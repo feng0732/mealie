@@ -511,39 +511,78 @@ def create(self, document: Recipe) -> Recipe:
 - `recipe_instructions: list[dict]` → `[RecipeInstruction(**step)]`
 - `recipe_ingredient: list[dict]` → `[RecipeIngredientModel(**ingr)]`
 
-### 5.5 图片下载与缓存键替换
+### 5.5 图片下载与缓存键机制
 
 图片处理发生在 `create_from_html` 中，**解析之后、落库之前**。
 
 #### 5.5.1 完整图片处理流程
 
 ```python
-# create_from_html 中的图片处理逻辑
+# create_from_html 中的图片处理逻辑（scraper.py#L63-L79）
 recipe_data_service = RecipeDataService(new_recipe.id)
 try:
     if new_recipe.image:
         if isinstance(new_recipe.image, list):
-            new_recipe.image = new_recipe.image[0]
-        if on_progress:
-            await on_progress(translator.t("recipe.create-progress.downloading-image"))
+            new_recipe.image = new_recipe.image[0]    # ⚠️ 关键：取列表第一项
+
         await recipe_data_service.scrape_image(new_recipe.image)  # 下载图片
     # ...
-    new_recipe.image = cache.new_key(4)   # 关键：替换为缓存键
+    new_recipe.image = cache.new_key(4)   # ⚠️ 替换为缓存键
 except Exception as e:
-    recipe_data_service.logger.exception(f"Error Scraping Image: {e}")
     new_recipe.image = "no image"
 ```
 
 **流程时序**：
-1. 解析器返回 `recipe.image` 为原始 URL（可能是 str / list / dict）
-2. 若为 list，取第一个元素
+1. 解析器返回 `recipe.image`（可能是 str / list / dict）
+2. **若为 list，取第一个元素**（create_from_html 入口处理）
 3. 调用 `RecipeDataService.scrape_image()` 下载图片到本地
 4. **将 `recipe.image` 字段替换为缓存键**（不再是 URL）
 5. 若下载失败，设置为 "no image"
 
-#### 5.5.2 缓存键机制：`cache.new_key`
+> ⚠️ **重要修正**：入口层 `create_from_html` 已将 list 转为 str，因此 `scrape_image` 内部的 list 分支在导入流程中**不会被触发**。
 
-定义在 [cache_key.py](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/pkgs/cache/cache_key.py#L1-L8)。
+#### 5.5.2 选图逻辑：入口 vs 下载服务
+
+**两个层级的 list 处理**：
+
+| 位置 | 处理逻辑 | 触发条件 |
+|------|----------|----------|
+| `create_from_html` 入口（[scraper.py#L65-L66](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/scraper/scraper.py#L65-L66)） | `new_recipe.image[0]` — **取第一项** | image 是 list 时 |
+| `scrape_image` 内部（[recipe_data_service.py#L127-L131](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/recipe/recipe_data_service.py#L127-L131)） | `largest_content_len()` — **选最大文件** | image_url 是 list 时 |
+
+**为何有两层处理？**
+- 入口层处理的是解析器返回的原始数据（schema.org 的 image 字段可能是 list）
+- 下载服务层是通用设计，支持外部调用者传入多个 URL 选择最佳图片
+- 在导入流程中，入口层已将 list 展开，所以下载服务层的 list 分支实际上不会执行
+
+**`largest_content_len` 算法**（如果被调用）：
+
+定义在 [recipe_data_service.py#L28-L46](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)：
+
+```python
+async def largest_content_len(urls: list[str]) -> tuple[str, int]:
+    # 对每个 URL 发送 HEAD 请求，获取 Content-Length 头
+    # 返回 (最大的 URL, content_length 值)
+```
+
+- 使用信号量控制并发（最多 10）
+- 模拟 Chrome 浏览器 TLS 指纹请求
+- 忽略异常响应，只比较成功返回的 Content-Length
+
+#### 5.5.3 缓存键机制：`recipe.image` 字段的真实含义
+
+**字段类型转换**：
+
+| 阶段 | `recipe.image` 存储内容 | 类型 |
+|------|------------------------|------|
+| 解析后 | 原始图片 URL | str / list / dict |
+| 入口处理后 | 第一个 URL（如果是 list） | str |
+| 下载后 | **4 字符随机缓存键** | str |
+| 失败时 | "no image" | str |
+
+**缓存键生成**：
+
+定义在 [cache_key.py](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/pkgs/cache/cache_key.py#L1-L8)：
 
 ```python
 def new_key(length=4) -> str:
@@ -552,27 +591,65 @@ def new_key(length=4) -> str:
     return "".join(random.choices(options, k=length))
 ```
 
-**缓存键的作用**：
-- 不是存储文件路径，而是作为**版本号/指纹**使用
-- 前端通过 URL `/api/media/recipes/{slug}/images?t={cache_key}` 访问图片
-- 当图片更新时，`cache_key` 变化，浏览器会重新请求，避免使用旧缓存
-- 默认 4 个字符，62^4 ≈ 1400 万种组合
+- 62^4 ≈ 1400 万种组合
+- 不是文件路径，而是**版本号/指纹**
+- 图片更新时 key 变化，触发浏览器重新请求
 
-#### 5.5.3 `RecipeDataService.scrape_image` 下载逻辑
+#### 5.5.4 前端图片路径构造
+
+**后端路由**（[media_recipe.py#L19-L30](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/routes/media/media_recipe.py#L19-L30)）：
+
+```
+GET /api/media/recipes/{recipe_id}/images/{file_name}
+```
+
+| file_name | 对应文件 | 用途 |
+|-----------|----------|------|
+| `original.webp` | original.webp | 原图 |
+| `min-original.webp` | min-original.webp | 小图 |
+| `tiny-original.webp` | tiny-original.webp | 缩略图 |
+
+> ⚠️ **重要修正**：路径参数是 `recipe_id`（UUID），**不是 slug**。
+
+**前端路径生成**（[static-routes.ts#L9-L24](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/frontend/app/composables/api/static-routes.ts#L9-L24)）：
+
+```typescript
+function recipeImage(recipeId: string, version: string | unknown = "", key: string | number = 1) {
+  return `${prefix}/media/recipes/${recipeId}/images/original.webp?rnd=${key}&version=${version}`;
+}
+```
+
+**两个查询参数**：
+
+| 参数 | 来源 | 作用 |
+|------|------|------|
+| `rnd=${key}` | 前端传入（默认 1），来自组件的 `imageKey.value` | 可选的额外随机因子 |
+| `version=${version}` | `recipe.image` 字段（4 字符缓存键） | 主要版本控制，图片更新时变化 |
+
+**前端调用示例**（[RecipePrintView.vue#L256-L258](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/frontend/app/components/Domain/Recipe/RecipePrintView.vue#L256-L258)）：
+
+```typescript
+// recipe.image 是 4 字符缓存键，作为 version 参数传入
+const recipeImageUrl = computed(() => {
+  return recipeImage(props.recipe.id, props.recipe.image, imageKey.value);
+});
+```
+
+#### 5.5.5 `RecipeDataService.scrape_image` 下载逻辑
 
 定义在 [recipe_data_service.py#L119-L169](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/recipe/recipe_data_service.py#L119-L169)。
 
 支持三种输入格式：
 1. **字符串**：直接使用 URL
-2. **列表**：多个 URL（不同分辨率），通过 HEAD 请求比较 `Content-Length`，选最大的
+2. **列表**：调用 `largest_content_len()` 选最大（导入流程中不会触发）
 3. **字典**：取 `url` 字段的值
 
 下载步骤：
 1. 确定图片扩展名，不确定则默认为 "jpg"
 2. 使用 `safehttp.AsyncSafeTransport` 模拟 Chrome 浏览器 TLS 指纹下载
 3. 校验 `Content-Type` 必须包含 "image"，否则抛出 `NotAnImageError`
-4. 写入 `{RECIPE_DATA_DIR}/{recipe_id}/images/original.{ext}`
-5. 调用 `PillowMinifier.minify()` 生成多种尺寸的缩略图（mini.webp、tiny.webp、small.webp、original.webp）
+4. 写入临时文件，调用 `minifier.minify()` 生成三种尺寸的 WebP 缩略图
+5. 最终文件：`original.webp`、`min-original.webp`、`tiny-original.webp`
 
 ---
 
