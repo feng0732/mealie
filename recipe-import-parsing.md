@@ -87,7 +87,74 @@ async def _create_recipe_from_web(self, req: ScrapeRecipe | ScrapeRecipeData) ->
 3. 调用 `create_from_html(url, repos, translator, html, on_progress)` → 返回 `(Recipe, ScrapedExtras)`
 4. 调用 `_finish_recipe_from_web(req, recipe, extras)` 完成后续处理
 
-### 2.4 JSON-LD 预处理
+### 2.4 入口异常处理机制
+
+入口层的异常处理分为两部分：
+
+#### 2.4.1 通用异常处理：`handle_exceptions`
+
+定义在 [recipe_crud_routes.py#L90-L125](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/routes/recipe/recipe_crud_routes.py#L90-L125)。
+
+`handle_exceptions` 是控制器的统一异常捕获器，用于 catch CRUD 操作中的已知异常：
+
+| 异常类型 | HTTP 状态码 | 错误消息 |
+|----------|------------|----------|
+| `exceptions.PermissionDenied` | 403 | "Permission Denied" |
+| `exceptions.NoEntryFound` | 404 | "No Entry Found" |
+| `sqlalchemy.exc.IntegrityError` | 400 | "Recipe already exists" |
+| `exceptions.RecursiveRecipe` | 400 | "Recursive recipe link error" |
+| `exceptions.SlugError` | 400 | "Unable to generate recipe slug" |
+| 其他异常 | 500 | "Unknown Error" + 异常类名 |
+
+> `handle_exceptions` 主要在 `get_one`、`create_one`、`update_one`、`delete_one` 等 CRUD 方法的 try-except 块中被调用。
+
+#### 2.4.2 流式导入异常处理：SSE 错误事件
+
+对于 `_create_recipe_from_web` 中的异步流程，异常通过 **SSE 错误事件**传递：
+
+```python
+async def run() -> None:
+    try:
+        recipe, extras = await create_from_html(url, self.repos, self.translator, html, on_progress=on_progress)
+        slug = self._finish_recipe_from_web(req, recipe, extras)
+        await queue.put(ServerSentEvent(data=SSEDataEventDone(slug=slug), event=SSEDataEventStatus.DONE))
+    except Exception as e:
+        self.logger.exception("Error in streaming recipe creation")
+        await queue.put(
+            ServerSentEvent(
+                data=SSEDataEventMessage(message=e.__class__.__name__),
+                event=SSEDataEventStatus.ERROR,
+            )
+        )
+    finally:
+        await queue.put(None)
+```
+
+异常捕获范围：
+- `create_from_html` 中的抓取/解析异常
+- `_finish_recipe_from_web` 中的落库异常
+- 整个异步任务中的任何未捕获异常
+
+在同步路由（如 `/create/url`）中，会通过监听队列中的 ERROR 事件重新抛出为 HTTP 400：
+```python
+async for event in self._create_recipe_from_web(req):
+    if isinstance(event.data, SSEDataEventMessage) and event.event == SSEDataEventStatus.ERROR:
+        raise HTTPException(status_code=400, detail=ErrorResponse.respond(message=event.data.message))
+```
+
+#### 2.4.3 抓取超时异常
+
+定义在 [scraper_strategies.py#L54-L55](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/scraper/scraper_strategies.py#L54-L55)。
+
+在 `test-scrape-url` 测试路由中，`ForceTimeoutException` 会独立处理并返回 408：
+```python
+except ForceTimeoutException as e:
+    raise HTTPException(
+        status_code=408, detail=ErrorResponse.respond(message="Recipe Scraping Timed Out")
+    ) from e
+```
+
+### 2.5 JSON-LD 预处理
 
 当 `ScrapeRecipeData.data` 以 `{` 开头时，视为 JSON-LD，先包装成 HTML：
 
@@ -204,16 +271,59 @@ DEFAULT_SCRAPER_STRATEGIES = [
 
 > **注意**：tags 和 categories 不直接写入 Recipe 对象，而是存入 `ScrapedExtras`，后续在 `_finish_recipe_from_web` 中根据 `include_tags` / `include_categories` 选项决定是否附加。
 
-### 4.2 `ScrapedExtras` — tags/categories 的延迟处理
+### 4.2 `ScrapedExtras` — tags/categories 的延迟创建
 
-定义在 [scraped_extras.py](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/scraper/scraped_extras.py#L19-L81)。
+定义在 [scraped_extras.py](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/scraper/scraped_extras.py#L19-L82)。
 
-`ScrapedExtras` 暂存了 `_tags: list[str]` 和 `_categories: list[str]`，只有当用户勾选了 `include_tags` / `include_categories` 时，才通过 `use_tags()` / `use_categories()` 转换为数据库对象：
+#### 4.2.1 设计意图："延迟创建" 模式
 
-1. 对每个 tag/category 名字做 `slugify`
-2. 查询数据库是否已存在（按 slug 匹配）
-3. 若不存在，创建新记录（`TagSave` / `CategorySave`）
-4. 返回完整的 `TagOut` / `CategoryOut` 列表，赋给 `recipe.tags` / `recipe.recipe_category`
+`ScrapedExtras` 采用 **延迟创建** 模式的原因：
+- **用户选择权**：用户通过 `include_tags` / `include_categories` 决定是否导入这些元数据
+- **跨上下文访问**：解析阶段没有数据库写入上下文，只有到 `_finish_recipe_from_web` 阶段才能访问完整的 `ScraperContext(repos)`
+- **避免无效创建**：如果用户不勾选，就不会产生额外的数据库写入
+
+#### 4.2.2 数据暂存与转换流程
+
+**阶段一：解析时暂存（无数据库操作）**
+
+在 `RecipeScraperPackage.clean_scraper` 中：
+```python
+extras = ScrapedExtras()
+extras.set_tags(try_get_default(scraped_data.keywords, "keywords", "", cleaner.clean_tags))
+extras.set_categories(try_get_default(scraped_data.category, "recipeCategory", "", cleaner.clean_categories))
+```
+
+此时只在内存中保存：
+- `_tags: list[str]` — 清洗后的标签名称列表
+- `_categories: list[str]` — 清洗后的分类名称列表
+
+**阶段二：落库前延迟创建（有数据库操作）**
+
+在 `_finish_recipe_from_web` 中，仅当用户勾选时才调用：
+```python
+if req.include_tags:
+    ctx = ScraperContext(self.repos)
+    recipe.tags = extras.use_tags(ctx)
+```
+
+#### 4.2.3 `use_tags` / `use_categories` 创建算法
+
+```python
+def use_tags(self, ctx: ScraperContext) -> list[TagOut]:
+```
+
+创建流程：
+1. **去重**：通过 `slugify(tag)` 生成 slug，用 `seen_tag_slugs: set` 去重，避免重复标签
+2. **查询**：`repo.get_one(slugify_tag, "slug")` — 按 slug 查询数据库中是否已存在
+3. **复用或创建**：
+   - 若存在 → 直接复用已有记录
+   - 若不存在 → 创建新记录：`TagSave(name=tag, group_id=ctx.repos.group_id)`
+4. **返回**：完整的 `TagOut` 对象列表，包含 id、name、slug、group_id
+
+**重复检测机制**：
+- 输入关键词可能重复（如 ["Dessert", "dessert", "甜品"]）
+- slugify 后都会变成 "dessert"
+- 通过 set 去重确保每个 slug 只处理一次
 
 ### 4.3 `cleaner.clean` — 全局数据清洗
 
@@ -239,6 +349,51 @@ DEFAULT_SCRAPER_STRATEGIES = [
 | `clean_tags` | 同上 |
 | `clean_nutrition` | 提取数值，钠/胆固醇单位转换 |
 | `clean_notes` | 标准化为 `[{"title": "", "text": "..."}]` |
+
+#### 4.3.1 份量拆分：`clean_yield` 深度解析
+
+定义在 [cleaner.py#L361-L397](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/scraper/cleaner.py#L361-L397)。
+
+`clean_yield` 将抓取到的 recipeYield 字符串（或列表）拆分为 **三个字段**：
+
+| 返回值 | 类型 | 含义 | 数据库列 |
+|--------|------|------|----------|
+| `servings_qty` | `float` | 份量人数（如 4 人份） | `recipe_servings` |
+| `yld_qty` | `float` | 产出数量（如 2 个蛋糕） | `recipe_yield_quantity` |
+| `yld_str` | `str` | 产出描述文本 | `recipe_yield` |
+
+**拆分算法**：
+
+```python
+def clean_yield(yields: str | list[str] | None) -> tuple[float, float, str]:
+```
+
+1. 若输入是 list，遍历处理每个元素（支持 ["4 servings", "2 cakes"] 这种多值情况）
+2. 调用 `extract_quantity_from_string(yld)` 提取数值和剩余文本
+3. 通过 `_is_serving_string(yld)` 判断是否是「人份」描述
+   - **服务词汇**：从 i18n 翻译系统中获取所有语言的 "makes"、"serves"、"serving"、"servings"、"yield"、"yields" 的翻译版本
+   - 若字符串中包含这些词汇，则数值归入 `servings_qty`
+   - 否则归入 `yld_qty`，文本部分保留为 `yld_str`
+
+**示例**：
+| 输入 | servings_qty | yld_qty | yld_str |
+|------|--------------|---------|---------|
+| "4 servings" | 4.0 | 0 | "" |
+| "2 cakes" | 0 | 2.0 | "cakes" |
+| ["4 servings", "2 cookies"] | 4.0 | 2.0 | "cookies" |
+| "1 1/2 dozen muffins" | 0 | 18.0 | "dozen muffins" |
+
+**`extract_quantity_from_string` 工具函数**
+
+定义在 [string_utils.py#L57-L111](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/parser_services/parser_utils/string_utils.py#L57-L111)。
+
+支持三种数值格式：
+- **带分数**："1 1/2" → 1.5
+- **普通分数**："1/2" → 0.5
+- **整数/小数**："3" → 3, "3.5" → 3.5
+
+辅助预处理：
+- `convert_vulgar_fractions_to_regular_fractions`：将 Unicode 俗分数字符（如 ½、¼）转换为普通分数（如 " 1/2"、" 1/4"）
 
 ### 4.4 Pydantic `Recipe` Schema 的字段校验器
 
@@ -356,37 +511,190 @@ def create(self, document: Recipe) -> Recipe:
 - `recipe_instructions: list[dict]` → `[RecipeInstruction(**step)]`
 - `recipe_ingredient: list[dict]` → `[RecipeIngredientModel(**ingr)]`
 
-### 5.5 图片下载与存储
+### 5.5 图片下载与缓存键替换
 
-在 `create_from_html` 中，图片处理发生在解析之后、落库之前：
+图片处理发生在 `create_from_html` 中，**解析之后、落库之前**。
+
+#### 5.5.1 完整图片处理流程
 
 ```python
+# create_from_html 中的图片处理逻辑
 recipe_data_service = RecipeDataService(new_recipe.id)
-await recipe_data_service.scrape_image(new_recipe.image)
-new_recipe.image = cache.new_key(4)   # 替换为缓存版本号
+try:
+    if new_recipe.image:
+        if isinstance(new_recipe.image, list):
+            new_recipe.image = new_recipe.image[0]
+        if on_progress:
+            await on_progress(translator.t("recipe.create-progress.downloading-image"))
+        await recipe_data_service.scrape_image(new_recipe.image)  # 下载图片
+    # ...
+    new_recipe.image = cache.new_key(4)   # 关键：替换为缓存键
+except Exception as e:
+    recipe_data_service.logger.exception(f"Error Scraping Image: {e}")
+    new_recipe.image = "no image"
 ```
 
-[RecipeDataService](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/recipe/recipe_data_service.py#L57-L169) 负责图片下载和存储：
-1. 解析图片 URL（支持 str / list / dict 格式）
-2. 若有多个 URL，选 `Content-Length` 最大的
-3. 下载图片到 `{RECIPE_DATA_DIR}/{recipe_id}/images/original.{ext}`
-4. 调用 `PillowMinifier.minify()` 生成缩略图
-5. `recipe.image` 字段存的是缓存 key（随机数），而非 URL 本身
+**流程时序**：
+1. 解析器返回 `recipe.image` 为原始 URL（可能是 str / list / dict）
+2. 若为 list，取第一个元素
+3. 调用 `RecipeDataService.scrape_image()` 下载图片到本地
+4. **将 `recipe.image` 字段替换为缓存键**（不再是 URL）
+5. 若下载失败，设置为 "no image"
+
+#### 5.5.2 缓存键机制：`cache.new_key`
+
+定义在 [cache_key.py](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/pkgs/cache/cache_key.py#L1-L8)。
+
+```python
+def new_key(length=4) -> str:
+    """returns a 4 character string to be used as a cache key for frontend data"""
+    options = string.ascii_letters + string.digits
+    return "".join(random.choices(options, k=length))
+```
+
+**缓存键的作用**：
+- 不是存储文件路径，而是作为**版本号/指纹**使用
+- 前端通过 URL `/api/media/recipes/{slug}/images?t={cache_key}` 访问图片
+- 当图片更新时，`cache_key` 变化，浏览器会重新请求，避免使用旧缓存
+- 默认 4 个字符，62^4 ≈ 1400 万种组合
+
+#### 5.5.3 `RecipeDataService.scrape_image` 下载逻辑
+
+定义在 [recipe_data_service.py#L119-L169](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/recipe/recipe_data_service.py#L119-L169)。
+
+支持三种输入格式：
+1. **字符串**：直接使用 URL
+2. **列表**：多个 URL（不同分辨率），通过 HEAD 请求比较 `Content-Length`，选最大的
+3. **字典**：取 `url` 字段的值
+
+下载步骤：
+1. 确定图片扩展名，不确定则默认为 "jpg"
+2. 使用 `safehttp.AsyncSafeTransport` 模拟 Chrome 浏览器 TLS 指纹下载
+3. 校验 `Content-Type` 必须包含 "image"，否则抛出 `NotAnImageError`
+4. 写入 `{RECIPE_DATA_DIR}/{recipe_id}/images/original.{ext}`
+5. 调用 `PillowMinifier.minify()` 生成多种尺寸的缩略图（mini.webp、tiny.webp、small.webp、original.webp）
 
 ---
 
-## 六、批量导入
+## 六、批量导入与结果记录
 
 定义在 [recipe_bulk_scraper.py](file:///d:/fz/0601/solo-dogfeeding/code/31-mealie/mealie/services/scraper/recipe_bulk_scraper.py#L21-L127)。
 
-`RecipeBulkScraperService.scrape()` 作为后台任务执行：
+### 6.1 批量导入架构
 
-1. 创建导入报告 `ReportCreate`
-2. 使用 `asyncio.Semaphore(3)` 控制并发
-3. 对每个 URL 调用 `create_from_html()` 获取 Recipe
-4. 附加请求中的 tags / categories
-5. 调用 `service.create_one(recipe)` 落库
-6. 汇总成功/失败条目，更新报告状态
+批量导入采用 **后台任务 + 报告记录** 的异步模式：
+
+```
+用户提交批量 URL
+      │
+      ▼
+POST /recipes/create/url/bulk
+      │
+      ├─ 立即创建 Report（状态：in_progress）
+      ├─ 返回 reportId 给前端
+      └─ 将 scrape() 加入 BackgroundTasks
+              │
+              ▼
+      异步执行批量抓取与导入
+              │
+              ▼
+      更新 Report（success/failure/partial）
+```
+
+### 6.2 并发控制
+
+使用 `asyncio.Semaphore(3)` 限制同时抓取的并发数为 3，避免对目标网站造成过大压力：
+
+```python
+sem = asyncio.Semaphore(3)
+
+async def _do(url: str) -> Recipe | None:
+    async with sem:
+        try:
+            recipe, _ = await create_from_html(url, self.repos, self.translator)
+            return recipe
+        except Exception as e:
+            self._add_error_entry(f"failed to scrape url {url}", str(e))
+            return None
+```
+
+### 6.3 报告系统设计
+
+#### 6.3.1 报告生命周期
+
+**阶段一：初始化报告** — `get_report_id()`
+
+```python
+def get_report_id(self) -> UUID4:
+    import_report = ReportCreate(
+        name="Bulk Import",
+        category=ReportCategory.bulk_import,
+        status=ReportSummaryStatus.in_progress,
+        group_id=self.group.id,
+    )
+    self.report = self.repos.group_reports.create(import_report)
+    return self.report.id
+```
+
+此时状态为 `in_progress`，前端可以轮询报告状态。
+
+**阶段二：收集条目** — 内存中暂存 `report_entries: list[ReportEntryCreate]`
+
+每个成功/失败的导入都生成一个条目：
+- **成功**：`ReportEntryCreate(success=True, message="Successfully imported recipe {name}", exception="")`
+- **失败（抓取阶段）**：`ReportEntryCreate(success=False, message="failed to scrape url {url}", exception=str(e))`
+- **失败（落库阶段）**：`ReportEntryCreate(success=False, message="Failed to save recipe to database...", exception=str(e))`
+
+**阶段三：保存并计算最终状态** — `_save_all_entries()`
+
+```python
+def _save_all_entries(self) -> None:
+    is_success = True
+    is_failure = True
+
+    for entry in self.report_entries:
+        if is_failure and entry.success:
+            is_failure = False    # 有成功则不是全失败
+        if is_success and not entry.success:
+            is_success = False     # 有失败则不是全成功
+        # 保存到数据库...
+
+    # 设置最终状态
+    if is_success:
+        self.report.status = ReportSummaryStatus.success
+    elif is_failure:
+        self.report.status = ReportSummaryStatus.failure
+    else:
+        self.report.status = ReportSummaryStatus.partial
+```
+
+三种最终状态：
+| 状态 | 条件 |
+|------|------|
+| `success` | 所有条目都成功 |
+| `failure` | 所有条目都失败 |
+| `partial` | 部分成功部分失败 |
+
+### 6.4 自定义 tags/categories 附加
+
+批量导入支持为每个 URL 单独指定 tags 和 categories（请求体 `CreateRecipeBulk` 中）：
+
+```python
+for b, recipe in zip(urls.imports, results, strict=True):
+    if not recipe or isinstance(recipe, BaseException):
+        continue
+    if b.tags:
+        recipe.tags = b.tags
+    if b.categories:
+        recipe.recipe_category = b.categories
+    try:
+        self.service.create_one(recipe)
+        # 添加成功记录...
+    except Exception as e:
+        # 添加失败记录...
+```
+
+> 注意：批量导入中的 tags/categories 是**直接赋值**而不是通过 `ScrapedExtras.use_tags()` 创建。这意味着如果传入的是字符串列表，会通过 `Recipe.validate_tags`/`validate_categories` 校验器转为临时对象，再由服务层/仓库层处理持久化。
 
 ---
 
