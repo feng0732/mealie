@@ -111,7 +111,7 @@ export interface ReadPlanEntry {
 
 | 方法 | 路由 | 说明 |
 |------|------|------|
-| GET | `/households/mealplans` | 分页查询，支持 `start_date` / `end_date` 过滤 |
+| GET | `/households/mealplans` | 分页查询，支持 `start_date` / `end_date` 作为独立参数，拼接到 query_filter |
 | POST | `/households/mealplans` | 创建排期，触发 `mealplan_entry_created` 事件 |
 | GET | `/households/mealplans/today` | 获取今日排期 |
 | POST | `/households/mealplans/random` | 根据规则创建随机排期 |
@@ -128,7 +128,7 @@ class RepositoryMeals(HouseholdRepositoryGeneric[ReadPlanEntry, GroupMealPlan]):
     # 获取今日排期
     def get_today(self, tz=UTC) -> list[ReadPlanEntry]
     
-    # 按日期范围查询 - 供 Webhook 和定时任务使用
+    # 按日期范围查询 - 仅 Webhook 内部使用，API 不暴露此方法
     def get_meals_by_date_range(self, start_date, end_date) -> list[ReadPlanEntry]
 ```
 
@@ -599,6 +599,15 @@ class HouseholdService(BaseService):
 
 **文件**: `mealie/services/scheduler/tasks/post_webhooks.py` + `mealie/services/event_bus_service/event_bus_listeners.py`
 
+**核心方法对比**:
+
+| 方法 | 用途 | 调用方 | 代码位置 |
+|------|------|--------|---------|
+| `get_meals_by_date_range()` | 按日期范围查询，供 Webhook 内部使用 | WebhookEventListener | `mealie/repos/repository_meals.py#L23-L33` |
+| `get_all()` + `page_all()` | API 分页查询，将日期拼接到 query_filter | 前端 API 调用 | `mealie/routes/households/controller_mealplan.py#L76-L100` |
+
+**注意**: `get_meals_by_date_range()` 仅在 Webhook 监听器中调用，前端 API 不使用此方法。
+
 **完整流程**:
 
 ```
@@ -704,7 +713,7 @@ def get_meals_by_date_range(self, start_date: datetime, end_date: datetime) -> l
 | 层次 | 用途 | 粒度 | 代码位置 |
 |------|------|------|---------|
 | 滑动时间窗口 | Webhook 订阅匹配 | 分钟级 (time) | `mealie/services/scheduler/tasks/post_webhooks.py#L31-L35` |
-| 取数日期窗口 | 实际查询数据 | 日期级 (date) | `mealie/repos/repository_meals.py#L27-L30` |
+| 取数日期窗口 | Webhook 实际查询数据 | 日期级 (date) | `mealie/repos/repository_meals.py#L27-L30` |
 | Webhook 调度时间 | 触发推送时机 | 分钟级 (time) | `mealie/services/event_bus_service/event_bus_listeners.py#L172-L176` |
 
 **1. 跨午夜时的取数范围计算**
@@ -803,7 +812,7 @@ class EventWebhookData(EventDocumentDataBase):
 
 ---
 
-### 6.5.2 整周数据表述与查询方式
+### 6.5.2 前端日期范围与查询方式
 
 **前端日期范围计算**: `frontend/app/pages/household/mealplan/planner.vue#L172-L199`
 
@@ -844,26 +853,67 @@ function filterMealByDate(date: Date) {
 }
 ```
 
-**后端分页查询支持日期范围**: `mealie/routes/households/controller_mealplan.py`
+**后端日期查询真实入口**: `mealie/routes/households/controller_mealplan.py#L76-L100`
 
 ```python
-# GET /households/mealplans 支持 start_date 和 end_date 查询参数
-async def get_all_meal_plans(
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
-    ...
+@router.get("", response_model=PlanEntryPagination)
+def get_all(
+    self,
+    q: PaginationQuery = Depends(PaginationQuery),
+    start_date: date | None = None,      # date 类型，无时分秒
+    end_date: date | None = None,        # date 类型，无时分秒
 ):
-    if start_date and end_date:
-        return repos.meals.get_meals_by_date_range(start_date, end_date)
+    # 将日期范围拼接为 query_filter 字符串
+    if start_date or end_date:
+        if not start_date:
+            date_filter = f"date <= {end_date}"
+        elif not end_date:
+            date_filter = f"date >= {start_date}"
+        else:
+            date_filter = f"date >= {start_date} AND date <= {end_date}"
+
+        # 与已有 query_filter 合并
+        if q.query_filter:
+            q.query_filter = f"({q.query_filter}) AND ({date_filter})"
+        else:
+            q.query_filter = date_filter
+
+    # 通过通用分页方法查询，不调用 get_meals_by_date_range
+    return self.repo.page_all(pagination=q)
 ```
 
-**整周查询示例**:
+**前端调用参数**: `frontend/app/composables/use-group-mealplan.ts#L42-L46`
+
+```typescript
+const query = {
+  start_date: format(range.value.start, "yyyy-MM-dd"),  // 字符串日期
+  end_date: format(range.value.end, "yyyy-MM-dd"),      // 字符串日期
+};
+const { data } = await api.mealplans.getAll(1, -1, { 
+  start_date: query.start_date, 
+  end_date: query.end_date 
+});
 ```
-前端 URL: /household/mealplan/planner/view?start=2026-06-01&end=2026-06-07
-→ API 请求: GET /api/households/mealplans?start_date=2026-06-01&end_date=2026-06-07
-→ 后端查询: date >= 2026-06-01 AND date <= 2026-06-07
-→ 返回: 6月1日 ~ 6月7日 所有排期
+
+**日期查询流程**:
 ```
+前端 URL: /planner/view?start=2026-06-01&end=2026-06-07
+  → API: GET /api/households/mealplans?start_date=2026-06-01&end_date=2026-06-07
+  → 后端: 拼接为 query_filter = "date >= 2026-06-01 AND date <= 2026-06-07"
+  → 调用: repo.page_all(pagination=q)
+  → 底层: 通过 PaginationQuery 解析过滤条件查询
+```
+
+**前后端日期查询对比**:
+
+| 场景 | 前端API调用 | 后端Webhook调用 |
+|------|------------|----------------|
+| 方法 | `api.mealplans.getAll()` | `repos.meals.get_meals_by_date_range()` |
+| 参数 | `start_date: string (yyyy-MM-dd)` | `start_date: datetime` |
+| | `end_date: string (yyyy-MM-dd)` | `end_date: datetime` |
+| 处理方式 | 拼接为 `query_filter` 字符串 | 直接 `datetime.date()` 转换 |
+| 查询方法 | `repo.page_all()` | 直接 SQL `select` |
+| 返回格式 | `PlanEntryPagination`（含 items） | `list[ReadPlanEntry]` |
 
 ---
 
@@ -876,12 +926,10 @@ async def get_all_meal_plans(
 | 文件 | `mealie/repos/repository_meals.py` | 相对于仓库根目录的文件路径 |
 | 行号 | `mealie/repos/repository_meals.py#L23-L33` | 具体代码行范围 |
 
-**仓库根目录**: `d:\fz\0601\solo-dogfeeding\code\32-mealie\`
-
-**路径转换示例**:
-- 绝对路径: `d:\fz\0601\solo-dogfeeding\code\32-mealie\mealie\repos\repository_meals.py`
-- 相对路径: `mealie/repos/repository_meals.py`
-- 反斜杠转换: Windows 路径的 `\` 统一转换为 `/`
+**路径转换规则**:
+- Windows 路径的 `\` 统一转换为 `/`
+- 省略仓库根目录，从 `mealie/` 或 `frontend/` 开始
+- 行号引用格式为 `#L<start>-L<end>`
 
 ---
 
