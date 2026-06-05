@@ -251,11 +251,14 @@ if (data && allRef) {
 }
 ```
 
-#### 为什么 PaginationBase 不继承 MealieModel？
+#### PaginationBase 不继承 MealieModel 的可能原因（推测）
 
-1. **泛型参数限制**：`PaginationBase[DataT: BaseModel]` 的泛型约束要求 `DataT` 是 `BaseModel` 子类
-2. **代码生成排除**：`gen_ts_types.py` 排除泛型类生成，导致 `PaginationBase` 无法自动生成类型
-3. **历史遗留**：分页模型早于 `MealieModel` 基类建立，后续未重构统一
+> **⚠️ 以下为代码推断，无明确设计文档证据**
+
+根据代码上下文推测，可能的原因包括：
+1. **泛型参数约束**：`PaginationBase[DataT: BaseModel]` 的泛型约束要求 `DataT` 是 `BaseModel` 子类，使用 `MealieModel` 会引入不必要的依赖
+2. **保持分页字段稳定**：`per_page`、`total_pages` 作为 API 契约的一部分，可能有意保持 snake_case 以兼容早期客户端
+3. **代码生成工具限制**：`pydantic2ts` 对泛型类的支持不完善，继承 `BaseModel` 可减少生成复杂度
 
 #### 影响范围
 
@@ -263,7 +266,18 @@ if (data && allRef) {
 |--------|------|
 | 前端类型安全 | 必须手动维护 `PaginationData<T>` 与后端一致 |
 | 命名一致性 | 分页字段 `per_page`、`total_pages` 与其他字段 `groupId` 风格不一致 |
-| 代码生成 | `PaginationBase` 无法自动生成，需手动同步 |
+| 代码生成 | `PaginationBase` 及其子类（如 `MultiPurposeLabelPagination`）均无法自动生成 |
+
+#### 分页响应例外：最终总结
+
+| 对比项 | PaginationQuery（继承 MealieModel） | PaginationBase（继承 BaseModel） |
+|--------|-----------------------------------|--------------------------------|
+| 字段示例 | `per_page` → `perPage`（✅ 转换） | `per_page` → `per_page`（❌ 不转换） |
+| 代码生成 | ✅ 生成 `PaginationQuery` 接口 | ❌ 无生成类型，需手写 `PaginationData<T>` |
+| 前端使用 | `api.getAll(page, perPage, params)` | `data.per_page`、`data.total_pages` |
+| 类型来源 | 生成类型 `types/response.ts` | 手写类型 `types/non-generated.ts` |
+
+> **关键事实**：所有 `*Pagination` 子类（如 `MultiPurposeLabelPagination`、`RecipePagination`）均未在生成类型中出现，前端统一使用手写的 `PaginationData<T>` 作为所有分页响应的类型。
 
 ---
 
@@ -502,82 +516,101 @@ export type RecipeOrganizer = "categories" | "tags" | "tools" | "foods" | "house
 
 **手写类型**集中在 [non-generated.ts](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts)，无自动生成标记。
 
-#### 完整差异表
+#### 完整差异表（修正后）
 
 | 维度 | 生成类型（auto-generated） | 手写类型（non-generated） |
 |------|---------------------------|---------------------------|
 | **来源** | 从 Pydantic Schema 自动生成 | 前端团队手动维护 |
 | **文件位置** | `types/*.ts`（如 `recipe.ts`、`response.ts`） | `types/non-generated.ts` |
 | **可修改性** | ❌ 禁止手动修改，重新生成会被覆盖 | ✅ 可手动编辑 |
+| **支持 interface** | ✅ 大多数数据接口 | ✅ 泛型接口如 `PaginationData<T>` |
+| **支持 type 联合** | ✅ `export type RegisteredParser = "nlp" \| "brute" \| "openai"` | ✅ `export type RecipeOrganizer = "categories" \| ...` |
 | **支持泛型** | ❌ pydantic2ts 不支持泛型类 | ✅ `PaginationData<T>` |
-| **函数类型** | ❌ 仅数据结构 | ✅ `ApiRequestInstance` 包含方法签名 |
+| **函数类型** | ❌ | ✅ `ApiRequestInstance` 包含方法签名 |
 | **工具类型** | ❌ | ✅ `NoUndefinedField<T>` 条件类型 |
 | **TypeScript enum** | ❌ 仅生成字符串字面量联合 | ✅ `Organizer`、`SSEDataEventStatus` |
 | **外部依赖** | ❌ 不引用外部类型 | ✅ 引用 `AxiosRequestConfig`、`AxiosResponse` |
 
-#### 代码证据：生成类型的局限性
+#### 代码证据：生成类型的真实能力
 
-**生成类型**（[response.ts:19-27](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/response.ts#L19-L27)）：
+**生成类型不仅有 interface，也有 type 联合**（[recipe.ts:8-13](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/recipe.ts#L8-L13)）：
 ```typescript
-// ✅ 能生成简单接口
+// ✅ 生成类型也包含字符串字面量联合类型
+export type ExportTypes = "json";
+export type RegisteredParser = "nlp" | "brute" | "openai";
+export type TimelineEventType = "system" | "info" | "comment";
+
+// ✅ 生成简单接口
 export interface PaginationQuery {
   orderBy?: string | null;
   perPage?: number;
 }
-
-// ❌ 无法生成泛型类 PaginationBase<T>，因为 gen_ts_types.py 排除泛型
-// 参见 gen_ts_types.py:208 -> generate_typescript_defs(..., exclude=("MealieModel"))
 ```
 
-**手写类型**（[non-generated.ts:1-25](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts#L1-L25)）：
+**手写类型也包含数据结构，不仅是封装**（[non-generated.ts:19-25, 68-76](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts#L19-L25)）：
 ```typescript
-// ✅ 支持条件类型（工具类型）
-export type NoUndefinedField<T> = { [P in keyof T]-?: NoUndefinedField<NonNullable<T[P]>> };
-
-// ✅ 支持泛型接口
-export interface PaginationData<T> {
+// ✅ 数据结构类型：后端有定义但代码生成失败，需手动同步
+export interface PaginationData<T> {  // 对应后端 PaginationBase
   page: number;
   per_page: number;
-  items: T[];  // 泛型参数 T
+  total: number;
+  total_pages: number;
+  items: T[];
 }
 
-// ✅ 支持函数类型签名
-export interface ApiRequestInstance {
-  get<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<RequestResponse<T>>;
-  post<T>(url: string, data: unknown, config?: AxiosRequestConfig): Promise<RequestResponse<T>>;
-  // ...
-}
-
-// ✅ 支持 TypeScript enum（用于运行时）
-export enum Organizer {
-  Category = "categories",
-  Tag = "tags",
-}
+// ✅ 数据结构类型：后端有 StandardizedUnitType(StrEnum)，但未生成
+export type StandardizedUnitType
+  = | "fluid_ounce"
+    | "cup"
+    | "ounce"
+    // ...
 ```
+
+#### 代码证据：哪些类型本该生成但实际未生成？
+
+后端有定义但前端生成类型中缺失的类型（代码生成工具限制导致）：
+
+| 后端类型 | 前端状态 | 原因推测 |
+|---------|---------|---------|
+| `PaginationBase<T>` | ❌ 缺失，需手写 `PaginationData<T>` | 泛型类 pydantic2ts 不支持 |
+| `MultiPurposeLabelPagination` | ❌ 缺失，复用 `PaginationData<T>` | 继承泛型基类导致生成失败 |
+| `RecipePagination` | ❌ 缺失，复用 `PaginationData<T>` | 继承泛型基类导致生成失败 |
+| `StandardizedUnitType(StrEnum)` | ❌ 缺失，需手动重定义 | 可能是模块导出或清理逻辑问题 |
+
+> **代码证据**：`labels.ts` 中只有 `MultiPurposeLabelCreate/Out/Save/Summary/Update`，没有 `MultiPurposeLabelPagination`（后端 [multi_purpose_label.py:29](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/labels/multi_purpose_label.py#L29) 有定义）。
 
 #### 为什么需要手写类型？
 
-1. **泛型分页数据**：`PaginationData<T>` 无法自动生成，因为 `PaginationBase` 是泛型类
+1. **泛型分页数据**：`PaginationData<T>` 无法自动生成，因为 `PaginationBase` 是泛型类，且所有 `*Pagination` 子类均无法生成
 2. **请求封装接口**：`ApiRequestInstance`、`RequestResponse<T>` 是前端架构需要，后端无对应 Schema
 3. **运行时枚举**：`enum Organizer` 用于运行时逻辑判断，字符串字面量类型仅用于编译时
 4. **类型体操工具**：`NoUndefinedField<T>` 是 TypeScript 高级类型，Pydantic 无对应概念
 5. **外部库依赖**：引用 `axios` 类型，不属于后端契约
+6. **代码生成遗漏**：`StandardizedUnitType` 等后端有定义但生成失败的类型，需手动同步
 
-#### 边界规则：何时使用哪种类型？
+#### 边界规则：修正后的实际约定
 
 ```typescript
-// ✅ 数据结构：使用生成类型
+// ✅ 数据结构：优先使用生成类型
 import type { MultiPurposeLabelOut } from "~/lib/api/types/labels";  // 生成类型
 
+// ✅ 分页数据：只能用手写类型（生成失败）
+import type { PaginationData } from "~/lib/api/types/non-generated";  // 手写类型
+
 // ✅ API 调用封装：使用手写类型
-import type { PaginationData, RequestResponse } from "~/lib/api/types/non-generated";  // 手写类型
+import type { RequestResponse } from "~/lib/api/types/non-generated";  // 手写类型
 
 // ✅ 运行时逻辑：使用手写 enum
 import { Organizer } from "~/lib/api/types/non-generated";
 if (type === Organizer.Category) { /* 运行时判断 */ }
 ```
 
-> **⚠️ 重要约定**：所有后端返回的数据结构**必须**在后端 Pydantic Schema 中定义，禁止在前端手动定义数据接口。手写类型仅限前端架构需要的封装类型。
+> **⚠️ 实际约定**：
+> 1. 后端 Pydantic Schema 是数据结构的唯一真值源
+> 2. 优先使用自动生成的类型
+> 3. 当生成类型缺失时（如泛型、枚举），前端可手动定义对应类型，但**必须与后端 Schema 保持一致**
+> 4. 禁止前端定义后端不存在的数据字段
+> 5. 手写类型仅限：前端架构封装 + 生成失败的数据类型补全
 
 ---
 
