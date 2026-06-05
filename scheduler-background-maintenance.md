@@ -3,7 +3,7 @@
 ## 一、调度入口：应用启动时触发
 
 ### 1.1 启动时机
-调度器在 FastAPI 应用的生命周期管理中启动。入口在 [app.py](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/app.py#L54-L95) 的 `lifespan_fn` 函数中：
+调度器在 FastAPI 应用的生命周期管理中启动。入口在 `app.py` 的 `lifespan_fn` 函数中：
 
 ```python
 @asynccontextmanager
@@ -23,7 +23,7 @@ async def lifespan_fn(_: FastAPI) -> AsyncGenerator[None, None]:
 ```
 
 ### 1.2 启动流程
-[start_scheduler()](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/app.py#L124-L144) 函数执行两步操作：
+`start_scheduler()` 函数执行两步操作：
 
 ```python
 async def start_scheduler():
@@ -42,7 +42,7 @@ async def start_scheduler():
 
 ## 二、任务注册表：SchedulerRegistry
 
-[SchedulerRegistry](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/scheduler_registry.py) 是任务容器，维护三个任务列表：
+`SchedulerRegistry` 是任务容器，维护三个任务列表：
 
 | 调度频率 | 存储列表 | 注册方法 | 已注册任务 |
 |---------|---------|---------|-----------|
@@ -55,7 +55,7 @@ async def start_scheduler():
 ## 三、任务执行：三层调度机制
 
 ### 3.1 第一层：SchedulerService.start()
-[SchedulerService.start()](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/scheduler_service.py#L20-L27) 启动三个调度循环：
+`SchedulerService.start()` 启动三个调度循环：
 
 ```python
 class SchedulerService:
@@ -67,7 +67,7 @@ class SchedulerService:
 ```
 
 ### 3.2 第二层：@repeat_every 装饰器
-[runner.py](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/runner.py) 中的 `@repeat_every` 装饰器是核心执行引擎：
+`runner.py` 中的 `@repeat_every` 装饰器是核心执行引擎：
 
 ```python
 @repeat_every(minutes=MINUTES_DAY, wait_first=False, logger=logger)
@@ -93,8 +93,6 @@ def run_minutely(): ...
 
 ### 3.3 第三层：每日任务的首次触发时间计算
 每日任务比较特殊，不是立即启动，而是先计算到下一个 `DAILY_SCHEDULE_TIME_UTC` 的时间差：
-
-[schedule_daily()](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/scheduler_service.py#L30-L53):
 
 ```python
 async def schedule_daily():
@@ -135,9 +133,11 @@ def _scheduled_task_wrapper(callable):
                     callable.__name__, e)
 ```
 
+**重要**：这个 wrapper 捕获异常后**没有重新抛出**，异常到此为止。
+
 ### 4.2 典型任务实现
 
-以 [purge_expired_tokens()](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/tasks/purge_expired_share_tokens.py#L8-L19) 为例：
+以 `purge_expired_tokens()` 为例：
 
 ```python
 def purge_expired_tokens() -> None:
@@ -154,7 +154,7 @@ def purge_expired_tokens() -> None:
         db.recipe_share_tokens.delete_many([token.id for token in tokens])
 ```
 
-另一个例子 [post_group_webhooks()](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/tasks/post_webhooks.py#L24-L79) 使用全局变量追踪状态：
+另一个例子 `post_group_webhooks()` 使用全局变量追踪状态：
 
 ```python
 last_ran = datetime.now(UTC)  # 全局状态变量
@@ -186,14 +186,14 @@ def session_context() -> Generator[Session, None, None]:
 **关键特性**：
 - 每个任务独立创建数据库会话
 - 通过 `with` 语句确保会话在任务完成后自动关闭
-- 异常情况下也能保证资源释放
+- 异常情况下也能保证资源释放（finally 块执行）
 
 ### 5.2 任务间的状态维护
 - `post_group_webhooks` 使用全局变量 `last_ran` 记录上次执行时间，避免重复发送
 - 其他无状态任务（如清理类）每次独立执行
 
 ### 5.3 应用关闭时的收尾
-目前 [lifespan_fn](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/app.py#L93-L95) 的 `yield` 之后仅打印日志，**没有显式停止调度任务的逻辑**：
+目前 `lifespan_fn` 的 `yield` 之后仅打印日志，**没有显式停止调度任务的逻辑**：
 
 ```python
     yield
@@ -201,64 +201,107 @@ def session_context() -> Generator[Session, None, None]:
 ```
 
 这意味着：
-- 应用关闭时，正在运行的 `asyncio.sleep()` 会被取消
+- 应用关闭时，事件循环开始销毁，正在运行的 `asyncio.sleep()` 会被取消
 - 正在执行的任务函数（同步函数跑在线程池）可能会被中断
 - `@repeat_every` 的 while 循环会随事件循环销毁而终止
+- **没有优雅停机机制**，无法等待正在执行的任务完成
 
 ---
 
-## 六、异常处理：两层防护
+## 六、异常处理：关键纠正（只有一层在起作用！）
 
-### 第一层：@repeat_every 内部异常捕获
-[runner.py](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/runner.py#L60-L77) 的 loop 函数中：
+### 完整调用链与异常传播
 
-```python
-try:
-    if is_coroutine:
-        await func()
-    else:
-        await run_in_threadpool(func)
-    repetitions += 1
-except Exception as exc:
-    if logger is not None:
-        formatted_exception = "".join(format_exception(type(exc), exc, exc.__traceback__))
-        logger.error(formatted_exception)  # 打印完整堆栈
-    if raise_exceptions:
-        raise exc  # 默认 False，不会抛出
-await asyncio.sleep(minutes * 60)  # 异常后继续等待下一次
 ```
-
-**效果**：单个任务抛出异常不会终止调度循环，sleep 后继续下一次执行。
-
-### 第二层：_scheduled_task_wrapper 异常捕获
-[scheduler_service.py](file:///d:/fz/0601/solo-dogfeeding/code/35-mealie/mealie/services/scheduler/scheduler_service.py#L56-L61):
-
-```python
-def _scheduled_task_wrapper(callable):
+@repeat_every 装饰器内部 loop()
+    ↓
     try:
-        callable()
-    except Exception as e:
-        logger.error("Error in scheduled task func='%s': exception='%s'", 
-                    callable.__name__, e)
+        run_daily()  ← 被装饰的原始函数（同步，跑在线程池）
+            ↓
+            for func in SchedulerRegistry._daily:
+                _scheduled_task_wrapper(func)
+                    ↓
+                    try:
+                        func()  ← 实际任务执行
+                    except Exception as e:
+                        logger.error("Error in scheduled task func='%s': exception='%s'", ...)
+                        # 异常被捕获，没有重新抛出！
+                        # 异常到此为止，不会传播到 for 循环之外
+        repetitions += 1  ← 这行正常执行！
+    except Exception as exc:
+        # 【重要】这里几乎不会执行到！
+        # 因为 _scheduled_task_wrapper 已经吞掉了所有任务异常
+        # 只有当 run_daily() 本身（for 循环之外）抛出异常时才会走到这里
+        logger.error(formatted_exception)  ← 完整堆栈打印代码实际是死代码
+    ↓
+    await asyncio.sleep(minutes * 60)  ← 正常进入下一次等待
 ```
 
-**效果**：单个任务失败不会影响同批次的其他任务执行。
+### 6.1 单个任务失败时的日志来源
 
-### 异常处理总结
+**日志只来自 `_scheduled_task_wrapper`**，格式为：
 ```
-任务A执行 → 抛出异常 → wrapper 捕获打日志 → 继续执行任务B → ...
-                                 ↓
-                          @repeat_every 捕获
-                                 ↓
-                          打印完整堆栈
-                                 ↓
-                          sleep 等待下一轮
+Error in scheduled task func='purge_expired_tokens': exception='...'
 ```
 
-**关键特性**：
-1. 单个任务失败 → 不影响同批次其他任务
-2. 单个任务失败 → 不终止调度循环，下一轮继续尝试
-3. 异常信息完整记录（函数名 + 异常信息 + 堆栈跟踪）
+**注意**：
+- 只有函数名和异常消息，**没有堆栈跟踪**
+- `@repeat_every` 中打印完整堆栈的代码实际上不会被触发
+- 这会导致调试困难，无法知道异常具体发生在哪一行
+
+### 6.2 同一批次任务是否继续执行？
+
+**继续执行**。原因：
+- `_scheduled_task_wrapper` 捕获异常后没有重新抛出
+- for 循环继续执行下一个迭代
+- 同批次的其他任务不受影响
+
+**示例场景**：
+```
+每日任务批次触发
+    ↓
+执行 purge_expired_tokens → 成功
+    ↓
+执行 purge_group_registration → 抛出异常
+    ↓
+    _scheduled_task_wrapper 捕获 → 打日志
+    ↓
+    for 循环继续 → 执行下一个任务
+    ↓
+执行 purge_password_reset_tokens → 成功
+... 后续任务全部正常执行
+```
+
+### 6.3 下一次周期如何处理？
+
+**下一次周期正常触发**。原因：
+- 异常没有传播到 `run_daily()` 之外
+- `run_daily()` 函数正常返回
+- `@repeat_every` 的 try 块中 `repetitions += 1` 正常执行
+- 然后执行 `await asyncio.sleep(minutes * 60)`
+- 等待下一个周期后再次触发
+
+**关键结论**：单个任务失败不会影响任何后续执行，既不会影响同批次其他任务，也不会影响下一次周期。
+
+### 6.4 什么时候会触发 @repeat_every 的异常捕获？
+
+只有以下极端情况才会走到 `@repeat_every` 的 except 块：
+1. `_scheduled_task_wrapper` 函数本身抛出异常（例如 logger 出问题）
+2. `run_daily()` 中 for 循环之外的代码抛出异常（目前只有 `logger.debug("Running daily callbacks")`）
+3. `SchedulerRegistry._daily` 列表本身在遍历过程中被修改导致异常
+
+这些情况在正常运行中几乎不会发生。
+
+### 6.5 异常处理总结表
+
+| 问题 | 答案 | 原因 |
+|------|------|------|
+| 日志来源 | `_scheduled_task_wrapper` | 异常被 wrapper 捕获，不向外传播 |
+| 日志内容 | 函数名 + 异常消息，无堆栈 | wrapper 的 logger.error 格式决定 |
+| 同批次其他任务 | 继续执行 | for 循环不受影响 |
+| 下一次周期 | 正常触发 | `run_daily()` 正常返回，repetitions 正常计数 |
+| `@repeat_every` 的 except 块 | 几乎不执行 | 异常已被内层 wrapper 吞掉 |
+| 调度循环是否终止 | 不会 | 异常没有传播到 while 循环级别 |
 
 ---
 
@@ -297,10 +340,49 @@ logger.info("-----SYSTEM SHUTDOWN-----")
 
 ---
 
-## 八、潜在问题与注意事项
+## 八、潜在问题与代码缺陷
+
+### 8.1 已确认的问题
 
 1. **关闭时无优雅停机**：应用关闭时没有等待正在执行的任务完成，可能导致任务中断
 2. **单 worker 限制**：tasks 模块注释中说明 "Scheduler object is only available to a single worker"，因此 uvicorn 配置为 `workers=1`
 3. **全局状态**：`post_group_webhooks` 使用全局变量 `last_ran`，多实例部署时会有问题
 4. **任务串行执行**：同批次任务按注册顺序串行执行，前一个任务慢会影响后一个
 5. **无重试机制**：任务失败后仅打日志，不会重试，需等待下一个周期
+
+### 8.2 本次分析发现的异常处理缺陷
+
+6. **异常无堆栈跟踪**：`_scheduled_task_wrapper` 只打印函数名和异常消息，没有堆栈，调试困难
+7. **异常处理代码冗余**：`@repeat_every` 中的完整堆栈打印代码实际上是死代码，不会被触发
+8. **两层 try-catch 意图冲突**：设计上看似有两层防护，但内层 wrapper 吞掉异常导致外层失效
+9. **异常静默**：任务失败后除了日志没有任何告警机制，问题可能长时间不被发现
+
+### 8.3 异常处理改进建议
+
+如果想保留完整堆栈，应该修改 `_scheduled_task_wrapper`：
+
+```python
+def _scheduled_task_wrapper(callable):
+    try:
+        callable()
+    except Exception as e:
+        # 方案1：使用 logger.exception 自动打印堆栈
+        logger.exception("Error in scheduled task func='%s'", callable.__name__)
+        
+        # 或者方案2：向外抛出，让 @repeat_every 处理堆栈打印
+        # raise
+```
+
+如果想让 `@repeat_every` 的异常处理生效，应该移除 `_scheduled_task_wrapper`，直接在 `run_daily` 中调用：
+
+```python
+def run_daily():
+    logger.debug("Running daily callbacks")
+    for func in SchedulerRegistry._daily:
+        try:
+            func()
+        except Exception as e:
+            logger.error("Error in scheduled task func='%s': exception='%s'", 
+                        func.__name__, e)
+            # 继续执行下一个任务
+```
