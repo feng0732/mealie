@@ -34,7 +34,7 @@
 │  │  │   ├─ 生成食谱时间线事件                                │   │
 │  │  │   └─ 更新 last_made 时间                              │   │
 │  │  └─ 每分钟: post_group_webhooks                          │   │
-│  │      └─ 按时间窗口推送排期数据                            │   │
+│  │      └─ 按日期范围推送排期数据                            │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -974,7 +974,7 @@ class EventMealplanData(EventDocumentDataBase):
 
 2. **WebhookEventListener** `mealie/services/event_bus_service/event_bus_listeners.py#L134-L179`
    - 定时触发的 Webhook 任务
-   - 可按 `mealplan` 类型推送整周排期数据
+   - 可按 `mealplan` 类型推送日期范围排期数据（通过 `get_meals_by_date_range` 查询）
 
 **注意**: 事件总线目前仅用于通知，**不用于前端实时数据同步**。前端仍采用手动刷新模式，无 WebSocket 实时推送。
 
