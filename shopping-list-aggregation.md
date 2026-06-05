@@ -1,6 +1,6 @@
 # 采购清单聚合规则详解
 
-本文档详细解析 Mealie 采购清单（Shopping List）的聚合规则，包括来源汇总、去重合并、数量换算和状态变更四个核心部分。
+本文档详细解析 Mealie 采购清单（Shopping List）的聚合规则，包括来源汇总、去重合并、数量换算和状态变更四个核心部分。所有规则均与代码实际实现严格对齐。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1.1 食谱食材提取流程
 
-核心逻辑位于 [shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py) 的 `get_shopping_list_items_from_recipe` 方法（L323-L411）。
+核心逻辑位于 [shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L323-L411) 的 `get_shopping_list_items_from_recipe` 方法。
 
 **处理步骤：**
 
@@ -28,10 +28,10 @@
    ```
 
 2. **提取食材属性**：为每个食材创建 `ShoppingListItemCreate` 对象，包含：
-   - `quantity`：原数量 × 缩放比例（`ingredient.quantity * scale`）
+   - `quantity`：原数量 × 缩放比例（`ingredient.quantity * scale if ingredient.quantity else 0`）
    - `food_id` / `label_id`：从食材对象提取
    - `unit_id`：从食材对象提取
-   - `recipe_references`：包含 `recipe_id`、`recipe_quantity`（单倍配方数量）、`recipe_scale`（添加次数倍数）
+   - `recipe_references`：包含 `recipe_id`、`recipe_quantity`（单倍配方数量，不带 scale）、`recipe_scale`（添加次数倍数）
 
 3. **同一食谱内合并**：在提取过程中，如果同一食谱内出现相同食材（可合并），直接合并数量和备注
 
@@ -39,7 +39,7 @@
    for existing_item in list_items:
        if not self.can_merge(existing_item, new_item):
            continue
-       # 同一食谱内：直接累加数量，而非累加 scale
+       # 同一食谱内：直接累加 ingredient.quantity（注意：未乘 scale！）
        if ingredient.quantity:
            existing_item.quantity += ingredient.quantity
            existing_item.recipe_references[0].recipe_quantity += ingredient.quantity
@@ -47,9 +47,24 @@
        break
    ```
 
-### 1.2 多食谱批量添加
+### 1.2 同一食谱重复食材在缩放数量下的处理
 
-`add_recipe_ingredients_to_list` 方法（L413-L455）支持批量添加多个食谱：
+**关键点**：当食谱添加时带有 `scale != 1`，且食谱内有重复食材时，合并逻辑存在不一致：
+
+- **创建新项时**：`quantity = ingredient.quantity * scale` ✓ 正确
+- **合并时**：`existing_item.quantity += ingredient.quantity` ✗ 应该乘以 scale
+
+**示例**：
+- 食谱添加 scale = 2，食谱内有两个 "牛奶 100ml"
+- 第一个牛奶：`quantity = 100 * 2 = 200`，`recipe_quantity = 100`
+- 第二个牛奶：新项 `quantity = 100 * 2 = 200`，但合并时只加 `100`
+- 结果：`quantity = 200 + 100 = 300`（预期应为 400）
+
+**`recipe_quantity` 的处理是正确的**：始终累加单倍配方数量 `ingredient.quantity`，因为它代表的是单倍配方中的用量，与 scale 无关。
+
+### 1.3 多食谱批量添加
+
+`add_recipe_ingredients_to_list` 方法（`mealie/services/household_services/shopping_lists.py` L413-L455）支持批量添加多个食谱：
 
 1. 遍历所有食谱，调用 `get_shopping_list_items_from_recipe` 生成待创建项
 2. 调用 `bulk_create_items` 进行批量创建与合并
@@ -127,8 +142,8 @@ return bool(item1.food_id) or item1.note == item2.note
 
 合并发生在三个层级：
 
-| 层级 | 发生时机 | 涉及方法 |
-|------|----------|----------|
+| 层级 | 发生时机 | 涉及代码位置 |
+|------|----------|--------------|
 | 1 | 输入批次内部合并 | `bulk_create_items` L162-L177、`bulk_update_items` L226-L252 |
 | 2 | 与数据库现有未勾选项合并 | `bulk_create_items` L180-L203、`bulk_update_items` L254-L282 |
 | 3 | 同一食谱内预合并 | `get_shopping_list_items_from_recipe` L387-L407 |
@@ -238,26 +253,92 @@ const listItems = reactive({
 ```
 
 **已勾选项排序规则**（L31-L36）：
-1. 优先按 `updatedAt` 降序（最近勾选的排在最前）
-2. `updatedAt` 相同时按 `position` 降序
+1. 优先按 `updatedAt` **降序**（最近勾选的排在最前）
+2. `updatedAt` 相同时按 `position` **降序**
+
+```typescript
+function sortCheckedItems(a: ShoppingListItemOut, b: ShoppingListItemOut) {
+  if (a.updatedAt! === b.updatedAt!) {
+    return ((a.position || 0) > (b.position || 0)) ? -1 : 1;
+  }
+  return a.updatedAt! < b.updatedAt! ? 1 : -1;
+}
+```
 
 ### 4.3 全选/取消全选
 
 位于 [use-shopping-list-crud.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-crud.ts)。
 
-**勾选流程：**
-- 遍历所有项，设置 `checked=true`
-- 更新 `updatedAt` 为当前时间（影响排序）
+**全选流程**（L38-L49）：
+- 遍历所有未勾选项，设置 `checked = true`
+- **注意**：全选时**不会更新 `updatedAt`**
+- 调用 `updateUncheckedListItems()` 更新未勾选项的 position
+
+```typescript
+function checkAllItems() {
+  let hasChanged = false;
+  shoppingList.value?.listItems?.forEach((item) => {
+    if (!item.checked) {
+      hasChanged = true;
+      item.checked = true;
+    }
+  });
+  if (hasChanged) {
+    updateUncheckedListItems();
+  }
+}
+```
+
+**取消全选流程**（L51-L64）：
+- 遍历所有已勾选项，设置 `checked = false`
+- 将 `listItems.checked` 全部合并到 `listItems.unchecked`
+- 清空 `listItems.checked`
+- 调用 `updateUncheckedListItems()` 重新排序 position
+
+```typescript
+function uncheckAllItems() {
+  let hasChanged = false;
+  shoppingList.value?.listItems?.forEach((item) => {
+    if (item.checked) {
+      hasChanged = true;
+      item.checked = false;
+    }
+  });
+  if (hasChanged) {
+    listItems.unchecked = [...listItems.unchecked, ...listItems.checked];
+    listItems.checked = [];
+    updateUncheckedListItems();
+  }
+}
+```
+
+**`updateUncheckedListItems`**（L173-L185）：
+- 只为**未勾选**的项重新设置 `position`
+- 遍历 `listItems.unchecked`，设置 `position = idx`
 - 调用后端批量更新
 
-**取消勾选流程：**
-- 遍历所有项，设置 `checked=false`
-- 将所有已勾选项移至未勾选列表
-- 重新计算未勾选项的 `position`
+### 4.4 单个项勾选
 
-### 4.4 删除逻辑
+**单个项勾选流程**（`saveListItem` L79-L102）：
+- 设置**临时** `updatedAt` 为当前时间（刷新后会被服务器值覆盖）
+- 立即更新本地 `shoppingList.listItems` 数组
+- 重新分离 `listItems.unchecked` 和 `listItems.checked` 并排序
+- 调用 `shoppingListItemActions.updateItem(item)` 进入更新队列
 
-**删除已勾选项：**
+```typescript
+// set a temporary updatedAt timestamp prior to refresh so it appears at the top of the checked items
+item.updatedAt = new Date().toISOString();
+```
+
+**关键区别**：
+| 操作 | 是否更新 updatedAt | 排序影响 |
+|------|-------------------|----------|
+| 单个勾选 | ✅ 设置临时值 | 立即排到最前 |
+| 全选 | ❌ 不更新 | 保持原顺序 |
+
+### 4.5 删除逻辑
+
+**删除已勾选项**：
 1. 筛选所有 `checked=true` 的项
 2. 调用 `bulk_delete_items` 批量删除
 3. 定时任务自动清理：[delete_old_checked_shopping_list_items.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py)
@@ -281,12 +362,21 @@ const listItems = reactive({
        delete_items.append(item.id)
    ```
 
-### 4.5 孤儿引用清理
+### 4.6 孤儿引用清理
 
 每次批量操作后调用 `remove_unused_recipe_references`（L130-L143）：
 
 1. 收集所有清单项中仍在使用的 `recipe_id`
 2. 删除清单级别 `recipe_references` 中未被任何项引用的条目
+
+### 4.7 离线队列机制
+
+位于 [use-shopping-list-item-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/use-shopping-list-item-actions.ts)。
+
+- 所有操作先进入本地 localStorage 队列
+- 队列包含 `create`、`update`、`delete` 三个子队列
+- 按 `delete` → `update` → `create` 顺序发送到后端（因为后端可能合并项）
+- 合并本地队列与服务器数据时，按 `updatedAt` 较新的为准
 
 ---
 
@@ -331,7 +421,7 @@ class ShoppingListItemBase(RecipeIngredientBase):
 ```python
 class ShoppingListItemRecipeRefCreate(MealieModel):
     recipe_id: UUID4
-    recipe_quantity: float = 0      # 单倍配方中的数量
+    recipe_quantity: float = 0      # 单倍配方中的数量（不带 scale）
     recipe_scale: NoneFloat = 1     # 添加次数倍数
     recipe_note: str | None = None  # 原始备注
 ```
@@ -351,3 +441,6 @@ class ShoppingListItemRecipeRefCreate(MealieModel):
 | 数量为 0 且无食谱引用 | 删除整个项 |
 | ounce 与体积单位合并 | 自动视为 fluid ounce |
 | 同一请求中相同 ID 的更新 | 只保留第一个 |
+| 全选操作 | 不更新 updatedAt，排序不变 |
+| 单个勾选 | 设置临时 updatedAt，立即排到最前 |
+| scale != 1 时同一食谱内重复食材 | 合并时数量少加了 scale 倍 |
