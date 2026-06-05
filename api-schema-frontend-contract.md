@@ -729,11 +729,50 @@ PATCH 操作遵循以下原则：
 
 | 约束项 | 规则 |
 |--------|------|
-| 字段命名 | Python snake_case → 自动 camelize → TS camelCase |
+| 字段命名（通用） | Python snake_case → 自动 camelize → TS camelCase |
+| 字段命名（分页响应例外） | `per_page`、`total_pages` **保持 snake_case**，不转换 |
 | 可选字段 | 后端 `\| None = None` → TS `?: \| null` |
 | 必填字段 | 后端无默认值 → TS 无 `?` 标记 |
 | 枚举值 | Python `StrEnum` → TS 字符串字面量联合类型 |
 | 日期时间 | 统一 UTC 时区，ISO 8601 格式 |
+
+#### 分页字段命名例外：代码证据
+
+**后端分页请求参数**（[pagination.py:46-50](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/response/pagination.py#L46-L50)）——继承 `MealieModel`，自动 camelize：
+```python
+class PaginationQuery(RequestQuery):  # RequestQuery 继承 MealieModel
+    page: int = 1
+    per_page: int = 50                  # → perPage（✅ 转换）
+```
+
+**后端分页响应数据**（[pagination.py:51-60](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/response/pagination.py#L51-L60)）——继承 `BaseModel`，**不转换**：
+```python
+class PaginationBase[DataT: BaseModel](BaseModel):  # 不继承 MealieModel
+    page: int = 1
+    per_page: int = 10                 # → per_page（❌ 不转换）
+    total: int = 0
+    total_pages: int = 0               # → total_pages（❌ 不转换）
+```
+
+**前端 API 调用**（[base-clients.ts:48-51](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/base/base-clients.ts#L48-L51)）：
+```typescript
+async getAll(page = 1, perPage = -1, params = {}) {  // ✅ 请求用 perPage（camelCase）
+  return await this.requests.get<PaginationData<ReadType>>(
+    route(this.baseRoute, { page, perPage, ...params })
+  );
+}
+```
+
+**前端数据消费**（[non-generated.ts:19-25](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts#L19-L25)）：
+```typescript
+export interface PaginationData<T> {
+  page: number;
+  per_page: number;      // ❌ 响应用 per_page（snake_case）
+  total: number;
+  total_pages: number;   // ❌ 响应用 total_pages（snake_case）
+  items: T[];
+}
+```
 
 ### 7.2 前端 → 后端 约束
 
@@ -742,7 +781,8 @@ PATCH 操作遵循以下原则：
 | 请求字段 | 支持 camelCase 或 snake_case（`populate_by_name=True`） |
 | PATCH 请求 | 使用 `Partial<T>`，只发送修改字段 |
 | PUT 请求 | 必须发送完整对象 |
-| 分页参数 | `page`、`perPage`、`queryFilter` 等驼峰参数 |
+| 分页请求参数 | `page`、`perPage`、`queryFilter` 等驼峰参数 |
+| 分页响应字段 | **注意**：响应数据中是 `per_page`、`total_pages`（snake_case） |
 
 ### 7.3 变更影响范围
 
