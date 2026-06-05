@@ -695,6 +695,196 @@ def get_meals_by_date_range(self, start_date: datetime, end_date: datetime) -> l
 
 ---
 
+### 6.5.1 跨午夜日期窗口深度分析
+
+**核心问题**: 当 Webhook 的时间窗口跨午夜时（如 23:59 ~ 00:01），取数范围如何计算？
+
+**三层时间窗口设计**:
+
+| 层次 | 用途 | 粒度 | 代码位置 |
+|------|------|------|---------|
+| 滑动时间窗口 | Webhook 订阅匹配 | 分钟级 (time) | `mealie/services/scheduler/tasks/post_webhooks.py#L31-L35` |
+| 取数日期窗口 | 实际查询数据 | 日期级 (date) | `mealie/repos/repository_meals.py#L27-L30` |
+| Webhook 调度时间 | 触发推送时机 | 分钟级 (time) | `mealie/services/event_bus_service/event_bus_listeners.py#L172-L176` |
+
+**1. 跨午夜时的取数范围计算**
+
+**文件**: `mealie/repos/repository_meals.py#L23-L33`
+
+```python
+def get_meals_by_date_range(self, start_date: datetime, end_date: datetime) -> list[ReadPlanEntry]:
+    stmt = select(GroupMealPlan).filter(
+        GroupMealPlan.date >= start_date.date(),  # 转换为 date，丢弃时间部分
+        GroupMealPlan.date <= end_date.date(),    # 转换为 date，丢弃时间部分
+        GroupMealPlan.household_id == self.household_id,
+    )
+```
+
+**关键转换**: `datetime.date()` 方法只保留日期部分，丢弃时分秒。
+
+**跨午夜场景示例**:
+
+```
+场景1: 正常情况（不跨午夜）
+  start_dt = 2026-06-05 07:59:00 UTC
+  end_dt   = 2026-06-05 08:00:00 UTC
+  → start_date.date() = 2026-06-05
+  → end_date.date()   = 2026-06-05
+  → 查询条件: date >= 2026-06-05 AND date <= 2026-06-05
+  → 取数范围: 6月5日当天所有排期
+
+场景2: 跨午夜边界
+  start_dt = 2026-06-05 23:59:00 UTC
+  end_dt   = 2026-06-06 00:00:00 UTC
+  → start_date.date() = 2026-06-05
+  → end_date.date()   = 2026-06-06
+  → 查询条件: date >= 2026-06-05 AND date <= 2026-06-06
+  → 取数范围: 6月5日 + 6月6日 两天所有排期
+
+场景3: 跨午夜（常见情况）
+  start_dt = 2026-06-05 23:59:00 UTC
+  end_dt   = 2026-06-06 00:01:00 UTC
+  → start_date.date() = 2026-06-05
+  → end_date.date()   = 2026-06-06
+  → 查询条件: date >= 2026-06-05 AND date <= 2026-06-06
+  → 取数范围: 6月5日 + 6月6日 两天所有排期
+
+场景4: 跨两天
+  start_dt = 2026-06-05 23:30:00 UTC
+  end_dt   = 2026-06-07 00:30:00 UTC
+  → start_date.date() = 2026-06-05
+  → end_date.date()   = 2026-06-07
+  → 查询条件: date >= 2026-06-05 AND date <= 2026-06-07
+  → 取数范围: 6月5日 + 6月6日 + 6月7日 三天所有排期
+```
+
+**2. 跨午夜时的 Webhook 订阅匹配**
+
+**文件**: `mealie/services/event_bus_service/event_bus_listeners.py#L169-L179`
+
+```python
+def get_scheduled_webhooks(self, start_dt: datetime, end_dt: datetime) -> list[ReadWebhook]:
+    stmt = select(GroupWebhooksModel).where(
+        GroupWebhooksModel.enabled == True,
+        # 比较的是 time 类型，不是 datetime 或 date
+        GroupWebhooksModel.scheduled_time > start_dt.astimezone(UTC).time(),
+        GroupWebhooksModel.scheduled_time <= end_dt.astimezone(UTC).time(),
+        GroupWebhooksModel.group_id == self.group_id,
+        GroupWebhooksModel.household_id == self.household_id,
+    )
+```
+
+**跨午夜匹配问题**: 当 `start_dt.time()` > `end_dt.time()` 时（即跨午夜），SQL 查询条件 `time > start.time AND time <= end.time` 永远不成立。
+
+**示例**:
+```
+start_dt = 2026-06-05 23:30:00 UTC → time = 23:30:00
+end_dt   = 2026-06-06 00:30:00 UTC → time = 00:30:00
+
+查询条件: scheduled_time > '23:30:00' AND scheduled_time <= '00:30:00'
+→ 没有任何 time 值能同时满足 >23:30:00 和 <=00:30:00
+→ 结果: 没有 Webhook 被匹配
+```
+
+**结论**: 当 `post_group_webhooks` 的执行时间跨午夜时，如果 Webhook 配置的 `scheduled_time` 落在跨午夜的时间窗口内（如 00:00），该 Webhook **不会被触发**。
+
+**3. EventWebhookData 数据结构**
+
+**文件**: `mealie/services/event_bus_service/event_types.py#L173-L176`
+
+```python
+class EventWebhookData(EventDocumentDataBase):
+    webhook_start_dt: datetime   # 完整 datetime，含时分秒
+    webhook_end_dt: datetime     # 完整 datetime，含时分秒
+    webhook_body: Any = None     # 存储查询结果（List[ReadPlanEntry]）
+```
+
+注意：`webhook_start_dt` 和 `webhook_end_dt` 保存的是完整的 `datetime`，但实际查询时会被转换为 `date`。
+
+---
+
+### 6.5.2 整周数据表述与查询方式
+
+**前端日期范围计算**: `frontend/app/pages/household/mealplan/planner.vue#L172-L199`
+
+```typescript
+const weekRange = computed(() => {
+  const sorted = [...state.value.range].sort((a, b) => a.getTime() - b.getTime());
+  const start = sorted[0];
+  const end = sorted[sorted.length - 1];
+  if (start && end) {
+    return { start, end };
+  }
+  return {
+    start: addDays(new Date(), adjustForToday(-numberOfDaysPast.value)),
+    end: addDays(new Date(), adjustForToday(numberOfDays.value)),
+  };
+});
+
+// URL query 同步
+watch(weekRange, (newRange) => {
+  router.replace({
+    query: {
+      start: format(newRange.start, "yyyy-MM-dd"),  // 日期格式，无时间
+      end: format(newRange.end, "yyyy-MM-dd"),      // 日期格式，无时间
+    },
+  });
+}, { immediate: true });
+```
+
+**前端按日期过滤**: `frontend/app/pages/household/mealplan/planner.vue#L203-L208`
+
+```typescript
+function filterMealByDate(date: Date) {
+  if (!mealplans.value) return [];
+  return mealplans.value.filter((meal) => {
+    const mealDate = parseISO(meal.date);  // meal.date 是 "yyyy-MM-dd" 字符串
+    return isSameDay(mealDate, date);      // 比较日期部分
+  });
+}
+```
+
+**后端分页查询支持日期范围**: `mealie/routes/households/controller_mealplan.py`
+
+```python
+# GET /households/mealplans 支持 start_date 和 end_date 查询参数
+async def get_all_meal_plans(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    ...
+):
+    if start_date and end_date:
+        return repos.meals.get_meals_by_date_range(start_date, end_date)
+```
+
+**整周查询示例**:
+```
+前端 URL: /household/mealplan/planner/view?start=2026-06-01&end=2026-06-07
+→ API 请求: GET /api/households/mealplans?start_date=2026-06-01&end_date=2026-06-07
+→ 后端查询: date >= 2026-06-01 AND date <= 2026-06-07
+→ 返回: 6月1日 ~ 6月7日 所有排期
+```
+
+---
+
+### 6.5.3 相对路径引用说明
+
+本文档中所有代码引用均采用**仓库根目录相对路径**格式：
+
+| 格式 | 示例 | 说明 |
+|------|------|------|
+| 文件 | `mealie/repos/repository_meals.py` | 相对于仓库根目录的文件路径 |
+| 行号 | `mealie/repos/repository_meals.py#L23-L33` | 具体代码行范围 |
+
+**仓库根目录**: `d:\fz\0601\solo-dogfeeding\code\32-mealie\`
+
+**路径转换示例**:
+- 绝对路径: `d:\fz\0601\solo-dogfeeding\code\32-mealie\mealie\repos\repository_meals.py`
+- 相对路径: `mealie/repos/repository_meals.py`
+- 反斜杠转换: Windows 路径的 `\` 统一转换为 `/`
+
+---
+
 ### 6.6 后端事件总线
 
 **文件**: `mealie/services/event_bus_service/event_types.py`
