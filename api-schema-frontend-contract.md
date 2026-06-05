@@ -189,6 +189,82 @@ def set_pagination_guides(self, route: str, query_params: dict[str, Any] | None)
     self._set_prev(route, valid_dict)
 ```
 
+### 3.5 分页响应 snake_case 例外
+
+**重要例外：分页响应字段不遵循 camelCase 命名约定。**
+
+#### 根因分析
+
+`PaginationBase` 继承自 `BaseModel` 而非 `MealieModel`，因此不具备自动驼峰转换能力：
+
+```python
+# [pagination.py:32, 46, 51](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/response/pagination.py#L32-L51)
+
+class RequestQuery(MealieModel):           # ✅ 继承 MealieModel，自动 camelize
+    order_by: str | None = None            # → orderBy
+    query_filter: str | None = None        # → queryFilter
+
+class PaginationQuery(RequestQuery):       # ✅ 间接继承 MealieModel
+    page: int = 1                          # → page
+    per_page: int = 50                     # → perPage（自动转换）
+
+class PaginationBase[DataT: BaseModel](BaseModel):  # ❌ 继承 BaseModel，无 camelize
+    page: int = 1                          # → page（不变）
+    per_page: int = 10                     # → per_page（❌ 不转换！）
+    total: int = 0
+    total_pages: int = 0                   # → total_pages（❌ 不转换！）
+    items: list[DataT]
+    next: str | None = None
+    previous: str | None = None
+```
+
+#### 代码证据对比
+
+**后端生成的类型**（[response.ts:19-27](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/response.ts#L19-L27)）：
+```typescript
+// PaginationQuery 继承 MealieModel → 正确 camelize
+export interface PaginationQuery {
+  orderBy?: string | null;
+  queryFilter?: string | null;
+  page?: number;
+  perPage?: number;  // ✅ 正确转换为 perPage
+}
+```
+
+**前端手写类型**（[non-generated.ts:19-25](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts#L19-L25)）：
+```typescript
+// PaginationData 必须手写匹配后端实际输出
+export interface PaginationData<T> {
+  page: number;
+  per_page: number;      // ❌ 保持 snake_case，与实际响应一致
+  total: number;
+  total_pages: number;   // ❌ 保持 snake_case
+  items: T[];
+}
+```
+
+**前端实际消费**（[use-actions-factory.ts:40-48](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/composables/partials/use-actions-factory.ts#L40-L48)）：
+```typescript
+const { data } = await api.getAll(page, perPage, params);
+if (data && allRef) {
+  allRef.value = data.items;  // ✅ items 字段名一致，无问题
+}
+```
+
+#### 为什么 PaginationBase 不继承 MealieModel？
+
+1. **泛型参数限制**：`PaginationBase[DataT: BaseModel]` 的泛型约束要求 `DataT` 是 `BaseModel` 子类
+2. **代码生成排除**：`gen_ts_types.py` 排除泛型类生成，导致 `PaginationBase` 无法自动生成类型
+3. **历史遗留**：分页模型早于 `MealieModel` 基类建立，后续未重构统一
+
+#### 影响范围
+
+| 影响项 | 说明 |
+|--------|------|
+| 前端类型安全 | 必须手动维护 `PaginationData<T>` 与后端一致 |
+| 命名一致性 | 分页字段 `per_page`、`total_pages` 与其他字段 `groupId` 风格不一致 |
+| 代码生成 | `PaginationBase` 无法自动生成，需手动同步 |
+
 ---
 
 ## 四、API 调用方式
@@ -410,6 +486,99 @@ export interface PaginationData<T> {
 export type RecipeOrganizer = "categories" | "tags" | "tools" | "foods" | "households" | "users";
 ```
 
+### 5.4 生成类型 vs 手写类型：完整差异对比
+
+#### 识别标记
+
+**生成类型**的文件头有明确的自动生成标记（[recipe.ts:1-6](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/recipe.ts#L1-L6)）：
+```typescript
+/* tslint:disable */
+/* eslint-disable */
+/**
+/* This file was automatically generated from pydantic models by running pydantic2ts.
+/* Do not modify it by hand - just update the pydantic models and then re-run the script
+*/
+```
+
+**手写类型**集中在 [non-generated.ts](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts)，无自动生成标记。
+
+#### 完整差异表
+
+| 维度 | 生成类型（auto-generated） | 手写类型（non-generated） |
+|------|---------------------------|---------------------------|
+| **来源** | 从 Pydantic Schema 自动生成 | 前端团队手动维护 |
+| **文件位置** | `types/*.ts`（如 `recipe.ts`、`response.ts`） | `types/non-generated.ts` |
+| **可修改性** | ❌ 禁止手动修改，重新生成会被覆盖 | ✅ 可手动编辑 |
+| **支持泛型** | ❌ pydantic2ts 不支持泛型类 | ✅ `PaginationData<T>` |
+| **函数类型** | ❌ 仅数据结构 | ✅ `ApiRequestInstance` 包含方法签名 |
+| **工具类型** | ❌ | ✅ `NoUndefinedField<T>` 条件类型 |
+| **TypeScript enum** | ❌ 仅生成字符串字面量联合 | ✅ `Organizer`、`SSEDataEventStatus` |
+| **外部依赖** | ❌ 不引用外部类型 | ✅ 引用 `AxiosRequestConfig`、`AxiosResponse` |
+
+#### 代码证据：生成类型的局限性
+
+**生成类型**（[response.ts:19-27](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/response.ts#L19-L27)）：
+```typescript
+// ✅ 能生成简单接口
+export interface PaginationQuery {
+  orderBy?: string | null;
+  perPage?: number;
+}
+
+// ❌ 无法生成泛型类 PaginationBase<T>，因为 gen_ts_types.py 排除泛型
+// 参见 gen_ts_types.py:208 -> generate_typescript_defs(..., exclude=("MealieModel"))
+```
+
+**手写类型**（[non-generated.ts:1-25](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/non-generated.ts#L1-L25)）：
+```typescript
+// ✅ 支持条件类型（工具类型）
+export type NoUndefinedField<T> = { [P in keyof T]-?: NoUndefinedField<NonNullable<T[P]>> };
+
+// ✅ 支持泛型接口
+export interface PaginationData<T> {
+  page: number;
+  per_page: number;
+  items: T[];  // 泛型参数 T
+}
+
+// ✅ 支持函数类型签名
+export interface ApiRequestInstance {
+  get<T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<RequestResponse<T>>;
+  post<T>(url: string, data: unknown, config?: AxiosRequestConfig): Promise<RequestResponse<T>>;
+  // ...
+}
+
+// ✅ 支持 TypeScript enum（用于运行时）
+export enum Organizer {
+  Category = "categories",
+  Tag = "tags",
+}
+```
+
+#### 为什么需要手写类型？
+
+1. **泛型分页数据**：`PaginationData<T>` 无法自动生成，因为 `PaginationBase` 是泛型类
+2. **请求封装接口**：`ApiRequestInstance`、`RequestResponse<T>` 是前端架构需要，后端无对应 Schema
+3. **运行时枚举**：`enum Organizer` 用于运行时逻辑判断，字符串字面量类型仅用于编译时
+4. **类型体操工具**：`NoUndefinedField<T>` 是 TypeScript 高级类型，Pydantic 无对应概念
+5. **外部库依赖**：引用 `axios` 类型，不属于后端契约
+
+#### 边界规则：何时使用哪种类型？
+
+```typescript
+// ✅ 数据结构：使用生成类型
+import type { MultiPurposeLabelOut } from "~/lib/api/types/labels";  // 生成类型
+
+// ✅ API 调用封装：使用手写类型
+import type { PaginationData, RequestResponse } from "~/lib/api/types/non-generated";  // 手写类型
+
+// ✅ 运行时逻辑：使用手写 enum
+import { Organizer } from "~/lib/api/types/non-generated";
+if (type === Organizer.Category) { /* 运行时判断 */ }
+```
+
+> **⚠️ 重要约定**：所有后端返回的数据结构**必须**在后端 Pydantic Schema 中定义，禁止在前端手动定义数据接口。手写类型仅限前端架构需要的封装类型。
+
 ---
 
 ## 六、兼容处理机制
@@ -448,6 +617,55 @@ return AppInfo(
 # [controller_shopping_lists.py:263](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/routes/households/controller_shopping_lists.py#L263)
 @router.post("/{item_id}/recipe/{recipe_id}", response_model=ShoppingListOut, deprecated=True)
 ```
+
+### 6.3.1 重要：`deprecated` 仅用于路由级标记
+
+**证据结论：`deprecated=True` 仅用于路由装饰器，**不用于**字段级或 Schema 级废弃。**
+
+#### 完整代码搜索证据
+
+对整个 `mealie/` 目录全量搜索 `deprecated` 关键字：
+
+| 文件 | 用法 | 级别 |
+|------|------|------|
+| [controller_shopping_lists.py:263](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/routes/households/controller_shopping_lists.py#L263) | `@router.post(..., deprecated=True)` | ✅ 路由级 |
+| [task.py:18](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/db/models/server/task.py#L18) | `# Server Tasks are deprecated...` | ❌ 仅代码注释 |
+| [mealplan.py:45](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/db/models/household/mealplan.py#L45) | `# Old filters - deprecated in favor of...` | ❌ 仅代码注释 |
+| [cookbook.py:38](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/db/models/household/cookbook.py#L38) | `# Old filters - deprecated in favor of...` | ❌ 仅代码注释 |
+
+#### Schema 字段级废弃搜索结果为空：
+```bash
+# 搜索 Field(deprecated=True) 或 Field(..., deprecated=True)
+# → 0 匹配结果
+```
+
+#### 为什么不支持字段级 deprecated？
+
+1. **Pydantic v2 支持但未使用**：Pydantic v2 支持 `Field(..., deprecated=True)` 语法，可在 JSON Schema 中标记弃用字段，但本项目未采用此机制
+
+2. **向后兼容优先**：字段级废弃通过"可选字段 + 默认值"实现，而非显式 deprecated 标记
+
+3. **代码生成限制**：pydantic2ts 可能无法正确传递 deprecated 标记到 TypeScript
+
+#### 当前字段级兼容机制对比
+
+| 机制 | 本项目采用 | Pydantic 标准 |
+|------|----------|----------------|
+| 字段废弃 | 标记为可选 + 注释 | `Field(..., deprecated=True)` |
+| 路由废弃 | `@router(..., deprecated=True)` | 同左 |
+| OpenAPI 可见性 | 仅路由级可见 | 字段级也可见 |
+| 前端类型警告 | 无 | 可生成 `@deprecated` JSDoc |
+
+#### 字段级废弃的实际做法：
+
+```python
+# 本项目的做法：标记为可选，不使用 deprecated
+class SomeSchema(MealieModel):
+    old_field: str | None = None  # 不使用 Field(deprecated=True)
+    new_field: str | None = None
+```
+
+> **⚠️ 注意**：如果需要在 OpenAPI 文档中明确标记字段废弃，需要手动添加 `Field(..., json_schema_extra={"deprecated": True})` 并确保代码生成支持，当前无此实践。
 
 ### 6.4 缓存与 Last-Modified
 
