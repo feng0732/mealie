@@ -168,9 +168,120 @@ def post_group_webhooks(start_dt: datetime | None = None, ...) -> None:
 
 ---
 
-## 五、维护动作（收尾）
+## 五、手动触发：Webhooks Rerun 入口
 
-### 5.1 数据库会话管理
+### 5.1 API 入口
+手动触发 webhook 重投的 API 入口在 `controller_webhooks.py` 中：
+
+```python
+@router.post("/rerun")
+def rerun_webhooks(self):
+    """Manually re-fires all previously scheduled webhooks for today"""
+    
+    start_time = datetime.min.time()
+    start_dt = datetime.combine(datetime.now(UTC).date(), start_time)
+    post_group_webhooks(start_dt=start_dt, group_id=self.group.id, household_id=self.household.id)
+```
+
+### 5.2 调用流程
+
+```
+用户调用 POST /households/webhooks/rerun
+    ↓
+rerun_webhooks() 控制器方法
+    ↓
+构造 start_dt = 今日 00:00:00 UTC
+    ↓
+直接调用 post_group_webhooks(start_dt, group_id, household_id)
+    ↓
+post_group_webhooks() 执行
+    ├─ 不使用 last_ran，使用传入的 start_dt
+    ├─ 更新全局变量 last_ran = 当前时间
+    ├─ 查询指定 group 和 household 的 mealplan 事件
+    └─ 通过 EventBusService 分发 webhook 事件
+```
+
+### 5.3 关键特性
+
+1. **同步执行**：直接调用任务函数，不经过调度器，API 响应会等待任务完成
+2. **参数定制**：
+   - `start_dt` 设为今日零点，重投今天所有 webhook
+   - `group_id` 和 `household_id` 限定为当前用户所属组
+3. **副作用**：更新全局变量 `last_ran`，会影响后续调度器触发的执行（下一次调度从当前时间开始查询）
+4. **无异常处理**：控制器直接调用，没有 try-catch，如果任务抛出异常会返回 500 错误
+
+### 5.4 与调度触发的区别
+
+| 触发方式 | 调用路径 | start_dt | group_id | 异常处理 |
+|---------|---------|----------|----------|---------|
+| 调度触发 | run_minutely() → wrapper → post_group_webhooks() | last_ran（上一次运行时间） | 所有组 | wrapper 捕获，打日志 |
+| 手动触发 | rerun_webhooks() → post_group_webhooks() | 今日 00:00:00 | 当前用户组 | 无捕获，抛出 500 |
+
+---
+
+## 六、注册生命周期与重复注册问题
+
+### 6.1 SchedulerRegistry 注册机制
+
+`SchedulerRegistry._register` 方法实现：
+
+```python
+@staticmethod
+def _register(name: str, callbacks: list[Callable], callback: Iterable[Callable]):
+    for cb in callback:
+        logger.debug(f"Registering {name} callback: {cb.__name__}")
+        callbacks.append(cb)  # 直接 append，无去重检查！
+```
+
+**问题**：没有去重逻辑，如果 `register_daily()` 等方法被多次调用，同一个任务会被多次添加到列表中。
+
+### 6.2 重复注册场景
+
+场景 1：`start_scheduler()` 被多次调用
+```python
+# 第一次调用
+await start_scheduler()  # _daily = [task1, task2, ...]
+
+# 第二次调用（例如热重载、测试代码重复调用）
+await start_scheduler()  # _daily = [task1, task2, ..., task1, task2, ...]
+```
+
+场景 2：其他地方也调用了注册方法
+```python
+# app.py 中已注册
+SchedulerRegistry.register_daily(task1, task2)
+
+# 另一个模块中再次注册
+SchedulerRegistry.register_daily(task1)  # task1 被添加第二次
+```
+
+### 6.3 重复执行的后果
+
+每次调度触发时，`run_daily()` 会遍历整个列表：
+
+```python
+def run_daily():
+    for func in SchedulerRegistry._daily:  # 列表中有重复项
+        _scheduled_task_wrapper(func)      # 重复的任务会被执行多次
+```
+
+**影响**：
+- 清理类任务（如 `purge_expired_tokens`）：多次执行无害但浪费资源
+- 发送类任务（如 `post_group_webhooks`）：可能导致重复发送 webhook
+- 状态修改类任务：可能导致数据不一致
+- 性能影响：任务越多，调度周期被拉长越多
+
+### 6.4 其他注册生命周期问题
+
+1. **无注销机制**：应用运行中无法动态移除已注册的任务（虽然有 `remove_daily()` 方法，但没有被使用）
+2. **注册时机**：必须在 `SchedulerService.start()` 之前注册，否则已启动的循环不会包含新任务
+3. **列表非线程安全**：`_daily` 等是普通 list，并发注册可能有问题（虽然当前都是启动时同步注册）
+
+---
+
+## 七、维护动作（收尾）
+
+### 7.1 数据库会话管理
 所有任务统一使用 `session_context` 上下文管理器：
 
 ```python
@@ -188,11 +299,11 @@ def session_context() -> Generator[Session, None, None]:
 - 通过 `with` 语句确保会话在任务完成后自动关闭
 - 异常情况下也能保证资源释放（finally 块执行）
 
-### 5.2 任务间的状态维护
+### 7.2 任务间的状态维护
 - `post_group_webhooks` 使用全局变量 `last_ran` 记录上次执行时间，避免重复发送
 - 其他无状态任务（如清理类）每次独立执行
 
-### 5.3 应用关闭时的收尾
+### 7.3 应用关闭时的收尾
 目前 `lifespan_fn` 的 `yield` 之后仅打印日志，**没有显式停止调度任务的逻辑**：
 
 ```python
@@ -208,7 +319,7 @@ def session_context() -> Generator[Session, None, None]:
 
 ---
 
-## 六、异常处理：关键纠正（只有一层在起作用！）
+## 八、异常处理：关键纠正（只有一层在起作用！）
 
 ### 完整调用链与异常传播
 
@@ -237,7 +348,7 @@ def session_context() -> Generator[Session, None, None]:
     await asyncio.sleep(minutes * 60)  ← 正常进入下一次等待
 ```
 
-### 6.1 单个任务失败时的日志来源
+### 8.1 单个任务失败时的日志来源
 
 **日志只来自 `_scheduled_task_wrapper`**，格式为：
 ```
@@ -249,7 +360,7 @@ Error in scheduled task func='purge_expired_tokens': exception='...'
 - `@repeat_every` 中打印完整堆栈的代码实际上不会被触发
 - 这会导致调试困难，无法知道异常具体发生在哪一行
 
-### 6.2 同一批次任务是否继续执行？
+### 8.2 同一批次任务是否继续执行？
 
 **继续执行**。原因：
 - `_scheduled_task_wrapper` 捕获异常后没有重新抛出
@@ -272,7 +383,7 @@ Error in scheduled task func='purge_expired_tokens': exception='...'
 ... 后续任务全部正常执行
 ```
 
-### 6.3 下一次周期如何处理？
+### 8.3 下一次周期如何处理？
 
 **下一次周期正常触发**。原因：
 - 异常没有传播到 `run_daily()` 之外
@@ -283,7 +394,7 @@ Error in scheduled task func='purge_expired_tokens': exception='...'
 
 **关键结论**：单个任务失败不会影响任何后续执行，既不会影响同批次其他任务，也不会影响下一次周期。
 
-### 6.4 什么时候会触发 @repeat_every 的异常捕获？
+### 8.4 什么时候会触发 @repeat_every 的异常捕获？
 
 只有以下极端情况才会走到 `@repeat_every` 的 except 块：
 1. `_scheduled_task_wrapper` 函数本身抛出异常（例如 logger 出问题）
@@ -292,7 +403,7 @@ Error in scheduled task func='purge_expired_tokens': exception='...'
 
 这些情况在正常运行中几乎不会发生。
 
-### 6.5 异常处理总结表
+### 8.5 异常处理总结表
 
 | 问题 | 答案 | 原因 |
 |------|------|------|
@@ -305,7 +416,130 @@ Error in scheduled task func='purge_expired_tokens': exception='...'
 
 ---
 
-## 七、完整调用链时序图
+## 九、任务包装器向外抛错的改进建议
+
+### 9.1 问题分析
+
+当前 `_scheduled_task_wrapper` 不向外抛错，导致：
+- 异常无堆栈跟踪，调试困难
+- `@repeat_every` 的异常处理逻辑成为死代码
+
+但如果简单地让 wrapper 向外抛错：
+
+```python
+def _scheduled_task_wrapper(callable):
+    try:
+        callable()
+    except Exception as e:
+        logger.error(...)
+        raise  # 向外抛错
+```
+
+**后果**：异常会传播到 for 循环，导致循环终止，**同批次后续任务不再执行**。
+
+```python
+def run_daily():
+    for func in SchedulerRegistry._daily:
+        _scheduled_task_wrapper(func)  # 如果这里抛出异常
+        # 后续任务不会执行！
+```
+
+### 9.2 改进方案对比
+
+| 方案 | 堆栈信息 | 同批任务继续 | 外层捕获生效 | 复杂度 |
+|------|---------|-------------|-------------|-------|
+| 当前方案（不抛出） | ❌ 无 | ✅ 是 | ❌ 否 | 低 |
+| 直接向外抛出 | ✅ 有 | ❌ 否 | ✅ 是 | 低 |
+| logger.exception | ✅ 有 | ✅ 是 | ❌ 否 | 低 |
+| 收集异常最后抛出 | ✅ 有 | ✅ 是 | ✅ 是 | 中 |
+| 移除 wrapper，在 for 循环内捕获 | ✅ 有 | ✅ 是 | ❌ 否 | 低 |
+
+### 9.3 推荐方案
+
+#### 方案 A：使用 logger.exception（最简单，推荐）
+
+```python
+def _scheduled_task_wrapper(callable):
+    try:
+        callable()
+    except Exception as e:
+        # logger.exception 自动包含异常堆栈
+        logger.exception("Error in scheduled task func='%s'", callable.__name__)
+        # 不向外抛出，保证同批任务继续执行
+```
+
+**优点**：
+- 保留完整堆栈跟踪，便于调试
+- 同批次任务继续执行
+- 改动最小，只需修改一行代码
+
+**缺点**：
+- `@repeat_every` 的异常处理逻辑仍然是死代码
+
+#### 方案 B：收集所有异常，批量抛出（最完整）
+
+修改 `run_daily()` 等函数，收集所有任务的异常：
+
+```python
+def run_daily():
+    logger.debug("Running daily callbacks")
+    exceptions = []
+    
+    for func in SchedulerRegistry._daily:
+        try:
+            func()  # 直接调用，不使用 wrapper
+        except Exception as e:
+            logger.exception("Error in scheduled task func='%s'", func.__name__)
+            exceptions.append((func.__name__, e))
+    
+    # 所有任务执行完毕后，如果有异常，向外抛出
+    if exceptions:
+        error_msg = f"{len(exceptions)} tasks failed: " + \
+                   ", ".join([f"{name}: {exc}" for name, exc in exceptions])
+        raise RuntimeError(error_msg)
+```
+
+**优点**：
+- 每个任务有完整堆栈
+- 同批次任务全部执行
+- 外层 `@repeat_every` 可以捕获到异常，进行统一处理
+- 可以知道本次批次有多少任务失败
+
+**缺点**：
+- 改动较大，需要修改三个 `run_xxx` 函数
+- 异常聚合后可能丢失原始异常类型
+
+#### 方案 C：移除 wrapper，在 for 循环内捕获（简洁）
+
+```python
+def run_daily():
+    logger.debug("Running daily callbacks")
+    for func in SchedulerRegistry._daily:
+        try:
+            func()
+        except Exception as e:
+            logger.exception("Error in scheduled task func='%s'", func.__name__)
+            # 不抛出，继续下一个任务
+```
+
+**优点**：
+- 保留完整堆栈
+- 同批次任务继续执行
+- 减少一层函数调用，更简洁
+
+**缺点**：
+- 代码重复（三个 `run_xxx` 函数都要写 try-catch）
+- `@repeat_every` 的异常处理逻辑仍然是死代码
+
+### 9.4 最终建议
+
+**短期方案**：采用方案 A，将 `logger.error` 改为 `logger.exception`，保留堆栈。
+
+**长期方案**：如果需要 `@repeat_every` 的异常处理生效，采用方案 B，收集所有异常后批量抛出。
+
+---
+
+## 十、完整调用链时序图
 
 ```
 应用启动
@@ -329,6 +563,10 @@ lifespan_fn()
 每小时触发: run_hourly() → 遍历 _hourly → wrapper(task)  
 每日触发: run_daily() → 遍历 _daily → wrapper(task)
 
+手动触发: POST /households/webhooks/rerun
+   ↓
+rerun_webhooks() → 直接调用 post_group_webhooks(今日零点, 当前组)
+
 应用关闭
    ↓
 lifespan_fn yield 后执行
@@ -340,49 +578,60 @@ logger.info("-----SYSTEM SHUTDOWN-----")
 
 ---
 
-## 八、潜在问题与代码缺陷
+## 十一、潜在问题与代码缺陷
 
-### 8.1 已确认的问题
+### 11.1 已确认的问题
 
 1. **关闭时无优雅停机**：应用关闭时没有等待正在执行的任务完成，可能导致任务中断
 2. **单 worker 限制**：tasks 模块注释中说明 "Scheduler object is only available to a single worker"，因此 uvicorn 配置为 `workers=1`
 3. **全局状态**：`post_group_webhooks` 使用全局变量 `last_ran`，多实例部署时会有问题
 4. **任务串行执行**：同批次任务按注册顺序串行执行，前一个任务慢会影响后一个
 5. **无重试机制**：任务失败后仅打日志，不会重试，需等待下一个周期
+6. **注册无去重**：`SchedulerRegistry._register` 直接 append，多次注册导致任务重复执行
+7. **手动触发副作用**：`rerun_webhooks` 更新 `last_ran`，影响后续调度触发的查询范围
 
-### 8.2 本次分析发现的异常处理缺陷
+### 11.2 异常处理缺陷
 
-6. **异常无堆栈跟踪**：`_scheduled_task_wrapper` 只打印函数名和异常消息，没有堆栈，调试困难
-7. **异常处理代码冗余**：`@repeat_every` 中的完整堆栈打印代码实际上是死代码，不会被触发
-8. **两层 try-catch 意图冲突**：设计上看似有两层防护，但内层 wrapper 吞掉异常导致外层失效
-9. **异常静默**：任务失败后除了日志没有任何告警机制，问题可能长时间不被发现
+8. **异常无堆栈跟踪**：`_scheduled_task_wrapper` 只用 `logger.error`，没有堆栈，调试困难
+9. **异常处理代码冗余**：`@repeat_every` 中的完整堆栈打印代码实际上是死代码，不会被触发
+10. **两层 try-catch 意图冲突**：设计上看似有两层防护，但内层 wrapper 吞掉异常导致外层失效
+11. **异常静默**：任务失败后除了日志没有任何告警机制，问题可能长时间不被发现
+12. **手动触发无异常处理**：`rerun_webhooks` 直接调用任务函数，异常会导致 API 返回 500
 
-### 8.3 异常处理改进建议
+### 11.3 改进建议汇总
 
-如果想保留完整堆栈，应该修改 `_scheduled_task_wrapper`：
+#### 注册去重
+```python
+@staticmethod
+def _register(name: str, callbacks: list[Callable], callback: Iterable[Callable]):
+    for cb in callback:
+        if cb not in callbacks:  # 添加去重检查
+            logger.debug(f"Registering {name} callback: {cb.__name__}")
+            callbacks.append(cb)
+        else:
+            logger.debug(f"Skipping duplicate {name} callback: {cb.__name__}")
+```
 
+#### 异常处理（推荐方案 A）
 ```python
 def _scheduled_task_wrapper(callable):
     try:
         callable()
     except Exception as e:
-        # 方案1：使用 logger.exception 自动打印堆栈
         logger.exception("Error in scheduled task func='%s'", callable.__name__)
-        
-        # 或者方案2：向外抛出，让 @repeat_every 处理堆栈打印
-        # raise
 ```
 
-如果想让 `@repeat_every` 的异常处理生效，应该移除 `_scheduled_task_wrapper`，直接在 `run_daily` 中调用：
-
+#### 手动触发避免副作用
 ```python
-def run_daily():
-    logger.debug("Running daily callbacks")
-    for func in SchedulerRegistry._daily:
-        try:
-            func()
-        except Exception as e:
-            logger.error("Error in scheduled task func='%s': exception='%s'", 
-                        func.__name__, e)
-            # 继续执行下一个任务
+@router.post("/rerun")
+def rerun_webhooks(self):
+    start_time = datetime.min.time()
+    start_dt = datetime.combine(datetime.now(UTC).date(), start_time)
+    # 传入一个临时变量，不更新全局 last_ran
+    original_last_ran = post_group_webhooks.last_ran
+    try:
+        post_group_webhooks(start_dt=start_dt, group_id=self.group.id, 
+                           household_id=self.household.id, update_last_ran=False)
+    finally:
+        post_group_webhooks.last_ran = original_last_ran
 ```
