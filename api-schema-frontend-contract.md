@@ -558,8 +558,8 @@ export interface PaginationData<T> {  // 对应后端 PaginationBase
   items: T[];
 }
 
-// ✅ 数据结构类型：后端有 StandardizedUnitType(StrEnum)，但未生成
-export type StandardizedUnitType
+// ✅ UI 约束类型：仅用于前端单位页下拉选项，不是 API 契约
+export type StandardizedUnitType  // 后端对外字段是 standard_unit: str|None
   = | "fluid_ounce"
     | "cup"
     | "ounce"
@@ -575,9 +575,45 @@ export type StandardizedUnitType
 | `PaginationBase<T>` | ❌ 缺失，需手写 `PaginationData<T>` | 泛型类 pydantic2ts 不支持 |
 | `MultiPurposeLabelPagination` | ❌ 缺失，复用 `PaginationData<T>` | 继承泛型基类导致生成失败 |
 | `RecipePagination` | ❌ 缺失，复用 `PaginationData<T>` | 继承泛型基类导致生成失败 |
-| `StandardizedUnitType(StrEnum)` | ❌ 缺失，需手动重定义 | 可能是模块导出或清理逻辑问题 |
 
 > **代码证据**：`labels.ts` 中只有 `MultiPurposeLabelCreate/Out/Save/Summary/Update`，没有 `MultiPurposeLabelPagination`（后端 [multi_purpose_label.py:29](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/labels/multi_purpose_label.py#L29) 有定义）。
+
+#### 澄清：StandardizedUnitType 不需要生成的原因
+
+**后端实际对外字段**（[recipe_ingredient.py:156](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/recipe/recipe_ingredient.py#L156)）：
+```python
+class IngredientUnitSave(MealieModel):
+    standard_unit: str | None = None  # ✅ 字段类型是 str，不是 StandardizedUnitType 枚举
+```
+
+**前端生成类型**（[recipe.ts:89](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/lib/api/types/recipe.ts#L89)）：
+```typescript
+export interface CreateIngredientUnit {
+  standardUnit?: string | null;  // ✅ 正确生成为可选字符串类型
+}
+```
+
+**后端 StandardizedUnitType(StrEnum)**（[recipe_ingredient.py:38-58](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/mealie/schema/recipe/recipe_ingredient.py#L38-L58)）：
+```python
+class StandardizedUnitType(StrEnum):
+    """An arbitrary list of standardized units supported by unit conversions.
+    The backend doesn't really care what standardized unit you use, as long as it's recognized,
+    but defining them here keeps it consistant with the frontend."""
+    FLUID_OUNCE = "fluid_ounce"
+    CUP = "cup"
+    # ...
+```
+
+**前端手写 StandardizedUnitType**（[units.vue:245-247](file:///d:/fz/0601/solo-dogfeeding/code/34-mealie/frontend/app/pages/group/data/units.vue#L245-L247)）：
+```typescript
+// ✅ 仅用于单位页下拉选项的类型约束，不是 API 契约
+type StandardizedUnitTypeOption = {
+  text: string;
+  value: StandardizedUnitType;  // 约束下拉选项的 value 只能是枚举值
+};
+```
+
+> **关键事实**：`StandardizedUnitType(StrEnum)` 是后端内部转换用的枚举，不作为对外 API 类型。对外字段是 `standard_unit: str | None`，生成类型正确生成为 `standardUnit?: string | null`。前端手写的 `StandardizedUnitType` 仅用于单位页下拉选项约束，与后端 API 契约无关。
 
 #### 为什么需要手写类型？
 
@@ -586,7 +622,7 @@ export type StandardizedUnitType
 3. **运行时枚举**：`enum Organizer` 用于运行时逻辑判断，字符串字面量类型仅用于编译时
 4. **类型体操工具**：`NoUndefinedField<T>` 是 TypeScript 高级类型，Pydantic 无对应概念
 5. **外部库依赖**：引用 `axios` 类型，不属于后端契约
-6. **代码生成遗漏**：`StandardizedUnitType` 等后端有定义但生成失败的类型，需手动同步
+6. **UI 约束类型**：`StandardizedUnitType` 等仅用于前端表单验证/下拉选项的类型约束，与后端 API 契约无关
 
 #### 边界规则：修正后的实际约定
 
@@ -608,9 +644,12 @@ if (type === Organizer.Category) { /* 运行时判断 */ }
 > **⚠️ 实际约定**：
 > 1. 后端 Pydantic Schema 是数据结构的唯一真值源
 > 2. 优先使用自动生成的类型
-> 3. 当生成类型缺失时（如泛型、枚举），前端可手动定义对应类型，但**必须与后端 Schema 保持一致**
+> 3. 当生成类型缺失时（如泛型分页），前端可手动定义对应类型，但**必须与后端 Schema 保持一致**
 > 4. 禁止前端定义后端不存在的数据字段
-> 5. 手写类型仅限：前端架构封装 + 生成失败的数据类型补全
+> 5. 手写类型分两类：
+>    - **架构封装类**：`ApiRequestInstance`、`RequestResponse<T>`、`NoUndefinedField<T>` 等前端架构需要的类型
+>    - **UI 约束类**：`StandardizedUnitType`、`Organizer` 等仅用于前端表单验证/下拉选项的类型约束，**不构成 API 契约**
+> 6. 对于 API 数据字段，生成类型是权威的，如 `standardUnit?: string | null`（由 `standard_unit: str | None` 生成）
 
 ---
 
