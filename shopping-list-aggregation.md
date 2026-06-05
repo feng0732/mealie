@@ -10,7 +10,7 @@
 
 ### 1.1 食谱食材提取流程
 
-核心逻辑位于 [shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L323-L411) 的 `get_shopping_list_items_from_recipe` 方法。
+核心逻辑位于 [mealie/services/household_services/shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L323-L411) 的 `get_shopping_list_items_from_recipe` 方法。
 
 **处理步骤：**
 
@@ -64,7 +64,7 @@
 
 ### 1.3 多食谱批量添加
 
-`add_recipe_ingredients_to_list` 方法（`mealie/services/household_services/shopping_lists.py` L413-L455）支持批量添加多个食谱：
+`add_recipe_ingredients_to_list` 方法位于 [mealie/services/household_services/shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L413-L455)，支持批量添加多个食谱：
 
 1. 遍历所有食谱，调用 `get_shopping_list_items_from_recipe` 生成待创建项
 2. 调用 `bulk_create_items` 进行批量创建与合并
@@ -78,7 +78,7 @@
 
 ### 2.1 可合并条件判断
 
-`can_merge` 方法位于 [shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L45-L71)。
+`can_merge` 方法位于 [mealie/services/household_services/shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L45-L71)。
 
 **不可合并的前置条件（满足任一即不可合并）：**
 
@@ -106,7 +106,7 @@ return bool(item1.food_id) or item1.note == item2.note
 
 ### 2.2 合并执行流程
 
-`merge_items` 方法位于 [shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L73-L128)。
+`merge_items` 方法位于 [mealie/services/household_services/shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/household_services/shopping_lists.py#L73-L128)。
 
 **合并优先级：** `to_item`（已有项）的属性优先于 `from_item`（新项）。
 
@@ -152,7 +152,7 @@ return bool(item1.food_id) or item1.note == item2.note
 
 ## 三、数量换算逻辑
 
-数量换算使用 [unit_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/parser_services/parser_utils/unit_utils.py) 中的 `UnitConverter` 类和 `merge_quantity_and_unit` 函数。
+数量换算使用 [mealie/services/parser_services/parser_utils/unit_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/parser_services/parser_utils/unit_utils.py) 中的 `UnitConverter` 类和 `merge_quantity_and_unit` 函数。
 
 ### 3.1 单位转换基础
 
@@ -241,7 +241,7 @@ if update_item.quantity < 0:
 
 ### 4.2 前端状态管理
 
-前端状态位于 [use-shopping-list-state.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-state.ts)。
+前端状态位于 [frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-state.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-state.ts)。
 
 **列表分组：**
 
@@ -267,7 +267,7 @@ function sortCheckedItems(a: ShoppingListItemOut, b: ShoppingListItemOut) {
 
 ### 4.3 全选/取消全选
 
-位于 [use-shopping-list-crud.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-crud.ts)。
+位于 [frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-crud.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/shopping-list-page/sub-composables/use-shopping-list-crud.ts)。
 
 **全选流程**（L38-L49）：
 - 遍历所有未勾选项，设置 `checked = true`
@@ -341,7 +341,7 @@ item.updatedAt = new Date().toISOString();
 **删除已勾选项**：
 1. 筛选所有 `checked=true` 的项
 2. 调用 `bulk_delete_items` 批量删除
-3. 定时任务自动清理：[delete_old_checked_shopping_list_items.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py)
+3. 定时任务自动清理：[mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py)
 
 **移除食谱时的递减逻辑**（`remove_recipe_ingredients_from_list` L457-L539）：
 
@@ -371,7 +371,7 @@ item.updatedAt = new Date().toISOString();
 
 ### 4.7 离线队列机制
 
-位于 [use-shopping-list-item-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/use-shopping-list-item-actions.ts)。
+位于 [frontend/app/composables/use-shopping-list-item-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/frontend/app/composables/use-shopping-list-item-actions.ts)。
 
 - 所有操作先进入本地 localStorage 队列
 - 队列包含 `create`、`update`、`delete` 三个子队列
@@ -402,7 +402,7 @@ item.updatedAt = new Date().toISOString();
 
 ### ShoppingListItemBase
 
-位于 [group_shopping_list.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/schema/household/group_shopping_list.py#L58-L76)。
+位于 [mealie/schema/household/group_shopping_list.py](file:///d:/fz/0601/solo-dogfeeding/code/33-mealie/mealie/schema/household/group_shopping_list.py#L58-L76)。
 
 ```python
 class ShoppingListItemBase(RecipeIngredientBase):
