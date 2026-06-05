@@ -341,7 +341,37 @@ item.updatedAt = new Date().toISOString();
 **删除已勾选项**：
 1. 筛选所有 `checked=true` 的项
 2. 调用 `bulk_delete_items` 批量删除
-3. 定时任务自动清理：`mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py`
+
+**定时任务自动清理**（`mealie/services/scheduler/tasks/delete_old_checked_shopping_list_items.py`）：
+
+定时任务 `delete_old_checked_list_items()` 会定期清理所有购物清单中过多的已勾选项，规则如下：
+
+1. **最大保留数量**：`MAX_CHECKED_ITEMS = 100`，每个购物清单最多保留 100 个已勾选项
+2. **排序规则**：按 `updated_at` **倒序** 排列（最近勾选的排在最前）
+3. **截断逻辑**：如果已勾选项数量超过 100，保留前 100 项，删除从第 101 项开始的所有旧项
+4. **执行范围**：遍历系统中所有 `groups` → 每个 group 的所有 `households` → 每个 household 的所有 `shopping lists`
+
+**核心代码**：
+
+```python
+MAX_CHECKED_ITEMS = 100
+
+def _trim_list_items(shopping_list_service, shopping_list_id, event_publisher):
+    pagination = PaginationQuery(
+        page=1,
+        per_page=-1,
+        query_filter=f'shopping_list_id="{shopping_list_id}" AND checked=true',
+        order_by="updated_at",
+        order_direction=OrderDirection.desc,  # 倒序：最新的在前
+    )
+    query = shopping_list_service.list_items.page_all(pagination)
+    if len(query.items) <= MAX_CHECKED_ITEMS:
+        return
+
+    items_to_delete = query.items[MAX_CHECKED_ITEMS:]  # 保留前100，删除后面的
+    items_response = shopping_list_service.bulk_delete_items([item.id for item in items_to_delete])
+    publish_list_item_events(event_publisher, items_response)
+```
 
 **移除食谱时的递减逻辑**（`remove_recipe_ingredients_from_list` L457-L539）：
 
@@ -444,3 +474,5 @@ class ShoppingListItemRecipeRefCreate(MealieModel):
 | 全选操作 | 不更新 updatedAt，排序不变 |
 | 单个勾选 | 设置临时 updatedAt，立即排到最前 |
 | scale != 1 时同一食谱内重复食材 | 合并时数量少加了 scale 倍 |
+| 已勾选项超过 100 个 | 定时任务按 updated_at 倒序保留前 100 项，删除旧项 |
+| 勾选时间（updatedAt） | 影响已勾选项排序和定时任务清理顺序 |
