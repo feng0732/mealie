@@ -157,12 +157,12 @@ def purge_expired_tokens() -> None:
 另一个例子 `post_group_webhooks()` 使用全局变量追踪状态：
 
 ```python
-last_ran = datetime.now(UTC)  # 全局状态变量
+last_ran = datetime.now(UTC)  # 模块级全局变量
 
 def post_group_webhooks(start_dt: datetime | None = None, ...) -> None:
     global last_ran
     start_dt = start_dt or last_ran  # 从上一次运行时间开始查询
-    last_ran = end_dt = datetime.now(UTC)  # 更新本次运行时间
+    last_ran = end_dt = datetime.now(UTC)  # 无条件更新本次运行时间
     # ... 查询并发送 webhook
 ```
 
@@ -195,27 +195,102 @@ rerun_webhooks() 控制器方法
 直接调用 post_group_webhooks(start_dt, group_id, household_id)
     ↓
 post_group_webhooks() 执行
-    ├─ 不使用 last_ran，使用传入的 start_dt
-    ├─ 更新全局变量 last_ran = 当前时间
+    ├─ 使用传入的 start_dt = 今日零点（不使用 last_ran）
+    ├─ 【关键】无条件更新全局变量 last_ran = 当前时间
     ├─ 查询指定 group 和 household 的 mealplan 事件
     └─ 通过 EventBusService 分发 webhook 事件
 ```
 
 ### 5.3 关键特性
 
-1. **同步执行**：直接调用任务函数，不经过调度器，API 响应会等待任务完成
+1. **同步执行**：直接调用任务函数，不经过调度器和 wrapper，API 响应会等待任务完成
 2. **参数定制**：
    - `start_dt` 设为今日零点，重投今天所有 webhook
    - `group_id` 和 `household_id` 限定为当前用户所属组
-3. **副作用**：更新全局变量 `last_ran`，会影响后续调度器触发的执行（下一次调度从当前时间开始查询）
-4. **无异常处理**：控制器直接调用，没有 try-catch，如果任务抛出异常会返回 500 错误
+3. **无异常处理**：控制器直接调用，没有 try-catch，如果任务抛出异常会返回 500 错误
 
-### 5.4 与调度触发的区别
+### 5.4 【纠正】手动触发的副作用分析
 
-| 触发方式 | 调用路径 | start_dt | group_id | 异常处理 |
-|---------|---------|----------|----------|---------|
-| 调度触发 | run_minutely() → wrapper → post_group_webhooks() | last_ran（上一次运行时间） | 所有组 | wrapper 捕获，打日志 |
-| 手动触发 | rerun_webhooks() → post_group_webhooks() | 今日 00:00:00 | 当前用户组 | 无捕获，抛出 500 |
+**副作用根因**：`post_group_webhooks` 函数中 `last_ran` 是**无条件更新**的：
+
+```python
+def post_group_webhooks(start_dt: datetime | None = None, ...) -> None:
+    global last_ran
+    start_dt = start_dt or last_ran  # 只有 start_dt 为 None 时才用 last_ran
+    last_ran = end_dt = datetime.now(UTC)  # 【关键】不管有没有传 start_dt，都更新 last_ran
+```
+
+**副作用场景**：
+
+```
+时间线：
+10:00 - 调度触发 post_group_webhooks()
+        → last_ran = 10:00
+        → 查询 [09:55, 10:00] 的事件并发送
+
+10:03 - 用户调用 rerun_webhooks()
+        → 传入 start_dt = 今日 00:00
+        → 查询 [00:00, 10:03] 的事件并发送
+        → 【副作用】last_ran = 10:03  ← 全局变量被修改！
+
+10:05 - 调度触发 post_group_webhooks()
+        → start_dt = last_ran = 10:03  ← 不是预期的 10:00！
+        → 只查询 [10:03, 10:05] 的事件
+        → 【问题】10:00 - 10:03 之间产生的新事件不会被发送！
+```
+
+**影响范围**：
+- 不仅影响当前用户的组，而是**影响所有组**（因为 `last_ran` 是模块级全局变量）
+- 所有后续调度触发的 `post_group_webhooks` 都会从 rerun 的执行时间开始查询
+
+### 5.5 与调度触发的区别
+
+| 触发方式 | 调用路径 | start_dt | group_id | 异常处理 | 是否更新 last_ran |
+|---------|---------|----------|----------|---------|------------------|
+| 调度触发 | run_minutely() → wrapper → post_group_webhooks() | last_ran（上一次运行时间） | 所有组 | wrapper 捕获打日志 | ✅ 是 |
+| 手动触发 | rerun_webhooks() → post_group_webhooks() | 今日 00:00:00 | 当前用户组 | 无捕获，抛出 500 | ✅ 是（无条件！） |
+
+### 5.6 避免副作用的正确方法
+
+由于 `post_group_webhooks` 没有提供参数控制是否更新 `last_ran`，需要通过保存/恢复的方式避免副作用：
+
+```python
+import mealie.services.scheduler.tasks.post_webhooks as webhook_module
+
+@router.post("/rerun")
+def rerun_webhooks(self):
+    start_time = datetime.min.time()
+    start_dt = datetime.combine(datetime.now(UTC).date(), start_time)
+    
+    # 保存原始 last_ran
+    original_last_ran = webhook_module.last_ran
+    try:
+        post_group_webhooks(
+            start_dt=start_dt, 
+            group_id=self.group.id, 
+            household_id=self.household.id
+        )
+    finally:
+        # 恢复 last_ran，不影响后续调度
+        webhook_module.last_ran = original_last_ran
+```
+
+**或者**，修改 `post_group_webhooks` 函数，增加控制参数：
+
+```python
+def post_group_webhooks(
+    start_dt: datetime | None = None, 
+    group_id: UUID4 | None = None, 
+    household_id: UUID4 | None = None,
+    update_last_ran: bool = True  # 新增参数
+) -> None:
+    global last_ran
+    start_dt = start_dt or last_ran
+    end_dt = datetime.now(UTC)
+    if update_last_ran:  # 条件更新
+        last_ran = end_dt
+    # ... 后续逻辑不变
+```
 
 ---
 
@@ -235,7 +310,46 @@ def _register(name: str, callbacks: list[Callable], callback: Iterable[Callable]
 
 **问题**：没有去重逻辑，如果 `register_daily()` 等方法被多次调用，同一个任务会被多次添加到列表中。
 
-### 6.2 重复注册场景
+### 6.2 【纠正】运行期列表的读取方式
+
+`run_daily()`、`run_hourly()`、`run_minutely()` 的实现：
+
+```python
+@repeat_every(minutes=MINUTES_DAY, wait_first=False, logger=logger)
+def run_daily():
+    logger.debug("Running daily callbacks")
+    for func in SchedulerRegistry._daily:  # 【关键】每次执行时重新读取列表
+        _scheduled_task_wrapper(func)
+```
+
+**重要发现**：列表是**动态读取**的，不是在装饰器启动时就固定下来的。每次调度触发时，都会重新读取 `SchedulerRegistry._daily` 的当前内容。
+
+### 6.3 【纠正】启动后追加任务的实际影响
+
+由于列表是动态读取的，**启动后追加任务是有效的**：
+
+```python
+# 应用启动时
+await start_scheduler()  # 注册 task1, task2，_daily = [task1, task2]
+                        # 启动 @repeat_every 循环
+
+# 应用运行中某个时刻（启动后）
+SchedulerRegistry.register_daily(task3)  # 动态追加，_daily = [task1, task2, task3]
+
+# 下一次调度触发时
+def run_daily():
+    for func in SchedulerRegistry._daily:  # 读取到的是 [task1, task2, task3]
+        _scheduled_task_wrapper(func)      # task3 会被执行！
+```
+
+**之前描述的错误**："必须在 SchedulerService.start() 之前注册"是不准确的。
+
+**正确结论**：
+- ✅ 启动前注册：有效，从第一次调度就执行
+- ✅ 启动后动态注册：有效，从下一次调度开始执行
+- ⚠️ 注意：如果 `@repeat_every` 的 `wait_first=True`，第一次执行会等待一个周期后才开始
+
+### 6.4 重复注册场景与后果
 
 场景 1：`start_scheduler()` 被多次调用
 ```python
@@ -255,14 +369,14 @@ SchedulerRegistry.register_daily(task1, task2)
 SchedulerRegistry.register_daily(task1)  # task1 被添加第二次
 ```
 
-### 6.3 重复执行的后果
+**重复执行的后果**：
 
 每次调度触发时，`run_daily()` 会遍历整个列表：
 
 ```python
 def run_daily():
-    for func in SchedulerRegistry._daily:  # 列表中有重复项
-        _scheduled_task_wrapper(func)      # 重复的任务会被执行多次
+    for func in SchedulerRegistry._daily:  # 列表中有重复项 [task1, task2, task1]
+        _scheduled_task_wrapper(func)      # task1 会被执行两次！
 ```
 
 **影响**：
@@ -271,11 +385,11 @@ def run_daily():
 - 状态修改类任务：可能导致数据不一致
 - 性能影响：任务越多，调度周期被拉长越多
 
-### 6.4 其他注册生命周期问题
+### 6.5 其他注册生命周期问题
 
-1. **无注销机制**：应用运行中无法动态移除已注册的任务（虽然有 `remove_daily()` 方法，但没有被使用）
-2. **注册时机**：必须在 `SchedulerService.start()` 之前注册，否则已启动的循环不会包含新任务
-3. **列表非线程安全**：`_daily` 等是普通 list，并发注册可能有问题（虽然当前都是启动时同步注册）
+1. **无注销机制**：虽然有 `remove_daily()` 方法，但目前代码中没有被使用，应用运行中无法动态移除已注册的任务
+2. **列表非线程安全**：`_daily` 等是普通 `list`，并发注册可能有问题（虽然当前都是启动时同步注册）
+3. **注册后立即生效**：由于列表是动态读取的，注册后下一次调度就会执行新任务
 
 ---
 
@@ -300,7 +414,7 @@ def session_context() -> Generator[Session, None, None]:
 - 异常情况下也能保证资源释放（finally 块执行）
 
 ### 7.2 任务间的状态维护
-- `post_group_webhooks` 使用全局变量 `last_ran` 记录上次执行时间，避免重复发送
+- `post_group_webhooks` 使用模块级全局变量 `last_ran` 记录上次执行时间，避免重复发送
 - 其他无状态任务（如清理类）每次独立执行
 
 ### 7.3 应用关闭时的收尾
@@ -456,7 +570,7 @@ def run_daily():
 
 ### 9.3 推荐方案
 
-#### 方案 A：使用 logger.exception（最简单，推荐）
+#### 方案 A：使用 logger.exception（最简单，推荐短期使用）
 
 ```python
 def _scheduled_task_wrapper(callable):
@@ -476,7 +590,7 @@ def _scheduled_task_wrapper(callable):
 **缺点**：
 - `@repeat_every` 的异常处理逻辑仍然是死代码
 
-#### 方案 B：收集所有异常，批量抛出（最完整）
+#### 方案 B：收集所有异常，批量抛出（最完整，推荐长期使用）
 
 修改 `run_daily()` 等函数，收集所有任务的异常：
 
@@ -559,13 +673,19 @@ lifespan_fn()
 
 应用运行中...
    ↓
-每5分钟触发: run_minutely() → 遍历 _minutely → wrapper(task)
-每小时触发: run_hourly() → 遍历 _hourly → wrapper(task)  
-每日触发: run_daily() → 遍历 _daily → wrapper(task)
+每5分钟触发: run_minutely() → 遍历 _minutely（动态读取）→ wrapper(task)
+每小时触发: run_hourly() → 遍历 _hourly（动态读取）→ wrapper(task)  
+每日触发: run_daily() → 遍历 _daily（动态读取）→ wrapper(task)
 
 手动触发: POST /households/webhooks/rerun
    ↓
 rerun_webhooks() → 直接调用 post_group_webhooks(今日零点, 当前组)
+   ↓
+【副作用】无条件更新全局 last_ran，影响所有后续调度
+
+运行中动态注册: SchedulerRegistry.register_daily(new_task)
+   ↓
+下一次调度触发时，run_daily() 读取到新任务并执行
 
 应用关闭
    ↓
@@ -584,11 +704,11 @@ logger.info("-----SYSTEM SHUTDOWN-----")
 
 1. **关闭时无优雅停机**：应用关闭时没有等待正在执行的任务完成，可能导致任务中断
 2. **单 worker 限制**：tasks 模块注释中说明 "Scheduler object is only available to a single worker"，因此 uvicorn 配置为 `workers=1`
-3. **全局状态**：`post_group_webhooks` 使用全局变量 `last_ran`，多实例部署时会有问题
+3. **全局状态**：`post_group_webhooks` 使用模块级全局变量 `last_ran`，多实例部署时会有问题
 4. **任务串行执行**：同批次任务按注册顺序串行执行，前一个任务慢会影响后一个
 5. **无重试机制**：任务失败后仅打日志，不会重试，需等待下一个周期
 6. **注册无去重**：`SchedulerRegistry._register` 直接 append，多次注册导致任务重复执行
-7. **手动触发副作用**：`rerun_webhooks` 更新 `last_ran`，影响后续调度触发的查询范围
+7. **【纠正】手动触发副作用真实存在**：`rerun_webhooks` 无条件更新 `last_ran`，会漏掉 rerun 时间到上次调度时间之间的事件，且影响所有组
 
 ### 11.2 异常处理缺陷
 
@@ -598,7 +718,13 @@ logger.info("-----SYSTEM SHUTDOWN-----")
 11. **异常静默**：任务失败后除了日志没有任何告警机制，问题可能长时间不被发现
 12. **手动触发无异常处理**：`rerun_webhooks` 直接调用任务函数，异常会导致 API 返回 500
 
-### 11.3 改进建议汇总
+### 11.3 【补充】注册生命周期问题
+
+13. **列表动态读取导致的并发风险**：`_daily` 等是普通 `list`，如果运行中动态注册任务，遍历时可能有并发问题
+14. **缺少注册状态查询**：无法查询某个任务是否已注册，只能通过 `print_jobs()` 打日志
+15. **remove 方法未使用**：虽然有 `remove_daily()` 等方法，但实际代码中没有调用场景
+
+### 11.4 改进建议汇总
 
 #### 注册去重
 ```python
@@ -612,7 +738,7 @@ def _register(name: str, callbacks: list[Callable], callback: Iterable[Callable]
             logger.debug(f"Skipping duplicate {name} callback: {cb.__name__}")
 ```
 
-#### 异常处理（推荐方案 A）
+#### 异常处理（推荐方案 A：短期）
 ```python
 def _scheduled_task_wrapper(callable):
     try:
@@ -621,17 +747,53 @@ def _scheduled_task_wrapper(callable):
         logger.exception("Error in scheduled task func='%s'", callable.__name__)
 ```
 
-#### 手动触发避免副作用
+#### 手动触发避免副作用（保存恢复法）
 ```python
+import mealie.services.scheduler.tasks.post_webhooks as webhook_module
+
 @router.post("/rerun")
 def rerun_webhooks(self):
     start_time = datetime.min.time()
     start_dt = datetime.combine(datetime.now(UTC).date(), start_time)
-    # 传入一个临时变量，不更新全局 last_ran
-    original_last_ran = post_group_webhooks.last_ran
+    
+    # 保存原始 last_ran
+    original_last_ran = webhook_module.last_ran
     try:
-        post_group_webhooks(start_dt=start_dt, group_id=self.group.id, 
-                           household_id=self.household.id, update_last_ran=False)
+        post_group_webhooks(
+            start_dt=start_dt, 
+            group_id=self.group.id, 
+            household_id=self.household.id
+        )
     finally:
-        post_group_webhooks.last_ran = original_last_ran
+        # 恢复 last_ran，不影响后续调度
+        webhook_module.last_ran = original_last_ran
+```
+
+#### 手动触发避免副作用（修改函数法，推荐）
+```python
+# 修改 post_webhooks.py
+def post_group_webhooks(
+    start_dt: datetime | None = None, 
+    group_id: UUID4 | None = None, 
+    household_id: UUID4 | None = None,
+    update_last_ran: bool = True
+) -> None:
+    global last_ran
+    start_dt = start_dt or last_ran
+    end_dt = datetime.now(UTC)
+    if update_last_ran:
+        last_ran = end_dt
+    # ...
+
+# 修改 controller_webhooks.py
+@router.post("/rerun")
+def rerun_webhooks(self):
+    start_time = datetime.min.time()
+    start_dt = datetime.combine(datetime.now(UTC).date(), start_time)
+    post_group_webhooks(
+        start_dt=start_dt, 
+        group_id=self.group.id, 
+        household_id=self.household.id,
+        update_last_ran=False  # 不更新全局状态
+    )
 ```
