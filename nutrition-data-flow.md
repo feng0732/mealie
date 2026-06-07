@@ -212,18 +212,118 @@ def update_one(self, slug_or_id: str | UUID, update_data: Recipe) -> Recipe:
     return new_data
 ```
 
-**Repository 层**：[repository_recipes.py#L204-L218](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/repos/repository_recipes.py#L204-L218)
+### 3.4 保存链路的字段名转换：camelCase ↔ snake_case 完整追踪
 
-```python
-def update(self, match_value, new_data: dict | Recipe) -> Recipe:
-    new_data = new_data if isinstance(new_data, dict) else new_data.model_dump()
-    entry = self._query_one(match_value=match_value)
-    entry.update(session=self.session, **new_data)
-    self.session.commit()
-    return self.schema.model_validate(entry)
+前端保存到数据库写入之间，字段名会经过 **三次格式转换**，对 Nutrition 子对象尤其关键。
+
+#### 转换链路全景
+
+```
+前端 TS 内存 (camelCase)
+  │  axios.put(recipe.value)
+  ▼
+HTTP JSON Payload (camelCase)
+  │  { "nutrition": { "carbohydrateContent": "30", ... } }
+  ▼
+FastAPI 路由层 (data: Recipe)
+  │  Pydantic alias_generator=camelize + populate_by_name=True
+  │  → 同时接受 camelCase 和 snake_case
+  ▼
+Pydantic Recipe 对象 (snake_case 内部属性)
+  │  recipe.nutrition.carbohydrate_content
+  ▼
+Repository.update()
+  │  new_data.model_dump()  ← 关键：默认 by_alias=False，输出 snake_case
+  ▼
+dict (snake_case)
+  │  { "nutrition": { "carbohydrate_content": "30", ... } }
+  ▼
+entry.update(**new_data)
+  │  BaseMixins.update() 调用 self.__init__(session=..., **new_data)
+  ▼
+RecipeModel.__init__
+  │  nutrition: dict | None = None
+  │  self.nutrition = Nutrition(**(nutrition or {}))
+  ▼
+Nutrition.__init__
+  │  def __init__(self, carbohydrate_content=None, ...)
+  ▼
+SQLAlchemy 写入 DB (snake_case 列名)
 ```
 
-`entry.update()` 是 SQLAlchemy 模型的通用更新方法，会遍历 new_data 的键值对，设置到 ORM 对象上。对于 nutrition 字段，Pydantic `model_dump()` 会输出 camelCase 键名（如 `carbohydrateContent`），由 ORM 的别名机制或字段映射处理。
+#### 各环节证据
+
+**① 前端发送 camelCase**：[RecipePage.vue#L364](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipePage/RecipePage.vue#L364)
+
+```typescript
+const { data, error } = await api.recipes.updateOne(recipe.value.slug, recipe.value);
+```
+
+`recipe.value` 是 TypeScript `Recipe` 对象，其 `nutrition` 字段使用 camelCase 键（`carbohydrateContent` 等）。Axios 序列化后 JSON payload 保持 camelCase。
+
+**② Pydantic 双格式兼容**：[mealie_model.py#L53](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/_mealie/mealie_model.py#L53)
+
+```python
+model_config = ConfigDict(alias_generator=camelize, populate_by_name=True)
+```
+
+- `alias_generator=camelize`：序列化（输出）时自动生成 camelCase 别名
+- `populate_by_name=True`：反序列化（输入）时同时接受字段名（snake_case）和别名（camelCase）
+- Nutrition 子类额外配置：[recipe_nutrition.py#L21-L24](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/recipe/recipe_nutrition.py#L21-L24)
+  ```python
+  alias_generator=to_camel,   # 使用 pydantic 标准的 to_camel（与 humps.camelize 等价）
+  coerce_numbers_to_str=True, # 数字自动转字符串
+  ```
+
+**③ model_dump() 默认输出 snake_case**：[repository_generic.py#L220](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/repos/repository_generic.py#L220)
+
+```python
+new_data = new_data if isinstance(new_data, dict) else new_data.model_dump()
+```
+
+Pydantic v2 的 `model_dump()` 默认为 `by_alias=False`，因此输出字段原名（snake_case）。Nutrition 子对象也遵守相同规则。
+
+**④ ORM update() 重走 __init__**：[_model_base.py#L41-L48](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/db/models/_model_base.py#L41-L48)
+
+```python
+class BaseMixins:
+    def update(self, *args, **kwargs):
+        self.__init__(*args, **kwargs)
+        for k, v in kwargs.items():
+            if hasattr(self, k) and v == []:
+                setattr(self, k, v)
+```
+
+RecipeModel 的 `__init__` 中 Nutrition 的处理：[recipe.py#L199-L205](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/db/models/recipe/recipe.py#L199-L205)
+
+```python
+def __init__(self, ..., nutrition: dict | None = None, ...):
+    self.nutrition = Nutrition(**(nutrition or {}))
+```
+
+**⑤ Nutrition ORM 接收 snake_case**：[nutrition.py#L36-L60](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/db/models/recipe/nutrition.py#L36-L60)
+
+```python
+def __init__(self, calories=None, carbohydrate_content=None, cholesterol_content=None,
+             fat_content=None, fiber_content=None, protein_content=None,
+             saturated_fat_content=None, sodium_content=None, sugar_content=None,
+             trans_fat_content=None, unsaturated_fat_content=None):
+```
+
+参数名全部为 snake_case，与 model_dump() 输出对齐。
+
+#### 空值 / 空对象的处理边界
+
+| 场景 | Schema 层 (validate_nutrition) | ORM 层 (Nutrition(**{})) | 结果 |
+|------|------|------|------|
+| `nutrition: null` | 保持 None | `Nutrition(**{})` → 所有字段 None | 存在一条全 NULL 的 nutrition 行 |
+| `nutrition: {}` | `v or None` → 转为 None | 同上 | 同上 |
+| `nutrition: {calories: "100"}` | 原样传递 | `Nutrition(calories="100")` | 部分字段有值，其余 NULL |
+| `nutrition: {calories: ""}` | 原样传递 | `Nutrition(calories="")` | 存储空字符串（前端 trim 判断会视为空） |
+
+**Repository 层**：[repository_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/repos/repository_recipes.py)
+
+`update()` 逻辑继承自 [repository_generic.py#L210-L226](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/repos/repository_generic.py#L210-L226)，完整流程与 create() 对称，均通过 model_dump() → ORM __init__ 的路径。
 
 ---
 
@@ -433,9 +533,201 @@ def loader_options(cls) -> list[LoaderOption]:
 
 Meal Plan 类型（[meal-plan.ts](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/lib/api/types/meal-plan.ts)）中的 `ReadPlanEntry.recipe` 也是 `RecipeSummary` 类型，不含 Nutrition。后端 meal plan 控制器中也没有 nutrition 相关处理代码。即 **Meal Plan 模块不做营养汇总统计**。
 
+### 6.4 公开分享页面
+
+分享页面复用了同一个 Recipe 组件，通过独立的公开 API 获取数据。
+
+**前端页面**：[[id].vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue)
+
+```typescript
+const api = usePublicApi();
+const { data: recipe } = await useAsyncData("recipe", async () => {
+  const { data, error } = await api.shared.getShared(recipeId);
+  return data;
+});
+```
+
+获取后直接渲染 `<RecipePage v-model="recipe" />`，与内部详情页完全相同的组件和逻辑。
+
+**公开 API 客户端**：[shared.ts](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/lib/api/public/shared.ts)
+
+```typescript
+const routes = {
+  recipeShareToken: (token: string) => `${prefix}/recipes/shared/${token}`,
+};
+async getShared(item_id: string) {
+  return await this.requests.get<Recipe>(routes.recipeShareToken(item_id));
+}
+```
+
+**后端 API**：[shared_routes.py#L22-L39](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/routes/recipe/shared_routes.py#L22-L39)
+
+```python
+@router.get("/shared/{token_id}", response_model=Recipe)
+def get_shared_recipe(token_id: UUID4, session: Session = Depends(generate_session)) -> Recipe:
+    token_summary = db.recipe_share_tokens.get_one(token_id)
+    # ... 过期检查和 404 处理
+    return token_summary.recipe
+```
+
+通过 RecipeShareToken 的 ORM 关联（`.recipe` 属性）获取 Recipe，`RecipeShareToken.loader_options()` 已配置了 `joinedload(RecipeModel.nutrition)` 进行 Eager Load（[recipe_share_token.py#L46](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/recipe/recipe_share_token.py#L46)）。
+
 ---
 
-## 七、关键文件索引
+## 七、Recipe 统计与报表接口
+
+### 7.1 Reports（报表）与 Nutrition 无关
+
+项目中的报表接口（[controller_group_reports.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/routes/groups/controller_group_reports.py)）完全不涉及 Nutrition 数据统计。
+
+报表的定义和用途：
+
+- **ReportCategory**：[reports.py#L14-L18](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/reports/reports.py#L14-L18)
+  ```python
+  class ReportCategory(enum.StrEnum):
+      backup = "backup"
+      restore = "restore"
+      migration = "migration"
+      bulk_import = "bulk_import"
+  ```
+
+四个类别均为**任务执行日志**（备份成功/失败、导入条数等），用于追踪数据迁移、批量导入等后台任务的进度和结果，与食谱内容（包括 Nutrition）的数据分析统计无关。
+
+### 7.2 不存在 Nutrition 聚合统计接口
+
+在整个代码库中：
+- `controller_group_reports.py`：无 Nutrition 引用
+- `controller_mealplan.py`：无 Nutrition 引用
+- 所有搜索/过滤接口使用 `QueryFilterBuilder`，仅对 Recipe 主表字段做筛选，未对 nutrition 子表做查询
+- 前端 `pages/group/reports/` 目录仅展示后台任务状态
+
+结论：**Mealie 目前没有任何对 Nutrition 数据做聚合统计（计算平均、求和、分类统计等）的接口**。
+
+---
+
+## 八、Schema.org 公开输出（JSON-LD）
+
+### 8.1 输出位置与触发条件
+
+当用户（或搜索引擎爬虫）访问任何食谱 URL 时，服务器在返回 SPA 的 HTML 之前，会注入一段 `<script type="application/ld+json">`，包含 Schema.org 标准的 Recipe 结构化数据，其中包含 Nutrition 信息。
+
+核心代码位于：[spa/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/routes/spa/__init__.py)
+
+三个注入入口：
+
+| 路由 | 入口函数 | 权限要求 |
+|------|----------|----------|
+| `/g/{group_slug}/r/{recipe_slug}`（已登录用户） | `serve_recipe_with_meta()` | 用户组匹配 |
+| `/g/{group_slug}/r/{recipe_slug}`（访客） | `serve_recipe_with_meta_public()` | 组非私有 + 食谱 `settings.public=True` |
+| `/g/{group_slug}/shared/r/{token_id}` | `serve_shared_recipe_with_meta()` | Token 有效 |
+
+### 8.2 Nutrition 字段输出逻辑
+
+**核心函数**：[spa/__init__.py#L116-L180](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/routes/spa/__init__.py#L116-L180)
+
+```python
+def content_with_meta(group_slug: str, recipe: Recipe) -> str:
+    # ...
+    nutrition: dict[str, str | None] = recipe.nutrition.model_dump(by_alias=True) if recipe.nutrition else {}
+    for k, v in nutrition.items():
+        if v:
+            nutrition[k] = escape(v)
+
+    as_schema_org: dict[str, Any] = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        # ... 其他字段
+        "nutrition": nutrition,
+    }
+```
+
+关键细节：
+
+1. **使用 `by_alias=True` 输出 camelCase**：确保 Schema.org JSON 中的键名符合 Schema.org 规范（如 `carbohydrateContent` 而非 `carbohydrate_content`）。Schema.org 的 NutritionInformation 类型字段名即为 camelCase。
+
+2. **HTML 转义**：`escape(v)` 对所有非空值做 HTML 实体转义，防止 XSS 攻击（在 `<script>` 标签内嵌 JSON 时仍需注意特殊字符）。空值（`None`）不做处理，保留在 JSON 中。
+
+3. **空值全部保留**：即使某字段为 `null`，也会被输出到 JSON-LD 中。这与前端展示层（RecipeNutrition.vue）过滤空值的策略不同——Schema.org 输出追求结构完整性，前端展示追求用户体验。
+
+4. **Schema.org NutritionInformation 映射**：Mealie 的 11 个 Nutrition 字段名与 Schema.org 的 [NutritionInformation](https://schema.org/NutritionInformation) 类型字段完全一致（camelCase 下），包括：
+   - `calories` → `calories`
+   - `carbohydrateContent` → `carbohydrateContent`
+   - `cholesterolContent` → `cholesterolContent`
+   - `fatContent` → `fatContent`
+   - `fiberContent` → `fiberContent`
+   - `proteinContent` → `proteinContent`
+   - `saturatedFatContent` → `saturatedFatContent`
+   - `sodiumContent` → `sodiumContent`
+   - `sugarContent` → `sugarContent`
+   - `transFatContent` → `transFatContent`
+   - `unsaturatedFatContent` → `unsaturatedFatContent`
+
+### 8.3 注入机制
+
+```python
+def inject_recipe_json(contents: str, schema: dict) -> str:
+    schema_as_html_tag = f"""<script type="application/ld+json">{json.dumps(jsonable_encoder(schema))}</script>"""
+    return contents.replace("</head>", schema_as_html_tag + "\n</head>", 1)
+```
+
+使用字符串替换的方式，将 JSON-LD `<script>` 标签插入到 `</head>` 之前，由 FastAPI 直接返回给浏览器或爬虫。
+
+### 8.4 与前端展示层的边界差异
+
+| 维度 | Schema.org JSON-LD | 前端 RecipeNutrition.vue |
+|------|------|------|
+| 字段输出 | 全部 11 个字段（含 null） | 仅输出非空字段 |
+| 字段格式 | camelCase（by_alias=True） | camelCase（TypeScript 原生） |
+| 单位后缀 | 无（由 Schema.org 规范隐含） | 追加 "g"/"mg"/"kcal" |
+| 显示开关 | 忽略 `showNutrition`，总是输出 | 受 `showNutrition` + 非空双重控制 |
+| 数据基准 | 每份值（与数据库一致） | 每份值（不参与缩放） |
+
+---
+
+## 九、全链路边界关系总览
+
+### 9.1 各模块对 Nutrition 的处理策略矩阵
+
+| 模块 | 每份/整份基准 | 缩放参与 | 缺失字段处理 | camelCase/snake_case | 关键文件 |
+|------|------|------|------|------|------|
+| **前端录入** | 每份（用户按每份填写） | 否 | 空值为 null/undefined | camelCase | RecipeNutrition.vue |
+| **URL 抓取清洗** | 每份（外部来源按每份提供） | 否 | 正则提取失败则为 None | camelCase→snake_case | cleaner.py |
+| **API 入站** | 每份 | 否 | 空对象→None | 双格式兼容 | mealie_model.py |
+| **数据持久化** | 每份 | 否 | 空行强制创建 | snake_case | nutrition.py + recipe.py |
+| **前端缩放临时因子** | N/A（仅作用于食材） | 是 | N/A | N/A | use-scaled-amount.ts |
+| **前端展示（详情页）** | 每份 | 否 | 静默过滤 | camelCase | RecipeNutrition.vue |
+| **前端打印视图** | 每份 | 否 | 跳过空行 | camelCase | RecipePrintView.vue |
+| **公开分享 API** | 每份 | 否 | 原样传递 | camelCase | shared_routes.py |
+| **Schema.org JSON-LD** | 每份 | 否 | 全部保留（含 null） | camelCase（by_alias=True） | spa/__init__.py |
+| **Reports 报表** | N/A（不涉及） | N/A | N/A | N/A | controller_group_reports.py |
+| **Meal Plan** | N/A（不涉及） | N/A | N/A | N/A | meal-plan.ts |
+
+### 9.2 缩放与 Nutrition 的明确边界
+
+缩放因子（`scale = newYield / recipeServings`）的传播路径：
+
+```
+用户修改份数 (RecipeScaleEditButton)
+    │
+    ├─→ scale ref 更新
+    │     │
+    │     ├─→ RecipeIngredientEditor 中 ingredient.quantity * scale  ✓
+    │     ├─→ useScaledAmount() 被食材数量计算调用              ✓
+    │     │
+    │     ├─→ RecipeNutrition.vue —— 未接收 scale prop             ✗ 不生效
+    │     ├─→ RecipePrintView Nutrition 表格 —— 无乘法              ✗ 不生效
+    │     └─→ Schema.org JSON-LD —— 服务端生成，无 scale 概念        ✗ 不生效
+    │
+    └─→ 若用户修改了 recipeServings 字段本身并保存
+          │
+          └─→ Nutrition 数值被当作新份数的每份值，数据库无换算          无自动换算
+```
+
+**结论**：Nutrition 在所有展示链路中均以「每份」为绝对基准，与任何动态缩放无关。
+
+---
+
+## 十、关键文件索引
 
 | 层级 | 文件 | 作用 |
 |------|------|------|
@@ -458,26 +750,54 @@ Meal Plan 类型（[meal-plan.ts](file:///d:/fz/0601/solo-dogfeeding/code/75-mea
 | **前端组件** | [RecipeScaleEditButton.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipeScaleEditButton.vue) | 缩放计算逻辑 |
 | **前端组件** | [RecipePage.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipePage/RecipePage.vue) | 食谱详情页主容器 |
 | **前端组件** | [RecipePageOrganizers.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipePage/RecipePageParts/RecipePageOrganizers.vue) | Nutrition 卡片嵌入点 |
-| **前端组件** | [RecipePrintView.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipePrintView.vue) | 打印视图中的 Nutrition 表格 |
-| **前端组件** | [RecipeSettingsSwitches.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipeSettingsSwitches.vue) | showNutrition 开关 |
+| 前端组件 | [RecipePrintView.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipePrintView.vue) | 打印视图中的 Nutrition 表格 |
+| 前端组件 | [RecipeSettingsSwitches.vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/components/Domain/Recipe/RecipeSettingsSwitches.vue) | showNutrition 开关 |
+| **Schema** | [mealie_model.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/_mealie/mealie_model.py) | alias_generator + populate_by_name 双格式兼容配置 |
+| **DB Model** | [_model_base.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/db/models/_model_base.py) | BaseMixins.update() → __init__ 重初始化逻辑 |
+| **Repository** | [repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/repos/repository_generic.py) | 通用 create/update 中 model_dump() 的调用 |
+| **API Route** | [shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/routes/recipe/shared_routes.py) | 公开分享食谱 API（含 Nutrition Eager Load） |
+| **API Route** | [spa/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/routes/spa/__init__.py) | Schema.org JSON-LD 注入（含 Nutrition） |
+| **Schema** | [recipe_share_token.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/recipe/recipe_share_token.py) | RecipeShareToken loader_options（含 nutrition joinedload） |
+| **Schema** | [reports.py](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/mealie/schema/reports/reports.py) | ReportCategory 定义（与 Nutrition 无关） |
+| **前端页面** | [[id].vue](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue) | 公开分享食谱页面 |
+| **前端 API** | [shared.ts](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/lib/api/public/shared.ts) | Public SharedApi 客户端 |
+| **前端 API** | [base-clients.ts](file:///d:/fz/0601/solo-dogfeeding/code/75-mealie/frontend/app/lib/api/base/base-clients.ts) | BaseCRUDAPI.updateOne() HTTP PUT 实现 |
 
 ---
 
-## 八、总结与注意事项
+## 十一、总结与注意事项
 
 ### 核心设计结论
 
 1. **Nutrition 是 Recipe 的一对一从属实体**，永远跟随 Recipe 生命周期，无独立 CRUD
 2. **存储基准为「每份」**，所有数值都是单份含量，份数由 `recipeServings` 定义
-3. **前端缩放不影响 Nutrition**，缩放因子只对食材数量生效，Nutrition 展示不做乘法
-4. **缺失字段采用静默过滤策略**：空值不展示、不报错、不占位
+3. **前端缩放不影响 Nutrition**，缩放因子只对食材数量生效，Nutrition 在所有展示链路（详情页、打印、Schema.org、分享页）中均不做乘法
+4. **缺失字段采用分层策略**：Schema 层空对象→None，DB 层强制创建空行，前端展示静默过滤，Schema.org 全部保留含 null
 5. **所有字段为 String 类型**，由 Pydantic 的 `coerce_numbers_to_str` 做兼容，支持存储任意格式
-6. **可见性受双重控制**：`showNutrition` 开关 + 数据非空判断，两者同时满足才渲染
-7. **列表页不加载 Nutrition**，仅详情页通过 `joinedload` 一次性加载，避免性能问题
+6. **可见性受双重控制（前端）**：`showNutrition` 开关 + 数据非空判断，两者同时满足才渲染；Schema.org 输出不受开关限制
+7. **列表页不加载 Nutrition**，仅详情页/分享页通过 `joinedload` 一次性加载，避免性能问题
+8. **字段名经过三次转换**：前端 camelCase → Pydantic 双格式兼容 → model_dump() snake_case → ORM snake_case 接收
+9. **Reports（报表）与 Nutrition 无关**：报表仅追踪备份/迁移/导入任务状态，无任何营养数据聚合统计
+10. **Meal Plan 无营养汇总**：作为饮食管理应用，meal plan 模块未做每日/每周营养摄入统计
+11. **Schema.org 输出是独立通道**：忽略 `showNutrition` 开关，总是输出完整 11 字段（含 null），使用 `by_alias=True` 输出 camelCase，并做 HTML escape 防 XSS
+
+### 保存链路字段名转换证据表
+
+| 环节 | 输入格式 | 处理逻辑 | 输出格式 | 代码位置 |
+|------|------|------|------|------|
+| 前端 TS → HTTP JSON | camelCase | Axios 原生序列化 | camelCase | base-clients.ts#L65-L66 |
+| HTTP JSON → Pydantic 对象 | camelCase 或 snake_case | `populate_by_name=True` + `alias_generator=camelize` | snake_case（内部属性） | mealie_model.py#L53 |
+| Pydantic → dict（Repository） | Pydantic 对象 | `model_dump()` 默认 `by_alias=False` | snake_case | repository_generic.py#L220 |
+| dict → ORM 对象（__init__） | snake_case | `Nutrition.__init__` 参数名匹配 | snake_case 属性 | nutrition.py#L36-L60 |
+| ORM → JSON Response | snake_case 属性 | Pydantic `model_validate()` + alias_generator | camelCase | recipe.py#L239 |
 
 ### 潜在风险 / 可改进点
 
 - **Nutrition 不跟随缩放同步**：用户调整份数后，Nutrition 仍显示原每份值，可能与用户直觉不符（用户可能期望看到调整后总份数对应的总营养）
 - **无数据一致性校验**：字符串存储无法保证数值有效性，可能出现 "abc" 这样的无效值
 - **无单位标准化**：存储前仅在抓取时对钠/胆固醇做 g→mg 换算，手动录入时完全信任用户输入
+- **ORM update() 重走 __init__ 的副作用**：`BaseMixins.update()` 通过重新调用 `__init__` 来更新字段，会重置某些由事件监听器维护的属性，其他模型可能存在隐患
+- **Schema.org 输出忽略 showNutrition**：即使用户在前端隐藏了营养卡片，搜索引擎仍可通过 JSON-LD 获取营养数据，这可能不符合部分用户预期
+- **空字符串与 null 处理不一致**：前端 `renderedList` 使用 `?.trim()` 判断，空字符串 `""` 与 `null` 均被视为空；但 Schema.org 输出中空字符串会被 escape 后保留为 `""`，与 `null` 表现不同
+- **缺少 Nutrition 聚合统计能力**：无法在组/household 层面统计用户的营养摄入趋势、平均值等
 - **Meal Plan 无营养汇总**：作为饮食管理应用，meal plan 模块未做每日/每周营养摄入统计
