@@ -315,14 +315,67 @@ if is_postgres():
 - **纯 `INSERT` 操作（household 创建、last_made 关联表插入等）**：**会产生重复数据或抛错**。例如 `feecc8ffb956` 的 `create_household()` 重复执行会给同一个 group 创建多个同名 household；`b9e516e2d3b3` 重复执行会插入重复的 `HouseholdToRecipe` 关联行（若无唯一约束则数据冗余，若有唯一约束则抛 IntegrityError 中断迁移）。
 - **评分与收藏迁移（`d7c6efd2de42`）**：由于使用了 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`，即使重复执行也不会产生重复数据，是全库唯一具备数据库级幂等保护的迁移脚本。
 
-### 6.3 普通 UPDATE / INSERT / session.commit 的事务边界
+### 6.3 Session 绑定与事务加入模式
 
-迁移脚本内的数据迁移代码虽然使用 SQLAlchemy Session，但与 Alembic 外层事务的关系如下：
+#### 6.3.1 SQLAlchemy 2.0 `join_transaction_mode` 默认为 `conditional_savepoint`
 
-- **Alembic 外层事务**：由 `context.begin_transaction()` 开启，包裹整个 revision 的 DDL 和数据迁移代码。revision 成功则 commit，任何异常则 rollback。
-- **迁移内 Session**：通过 `orm.Session(bind=op.get_bind())` 创建，共享同一个数据库连接，因此参与 Alembic 的外层事务。
-- **迁移内 `session.commit()`**：实际上是对共享连接提交内层事务点（PostgreSQL 下相当于 SAVEPOINT 行为），提交的内容在 Alembic 外层事务 rollback 时依然会被回滚。但如果迁移脚本在异常捕获后 `raise`，外层事务整体回滚；如果不 `raise`（如 `7cf3054cbbcc` 的 `truncate_normalized_fields()`），已 commit 的子任务不会被外层回滚。
-- **fixes 层的 Session**：使用独立的 `session_context()` 创建，**不参与 Alembic 事务**。fixes 在 `command.upgrade()` 成功返回后才执行，一旦失败被 `safe_try` 捕获，已执行的数据库变更不会被自动回滚。
+项目使用 SQLAlchemy `2.0.50`（定义于 `pyproject.toml:12`）。所有迁移脚本中的 Session 通过以下方式创建：
+
+```python
+# 全代码库 21 处相同模式
+session = orm.Session(bind=op.get_bind())
+# 或
+session = orm.Session(bind=bind)
+```
+
+两处都未显式传入 `join_transaction_mode` 参数，因此使用 SQLAlchemy 2.0 的默认值 **`conditional_savepoint`**。
+
+该模式的精确定义（SQLAlchemy 2.0 官方规范）：
+
+| 绑定 Connection 的状态 | `conditional_savepoint` 行为 |
+|----------------------|---------------------------|
+| **场景 A：已存在普通事务（BEGIN，但无 SAVEPOINT）** | Session 内部事务边界映射为真实的数据库 SAVEPOINT：`Session.begin()`（autobegin）→ `SAVEPOINT`；`Session.commit()` → `RELEASE SAVEPOINT`；`Session.rollback()` → `ROLLBACK TO SAVEPOINT`。外层 Connection 的普通事务保持开启状态。 |
+| **场景 B：已存在 SAVEPOINT（已在嵌套事务中）** | Session 继续使用现有 SAVEPOINT 之上的嵌套 SAVEPOINT，同样 commit/rollback 映射为 RELEASE/ROLLBACK。 |
+| **场景 C：Connection 未开启事务** | Session 使用正常的 `BEGIN` / `COMMIT` / `ROLLBACK`，直接控制 Connection 事务。 |
+
+#### 6.3.2 Alembic 迁移上下文中的实际执行路径
+
+Mealie 的迁移始终运行在 **场景 A** 之下，完整调用链如下：
+
+```
+mealie/alembic/env.py
+  └─ connectable.connect()                  # 创建原始 Connection（无事务）
+     └─ context.configure(connection=...)   # Alembic 绑定该 Connection
+        └─ context.begin_transaction()      # 对 Connection 执行 BEGIN → 进入普通事务（场景 A 条件）
+           └─ context.run_migrations()
+              └─ migration.upgrade():
+                 └─ orm.Session(bind=op.get_bind())
+                    # bind = 同一个 Connection（已在普通事务中）
+                    # join_transaction_mode=conditional_savepoint → 启用 SAVEPOINT 映射
+```
+
+在此场景下，迁移脚本中的调用实际对应的数据库 SQL：
+
+| Python 代码 | 实际发出的 SQL（PostgreSQL / SQLite 均相同） |
+|------------|----------------------------------------|
+| 首次 `session.execute(...)` / `session.add(...)`（触发 autobegin） | `SAVEPOINT sa_savepoint_1` |
+| `session.commit()` | `RELEASE SAVEPOINT sa_savepoint_1` |
+| `session.rollback()` | `ROLLBACK TO SAVEPOINT sa_savepoint_1` |
+| 下一次 session 操作（autobegin 重新触发） | `SAVEPOINT sa_savepoint_2` |
+
+**关键结论——不是"PostgreSQL 下相当于"，而是所有支持 SAVEPOINT 的数据库（PostgreSQL、SQLite、MySQL）下都真实发出 SAVEPOINT 语句。** 该行为由 SQLAlchemy 2.0 的 `conditional_savepoint` 默认模式决定，与数据库方言无关（仅排除完全不支持 SAVEPOINT 的边缘数据库）。
+
+#### 6.3.3 `session.commit()` 与 Alembic 外层事务的边界关系
+
+- **Alembic 外层事务**：由 `context.begin_transaction()` 开启，包裹整个 revision 的 DDL 和数据迁移代码。revision 成功完成所有 migration 函数后执行 COMMIT；任何未被捕获的异常触发 ROLLBACK，回滚该 revision 内的全部变更。
+- **SAVEPOINT 的可见性范围**：`session.commit()` 发出的 `RELEASE SAVEPOINT` 只是将内层保存点合并到外层事务中，**并未将数据真正持久化到磁盘**。此时如果 Alembic 外层事务执行 ROLLBACK（因为后续步骤抛异常），所有已 RELEASE 的 SAVEPOINT 变更同样被一并回滚。
+- **异常捕获后的分支**：
+  - **捕获后 `raise`（如 `b9e516e2d3b3` 的 `migrate_to_new_models()`）**：`session.rollback()` → `ROLLBACK TO SAVEPOINT` 回滚该子任务；随后 `raise` 将异常传到 Alembic 外层 → 外层事务整体 ROLLBACK → 整个 revision 的所有变更全部撤销。
+  - **捕获后不 `raise`（如 `7cf3054cbbcc` 的 `truncate_normalized_fields()`）**：`session.rollback()` → `ROLLBACK TO SAVEPOINT` 回滚当前模型的修改；异常被吞掉，脚本继续处理下一个模型。后续若整个 revision 无其他异常，外层事务最终 COMMIT → 所有成功子任务（未被 rollback 的模型）的变更被持久化，失败子任务的变更因已被 SAVEPOINT 回滚而不存在。
+
+#### 6.3.4 fixes 层的独立 Session
+
+`db/fixes/` 下的修复脚本（`fix_migration_data`、`fix_slug_food_names`、`fix_group_with_no_name`）使用独立的 `session_context()` 创建 Session，**不参与 Alembic 事务**。fixes 在 `command.upgrade()` 成功返回后才执行，此时 Alembic 外层事务已 COMMIT。如果 fixes 脚本抛出异常被 `safe_try` 捕获，已部分执行的数据库变更**不会被自动回滚**，需要人工介入处理。
 
 ---
 
@@ -369,14 +422,14 @@ else:
 ```
 
 - **覆盖范围**：所有 Alembic 迁移脚本的 DDL 和其中的数据迁移逻辑
-- **事务粒度**：单个迁移脚本（revision）内的所有操作在一个数据库事务中执行，失败自动回滚该脚本的全部变更
+- **事务粒度**：单个迁移脚本（revision）内的所有操作在一个数据库普通事务中执行（由 `context.begin_transaction()` 开启的 BEGIN）。迁移内 Session 的 `session.commit()` 仅发出 `RELEASE SAVEPOINT`，不会提交外层事务；revision 成功完成所有 migration 函数后，外层事务才执行真正的 COMMIT；任何未被捕获的异常触发外层事务 ROLLBACK，回滚该 revision 内的全部变更（含所有已 RELEASE 的 SAVEPOINT）。
 - **失败后果**：`command.upgrade()` 抛出的任何异常都**没有外层 try/except 捕获**，直接传播到 lifespan，**应用启动中断（致命）**
 
 这意味着：**任何一个 Alembic 迁移脚本失败，整个应用都无法启动。** 管理员必须修复数据库或迁移脚本后重新启动。数据库会停留在最后一个成功的 revision 版本。
 
 ### 7.3 迁移脚本内部的局部 try/except——边界：不同迁移策略不同
 
-迁移脚本内部的数据迁移子任务有时会自带 try/except，但行为分为两类：
+迁移脚本内部的数据迁移子任务有时会自带 try/except，但行为分为两类（结合 `join_transaction_mode=conditional_savepoint` 的 SAVEPOINT 机制）：
 
 **类型 A：捕获后重新 raise（仍然致命）**
 
@@ -386,15 +439,15 @@ else:
 for migration_func in [...]:
     try:
         migration_func(session)
-        session.commit()
+        session.commit()     # RELEASE SAVEPOINT sa_savepoint_N
     except Exception:
-        session.rollback()
+        session.rollback()   # ROLLBACK TO SAVEPOINT sa_savepoint_N
         logger.error(...)
-        raise  # 显式向上抛出，终止整个迁移
+        raise                # 显式向上抛出，终止整个迁移
 ```
 
-- 行为：回滚当前子任务的 session 保存点，记录错误日志，然后 `raise` 重新抛出
-- 失败后果：被外层 `context.run_migrations()` 捕获，触发事务整体回滚，最终导致**应用启动中断（致命）**
+- 行为：子任务抛异常时，`session.rollback()` 发出 `ROLLBACK TO SAVEPOINT` 撤销该子任务在当前保存点内的所有修改；然后 `raise` 重新抛出。
+- 失败后果：异常被外层 `context.run_migrations()` 捕获，触发 Alembic 外层普通事务整体 ROLLBACK，整个 revision 的所有变更（含前面已成功 commit/RELEASE SAVEPOINT 的子任务）全部撤销，最终导致**应用启动中断（致命）**。
 
 **类型 B：捕获后不 raise（局部失败，不影响同脚本其他子任务）**
 
@@ -404,14 +457,14 @@ for migration_func in [...]:
 for model in models:
     ...
     try:
-        session.commit()
+        session.commit()     # RELEASE SAVEPOINT sa_savepoint_N
     except Exception:
         logger.exception(f"Failed to truncate normalized fields for {model.__name__}")
-        session.rollback()  # 不 raise，继续处理下一个模型
+        session.rollback()   # ROLLBACK TO SAVEPOINT sa_savepoint_N，不 raise，继续处理下一个模型
 ```
 
-- 行为：单个模型失败仅回滚该模型的 session 保存点，记录日志后继续处理后续模型
-- 失败后果：该迁移脚本本身标记为成功执行（Alembic revision 前进），但部分数据可能未被正确规范化；应用可正常启动，属于**静默数据不完整**风险
+- 行为：单个模型失败时 `session.rollback()` 发出 `ROLLBACK TO SAVEPOINT`，仅撤销当前模型的修改；异常被吞掉，autobegin 为下一个模型开启新的 SAVEPOINT（`sa_savepoint_{N+1}`），循环继续。
+- 失败后果：该迁移脚本本身无异常抛出，Alembic 外层事务最终 COMMIT，revision 标记为已执行（alembic_version 前进）。但失败模型的数据未被正确规范化，属于**静默数据不完整**风险；应用可正常启动。
 
 ### 7.4 Fixes 层的 safe_try——边界：仅记录日志，绝不阻塞启动
 
@@ -473,10 +526,10 @@ for i, group in enumerate(groups):
 | 层级 | 机制 | 失败是否中断启动 | 数据一致性影响 |
 |------|------|:---:|---|
 | 数据库连接 | 10 次重试 → `ConnectionError` | **是** | 未建立连接，无数据操作 |
-| Alembic 迁移事务 | `command.upgrade()` 无外层捕获，迁移脚本事务回滚 | **是** | 当前 revision 的 DDL 回滚，已成功的 revision 不会回滚（数据库停留在中间版本） |
-| 迁移脚本内（类型 A） | try/except + `raise` 重抛 | **是** | 子任务 session 回滚，整脚本事务回滚 |
-| 迁移脚本内（类型 B） | try/except + 不 raise | 否 | 局部数据可能不完整（如某模型规范化未执行） |
-| Fixes 层 | `safe_try` 吞掉所有异常 | 否 | 数据质量问题遗留（悬垂引用、缺失规范化、冲突 slug 等） |
+| Alembic 迁移事务 | `command.upgrade()` 无外层捕获，外层普通事务 ROLLBACK | **是** | 当前 revision 全部变更（含已 RELEASE SAVEPOINT 的子任务）被外层事务回滚；已成功的 revision 不会回滚，数据库停留在中间版本 |
+| 迁移脚本内（类型 A） | try/except + `raise` 重抛 | **是** | 当前子任务 `ROLLBACK TO SAVEPOINT`，异常传到外层触发外层事务整体 ROLLBACK，整个 revision 全部撤销 |
+| 迁移脚本内（类型 B） | try/except + 不 raise | 否 | 失败子任务 `ROLLBACK TO SAVEPOINT` 单独撤销，其他子任务继续；外层事务最终 COMMIT，失败子任务的数据不完整（如某模型规范化未执行） |
+| Fixes 层 | `safe_try` 吞掉所有异常 | 否 | 数据质量问题遗留（悬垂引用、缺失规范化、冲突 slug 等）；已部分执行的变更不会自动回滚（fixes 使用独立 Session，且在 Alembic 事务 COMMIT 后执行） |
 | IntegrityError 重试 | 3 次后 `raise`，但外层有 `safe_try` | 否 | 个别空名称 group 未修复 |
 
 ---
@@ -624,5 +677,5 @@ WHERE EXISTS (
 6. **跨方言兼容**：GUID、数量类型、唯一约束都按 dialect 分支处理；SQLite 用 batch_alter_table 模拟 DDL。
 7. **规范化字段是搜索的真相来源**：算法三次演进，每次全量重算，fix 层兜底补填。
 8. **去重是加唯一约束的前置动作**：M2M 表靠数据库内部行号，实体表靠外键重定向+删除。
-9. **事务边界分层清晰**：Alembic 外层事务包裹整个 revision，迁移内 Session 共享连接但可独立 commit/rollback 子任务；fixes 层使用独立 Session，不参与 Alembic 事务，失败由 `safe_try` 吞异常。
+9. **事务边界与 SAVEPOINT 机制精确可控**：迁移内 Session 以 `join_transaction_mode=conditional_savepoint`（SQLAlchemy 2.0 默认）绑定 Alembic 的已开启事务 Connection，`session.commit()` 真实发出 `RELEASE SAVEPOINT`，`session.rollback()` 真实发出 `ROLLBACK TO SAVEPOINT`；RELEASE 后的数据仍在外层事务中，Alembic 外层 ROLLBACK 会一并撤销；fixes 层使用独立 Session，在 Alembic 事务 COMMIT 后执行，失败被 `safe_try` 吞异常且已执行部分不会自动回滚。
 10. **失败的致命性分层明确**：连接失败和 Alembic schema 迁移失败是**致命的**（应用无法启动，数据库可能停留在中间 revision 版本）；迁移脚本内部个别数据子任务失败（不 raise 类型）可能静默遗留数据不完整；fixes 层数据修复失败**非致命**但会遗留脏数据风险，需人工排查日志处理。
