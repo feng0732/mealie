@@ -32,18 +32,19 @@
 
 **入口路由**：[recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/recipe/recipe_crud_routes.py#L635-L642)
 
+**写入顺序（先鉴权后落盘，安全）**：
+
 ```
-前端 RecipeImageUploadBtn.vue
-  → RecipeAPI.updateImage(slug, fileObject)
-    → PUT /api/recipes/{slug}/image  (FormData: image=bytes, extension=jpg/png/...)
-      → RecipeController.update_recipe_image()
-        → RecipeService.update_recipe_image()
-          → 权限校验 can_update()
-          → RecipeDataService(recipe.id).write_image(image_bytes, extension)
-            → 写入 original.{ext}
-            → PillowMinifier.minify() 生成 original.webp / min-original.webp / tiny-original.webp
-          → RepositoryRecipes.update_image(slug)
-            → DB recipes.image = randint(0, 255)  （仅作为缓存版本号）
+① RecipeService.get_one(slug)           # 读取 Recipe（仅 household 过滤，无权限校验）
+② RecipeService.can_update([slug])      # ★ 权限校验（在此处拦截）
+   → 失败：抛 PermissionDenied → 403，磁盘不写任何东西
+③ RecipeDataService(recipe.id)           # 创建 {recipe_id}/images/ 等目录
+④ RecipeDataService.write_image(bytes, extension)
+   ├─ 写 images/original.{ext}
+   ├─ PillowMinifier.minify() 生成三种 webp
+   └─ purge=True → 删除 original.{ext}，只留 .webp
+⑤ RepositoryRecipes.update_image(slug)
+   → DB: recipes.image = randint(0, 255)  （仅作缓存版本号）
 ```
 
 关键实现：
@@ -54,44 +55,69 @@
 前端组件：[RecipeImageUploadBtn.vue](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/frontend/app/components/Domain/Recipe/RecipeImageUploadBtn.vue)
 前端 API：[recipe.ts updateImage](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/frontend/app/lib/api/user/recipes/recipe.ts#L133-L139)
 
+---
+
 ### 1.2 外链 URL 抓取图片（POST /api/recipes/{slug}/image）
 
-**入口路由**：[recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/recipe/recipe_crud_routes.py#L614-L634)
+**入口路由**：[recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/recipe/recipe_crud_routes.py#L614-L633)
+
+**写入顺序（先落盘后鉴权，存在 TOCTOU 漏洞）**：
 
 ```
-前端输入 URL → RecipeAPI.updateImagebyURL(slug, url)
-  → POST /api/recipes/{slug}/image  (Body: {url: "https://..."})
-    → RecipeController.scrape_image_url()
-      → RecipeDataService.scrape_image(url)
-        → URL 类型解析（str / list[str] / dict）
-        → 若为 list，并发 HEAD 请求选 Content-Length 最大的图片
-        → httpx GET 下载图片字节（AsyncSafeTransport 模拟浏览器 TLS）
-        → 校验 Content-Type 包含 "image"，否则抛 NotAnImageError
-        → write_image(bytes, extension) 写入并裁剪
-      → DB: recipe.image = cache.new_key(4)
-      → RecipeService.update_one() 保存
+① self.mixins.get_one(slug)             # 读取 Recipe（仅 household 过滤，无权限校验）
+② RecipeDataService(recipe.id)           # ★ 创建 {recipe_id}/images/ 等目录（磁盘已变化）
+③ await data_service.scrape_image(url)   # ★ 下载、写入三种 webp 到磁盘（磁盘已变化）
+   → 可能失败点：网络异常、非 200、非图片 Content-Type、PIL 解码失败
+   → NotAnImageError → 400；InvalidDomainError → 400；其他异常未显式捕获 → 500
+④ recipe.image = cache.new_key(4)        # 修改内存对象
+⑤ self.service.update_one(slug, recipe)  # ★ 权限校验在此处（写之后）
+   → 内部调用 _pre_update_check → can_update([slug])
+   → 失败：抛 PermissionDenied → handle_exceptions → 403
+   → 但磁盘上图片已经写入！
 ```
 
-关键实现：
+**未授权遗留状态分析**：
+- 若 can_update 在步骤 ⑤ 失败（PermissionDenied），步骤 ②③ 已在磁盘写入了：
+  - `{recipe_id}/images/original.webp`
+  - `{recipe_id}/images/min-original.webp`
+  - `{recipe_id}/images/tiny-original.webp`
+- DB 的 `recipes.image` 列仍保持旧值（因为 update_one 回滚）
+- 前端看到的仍是旧图，但磁盘上存在孤儿图片文件
+- **无自动清理机制**：下次 update/patch 时 `check_assets()` 只清理 assets/ 下的未引用文件，不清理 images/ 下的图片
+- 只能靠管理员手动调用 `clean/images`（但该接口只删非 webp，这三个都是 webp，也不会被清）或直接删除目录
+
+**关键实现**：
+- [scrape_image_url 路由](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/recipe/recipe_crud_routes.py#L614-L633) —— 无前置 can_update
 - [RecipeDataService.scrape_image](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L119-L169)
-- [largest_content_len](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)（多分辨率列表选最大图）
+- [RecipeService.update_one → _pre_update_check](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_service.py#L445-L478)
+
+---
 
 ### 1.3 资产文件上传（POST /api/recipes/{slug}/assets）
 
 **入口路由**：[recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/recipe/recipe_crud_routes.py#L653-L699)
 
+**写入顺序（先落盘后鉴权，同样存在 TOCTOU 漏洞）**：
+
 ```
-前端 FormData: name, icon, extension, file
-  → 扩展名白名单校验: {pdf, jpg, jpeg, png, gif, webp, bmp, avif, txt, md, csv, json}
-    → 黑名单（被拦截）: html, svg, js, htm, xhtml  （防止 XSS）
-  → 文件名 = slugify(name) + "." + extension
-  → 路径安全校验: dest.absolute().parent == recipe.asset_dir  （防止路径穿越）
-  → 写入文件到 assets/{file_name}
-  → recipe.assets 追加 RecipeAsset(name, icon, file_name)
-  → RecipeService.update_one() 保存到 DB
+① 扩展名白名单校验 / 文件名 slugify / 路径穿越校验         # 轻量前置校验
+② recipe = self.service.get_one(slug)                    # 读取 Recipe（无权限校验）
+③ dest = recipe.asset_dir / file_name
+④ with dest.open("wb") as buffer: copyfileobj(file, buf) # ★ 写入磁盘
+⑤ if not dest.is_file(): raise 500
+⑥ recipe.assets.append(asset_in)                          # 修改内存对象
+⑦ self.service.update_one(slug, recipe)                   # ★ 权限校验在此处（写之后）
+   → _pre_update_check → can_update([slug])
+   → 失败：抛 PermissionDenied（此路由没有 try/except 包 handle_exceptions，通常会 500）
+   → 磁盘上资产文件已经写入！
 ```
 
-安全参考测试：[test_recipe_image_assets.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/tests/integration_tests/user_recipe_tests/test_recipe_image_assets.py)（包含路径穿越、脚本扩展名拦截、attachment 下载头验证）
+**未授权遗留状态分析**：
+- 磁盘上 `assets/{file_name}` 已存在
+- DB 的 `recipe_assets` 表无记录，`recipe.assets` 内存追加被回滚
+- **有自动清理机制**：下次对该 recipe 执行 `update_one` 或 `patch_one` 时，`check_assets()` 会遍历 `assets/` 下所有文件，凡不在 `recipe.assets[*].file_name` 中的一律 `unlink()` 删除（[recipe_service.py#L150-L156](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_service.py#L150-L156)）
+
+**安全测试覆盖**：[test_recipe_image_assets.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/tests/integration_tests/user_recipe_tests/test_recipe_image_assets.py)（路径穿越、脚本扩展名拦截、attachment 下载头、nosniff 头验证）
 
 ---
 
@@ -116,16 +142,17 @@ POST /api/recipes/create/url  {url: "https://example.com/recipe"}
       │       4. RecipeScraperOpenGraph (Open Graph 标签兜底)
       │   └─ 返回 Recipe 对象（含 image 字段为 URL 字符串或 URL 列表）
       │
-      ├─ 生成 new_recipe.id = uuid4()
+      ├─ 生成 new_recipe.id = uuid4()                          # 预先分配 UUID
       │
-      ├─ RecipeDataService(new_recipe.id)
-      │   └─ scrape_image(new_recipe.image)
-      │       ├─ 下载外链图片到 images/{recipe_id}.{ext} （临时文件）
+      ├─ RecipeDataService(new_recipe.id)                      # 创建磁盘目录
+      │   └─ await recipe_data_service.scrape_image(new_recipe.image)
+      │       ├─ (URL 解析与下载)
       │       ├─ write_image(bytes, ext)  生成三尺寸 webp
       │       └─ 删除临时下载文件
       │
       ├─ new_recipe.slug = slugify(name)
-      └─ new_recipe.image = cache.new_key(4)  （4位随机字符串作为缓存版本）
+      └─ new_recipe.image = cache.new_key(4)    # 成功：4位随机字符串作为缓存版本
+      └─ (异常捕获) new_recipe.image = "no image"  # 失败：硬编码标记
     │
     → RecipeController._finish_recipe_from_web()
       └─ RecipeService.create_one(recipe)  写入 DB
@@ -141,6 +168,43 @@ POST /api/recipes/create/url  {url: "https://example.com/recipe"}
 | RecipeScraperOpenAI | 同上（先用 OpenAI 重写 HTML 中的 LD-JSON，再用 recipe_scrapers 解析），或 [find_image](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper_strategies.py#L364-L390) 从 og:image 或最大 img 标签提取 |
 | RecipeScraperOpenAITranscription | yt-dlp 返回的 `thumbnail_url` |
 | RecipeScraperOpenGraph | `<meta property="og:image">` 标签 |
+
+### 2.3 列表图片 URL 的选择逻辑
+
+图片字段三种类型，scrape_image 中处理逻辑不同：
+
+**在 create_from_html 调用之前**（[scraper.py#L64-L66](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L64-L66)）：
+```python
+if isinstance(new_recipe.image, list):
+    new_recipe.image = new_recipe.image[0]   # ★ 列表直接取第一个元素（非最大）
+```
+**create_from_html 对列表只取索引 0**，多分辨率信息被丢弃。
+
+**在 scrape_image 函数内部**（[recipe_data_service.py#L124-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L124-L139)）—— 此分支仅当 scrape_image 被直接调用（例如手动 POST /{slug}/image 传数组）时触发：
+- `str`：直接作为 image_url_str
+- `list[str]`：调用 `largest_content_len(urls)`，并发 HEAD 请求各 URL，选 Content-Length 最大的
+- `dict`：取 `dict["url"]` 字段
+
+**largest_content_len 失败行为**（[recipe_data_service.py#L28-L46](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)）：
+- 并发上限 10，`gather_with_concurrency(..., ignore_exceptions=True)` 过滤掉抛异常的响应
+- 若所有 HEAD 均失败（超时、DNS 错误、连接被拒等），`responses` 为空 → `largest_url = ""` → 回到 scrape_image 第 138 行 `if not image_url_str: raise ValueError("image url could not be parsed...")`
+
+---
+
+### 2.4 URL 导入中各失败场景的精确状态
+
+以下全部发生在 `create_from_html` 的 try/except 块（[scraper.py#L63-L79](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L63-L79)）内部，异常被统一捕获并降级为 `new_recipe.image = "no image"`：
+
+| 失败场景 | 代码位置 | `new_recipe.image` 最终值 | 磁盘状态 | 是否后续可清理 |
+|---------|---------|-------------------------|---------|--------------|
+| **A. 新 recipe 本身没有 image 字段**（`new_recipe.image` 为 None/空） | scraper.py#L64 | `"no image"` | 仅空目录 `{uuid}/images/`、`{uuid}/assets/`（RecipeDataService __init__ 创建） | 无自动；`clean/recipe-folders` 不删（名字是合法 UUID） |
+| **B. 网络层故障**（DNS 解析失败、连接超时、TLS 握手失败、连接被重置等） | recipe_data_service.py#L151-L154：`except Exception: return None` | `"no image"` | 仅空目录 | 同上 |
+| **C. 远程返回非 200 状态码**（403、404、500、429 等） | recipe_data_service.py#L156-L159：`if r.status_code != 200: return None` | `"no image"` | 仅空目录 | 同上 |
+| **D. 200 但 Content-Type 不含 "image"**（如 text/html、application/pdf 等） | recipe_data_service.py#L161-L165：`raise NotAnImageError` | `"no image"` | 仅空目录（异常在 write_image 之前抛出） | 同上 |
+| **E. 图片下载成功但 PIL 解码失败**（损坏文件、HEIC 缺少依赖、截断的 JPEG、零字节等） | recipe_data_service.py#L168：`self.write_image(...)` → minify.py 内部 PIL 抛异常 → write_image #L106：`image_path.unlink()` 后 re-raise | `"no image"` | write_image 内部已 `unlink(missing_ok=True)` 删除了临时 original.{ext}，仅空目录；若 minify 生成部分 webp 后失败，已生成的 webp 会残留 | **部分残留 webp 无法自动清理** |
+| **F. 图片下载 + minify 全部成功，但后续 slugify 或其他逻辑抛异常**（极少） | scraper.py#L77-L79：统一捕获 | `"no image"` | 三尺寸 webp 完整存在于 `{uuid}/images/` | 永久孤儿 webp，无自动清理 |
+
+所有 A–F 场景下，`create_from_html` 不会中断，仍然返回 Recipe 对象（`image="no image"`）给调用方继续写入 DB。
 
 ---
 
@@ -175,6 +239,7 @@ POST /api/recipes/create/url  {url: "https://example.com/recipe"}
 - 上传/URL 抓取成功时：`cache.new_key(4)` → 4 位随机字母数字（[cache_key.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/pkgs/cache/cache_key.py)）
 - 老代码路径：`randint(0, 255)` → 整数
 - 删除图片时：`entry.image = None`
+- 导入图片失败时：硬编码字符串 `"no image"`
 
 前端构造 URL 时将此值作为 query param：
 ```
@@ -233,7 +298,8 @@ public_filter = "(household.preferences.privateHousehold = FALSE AND settings.pu
 **RecipeService.delete_many**（[recipe_service.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_service.py#L573-L588)）：
 
 ```
-DB 删除 recipe 记录后
+先 can_delete 校验（仅 admin 或所有者）
+  → DB 删除 recipe 记录（级联删除 recipe_assets 行）
   → 对每个 recipe 调用 delete_assets(recipe)
     → shutil.rmtree(recipe.directory, ignore_errors=True)
       → 完整删除 {RECIPE_DATA_DIR}/{recipe_id}/ 整个目录
@@ -248,29 +314,48 @@ DB 层：`RecipeModel.assets` 配置 `cascade="all, delete-orphan"`，删除 rec
 
 ```
 每次 update / patch recipe 后执行：
-  1. 若 slug 变更 → copytree(old_dir, new_dir) 迁移整个目录
+  1. 若 slug 变更 → copytree(old_dir, new_dir) 迁移整个目录（遗留 slug 目录兼容代码）
   2. 遍历 assets/ 目录下所有文件
      → 若文件名不在 recipe.assets[x].file_name 列表中 → unlink() 删除
 ```
 
-这保证了 DB 中已解除关联的资产文件不会残留在磁盘上。
+这保证了 DB 中已解除关联的资产文件不会残留在磁盘上。**但 images/ 目录不做类似校验**。
 
 ### 5.3 图片显式删除
 
 **DELETE /api/recipes/{slug}/image** → [RecipeService.delete_recipe_image](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_service.py#L540-L549)：
 ```python
-data_service.delete_image()  # 删除 images/ 下三种 webp 文件
-self.group_recipes.delete_image(slug)  # DB recipes.image = None
+① can_update() 校验  （先鉴权后操作，安全）
+② data_service.delete_image()  # 删除 images/ 下三种 webp 文件
+③ self.group_recipes.delete_image(slug)  # DB recipes.image = None
 ```
 
-### 5.4 Admin 维护清理工具
+### 5.4 Admin 维护清理工具（清理能力边界）
 
-**POST /api/admin/maintenance/clean/images**（[admin_maintenance.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/admin/admin_maintenance.py#L16-L35)）：
+**POST /api/admin/maintenance/clean/images**（[admin_maintenance.py#L16-L35](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/admin/admin_maintenance.py#L16-L35)）：
 - 遍历所有 recipe 目录下 images/
-- 删除所有后缀 != `.webp` 的文件（即 purge 未清理干净的原始 jpg/png 等）
+- **只删除后缀 != `.webp` 的文件**（即 purge 未清理干净的原始 jpg/png/heic 等）
+- 对孤儿 webp 文件无效
 
-**POST /api/admin/maintenance/clean/recipe-folders**（[admin_maintenance.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/admin/admin_maintenance.py#L38-L52)）：
-- 删除 RECIPE_DATA_DIR 下文件夹名不是合法 UUID 的目录（旧版本按 slug 建的遗留目录）
+**POST /api/admin/maintenance/clean/recipe-folders**（[admin_maintenance.py#L38-L52](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/admin/admin_maintenance.py#L38-L52)）：
+
+```python
+for recipe_dir in root_dir.iterdir():
+    try:
+        uuid.UUID(recipe_dir.name)
+        continue                # ★ 合法 UUID 直接跳过，不查 DB
+    except ValueError:
+        shutil.rmtree(recipe_dir)
+```
+
+- **仅删除目录名不是合法 UUID 的目录**（旧版本按 slug 建的遗留目录）
+- **不与数据库 recipes 表做 JOIN 比对**，因此：
+  - 旧 slug 格式遗留目录 ✅ 可清
+  - 合法 UUID 但 DB 中不存在对应 recipe（孤儿目录） ❌ **无法被清理**
+  - 合法 UUID 且 DB 中存在对应 recipe ✅ 正确跳过
+
+**POST /api/admin/maintenance/clean/temp**：
+- 暴力删除并重建 TEMP_DIR
 
 ### 5.5 重新处理旧图脚本
 
@@ -283,24 +368,34 @@ self.group_recipes.delete_image(slug)  # DB recipes.image = None
 
 ## 6. 权限访问控制
 
-### 6.1 Recipe 图片/资产的写权限
+### 6.1 can_update 精确触发条件
 
-所有修改操作（上传图片、URL 抓取、删除图片、上传资产）都在 RecipeService 层通过 `can_update` 校验：
+**SQL 逻辑**（[recipe_service.py#L87-L131](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_service.py#L87-L131)），按优先级判断：
 
-```python
-# recipe_service.py can_update()
-SELECT CASE
-  WHEN r.user_id = :user_id THEN 1                          -- 所有者
-  WHEN COALESCE(rs.locked, TRUE) = TRUE THEN 0              -- 被锁定则不可改
-  WHEN u.household_id != :household_id                      -- 跨 Household
-       AND COALESCE(hp.lock_recipe_edits_from_other_households, TRUE) = TRUE THEN 0
-  ELSE 1
-END
-```
+| # | 条件 | can_update 结果 | 说明 |
+|---|------|----------------|------|
+| 1 | `r.user_id == :user_id` | **1（允许）** | Recipe 所有者 |
+| 2 | 不满足 #1 **且** `COALESCE(rs.locked, TRUE) = TRUE` | **0（拒绝）** | 非所有者 + recipe 被锁定（NULL 默认视为锁定） |
+| 3 | 不满足 #1、#2 **且** `u.household_id != :household_id AND COALESCE(hp.lock_recipe_edits_from_other_households, TRUE) = TRUE` | **0（拒绝）** | 非所有者 + 跨 Household + Household 策略禁止外组编辑 |
+| 4 | 不满足以上全部 | **1（允许）** | 非所有者 + 未锁定 + 同 Household（或跨 Household 但其策略允许） |
 
-删除权限 `can_delete` 更严格：仅 admin 或 recipe.user_id == 当前用户。
+**补充**：
+- 判断范围是全部传入的 slugs，只要有一条不可更新，整体返回 0
+- 查询加了 `r.group_id = :group_id` 过滤，跨 Group 的 recipe 根本看不到
+- `can_delete` 更严格：admin 或 `r.user_id == :user_id`（协作编辑不允许删除）
 
-### 6.2 RecipeSettings 对前端展示的影响
+### 6.2 各写操作的鉴权位置与遗留风险对比
+
+| 操作 | HTTP | 鉴权位置 | 鉴权时机 | 鉴权失败磁盘遗留 |
+|------|------|---------|---------|----------------|
+| 本地上传图片 | PUT /{slug}/image | `RecipeService.update_recipe_image` L532 | **写之前** ✅ | 无 |
+| 外链抓图 | POST /{slug}/image | `RecipeService.update_one` → `_pre_update_check` | **写之后** ❌ | images/ 下三种 webp，无自动清理 |
+| 删除图片 | DELETE /{slug}/image | `RecipeService.delete_recipe_image` L542 | **写之前** ✅ | 无 |
+| 上传资产 | POST /{slug}/assets | `RecipeService.update_one` → `_pre_update_check` | **写之后** ❌ | assets/ 下文件名，下次 update/patch 时 check_assets 会清 |
+| 更新 recipe 本体 | PATCH /{slug} | `RecipeService.patch_one` → `_pre_update_check` | 写 DB 之前 | 无（不碰磁盘） |
+| 删除 recipe | DELETE /{slug} | `RecipeService.delete_many` → `can_delete` | 写 DB 之前 | 无 |
+
+### 6.3 RecipeSettings 对前端展示的影响
 
 [recipe_settings.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/schema/recipe/recipe_settings.py)：
 
@@ -309,38 +404,31 @@ END
 | `public` | 公开浏览时（Explore 页面、未登录用户）只有 public=True 且所在 Household 非 private 才可见 |
 | `show_nutrition` | 控制营养信息展示 |
 | `show_assets` | 控制资产列表展示（前端根据此字段决定是否渲染资产区域） |
-| `locked` | 锁定后非所有者不可编辑（见 can_update 逻辑） |
+| `locked` | 锁定后非所有者不可编辑（见 can_update 条件 #2，NULL 视为 TRUE=锁定） |
 | `disable_comments` | 控制评论功能 |
 
 **注意**：`show_assets` 仅控制 UI 显示，资产文件仍可通过 `/api/media/recipes/{id}/assets/{name}` 直接下载（只要知道文件名和 recipe_id）。
 
-### 6.3 读权限漏洞（特性）
+### 6.4 读权限设计（obscurity 模式）
 
 Media 路由（`/api/media/recipes/*`）**没有任何认证/授权**。原因：
 - 生产环境 Docker 部署中，此路径由 nginx 直接 serve 静态文件，请求不经过 Python
 - 通过 obscurity 保护：需要知道 recipe 的 UUID（而非 slug），UUID 不可枚举
+- `recipe_id` 是 UUIDv4，2^122 熵，无法暴力枚举
 
 ---
 
 ## 7. 导入失败时的资源状态
 
-### 7.1 URL 抓取过程中图片下载失败
+### 7.1 单 URL 导入（create_from_html）
 
-在 [create_from_html](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L63-L79) 中：
+详见 **2.4 节表格**。汇总：
 
-```python
-try:
-    if new_recipe.image:
-        await recipe_data_service.scrape_image(new_recipe.image)
-    new_recipe.image = cache.new_key(4)
-except Exception as e:
-    recipe_data_service.logger.exception(f"Error Scraping Image: {e}")
-    new_recipe.image = "no image"   # 标记失败，不中断导入
-```
-
-- 图片下载异常（网络失败、非图片 Content-Type、PIL 解码失败等）**被吞掉**，仅记录日志
-- Recipe 仍然会被创建并保存到 DB，只是 `recipes.image = "no image"`
-- 磁盘状态：`RecipeDataService.scrape_image` 内部 `write_image` 失败时会 `image_path.unlink(missing_ok=True)` 回滚，不会残留半成品
+- **所有图片相关异常都被吞掉**（`try/except Exception` 包裹 scrape_image + slugify 整块），降级为 `new_recipe.image = "no image"`
+- Recipe **仍会创建**并写入 DB
+- 磁盘上至少存在空目录 `{uuid}/images/` 和 `{uuid}/assets/`
+- 若 PIL 处理在生成部分 webp 后失败，已生成的 webp 无法被自动清理
+- `"no image"` 是普通字符串存于 DB，前端会因版本号变化请求 `/api/media/recipes/{id}/images/tiny-original.webp?version=no+image`，该文件不存在 → 404 → 前端 fallback 显示占位图
 
 ### 7.2 write_image / minify 失败回滚
 
@@ -348,43 +436,55 @@ except Exception as e:
 
 ```python
 try:
-    self.minifier.minify(image_path)
+    self.minifier.minify(image_path)    # 生成三尺寸 webp，期间可能抛 PIL 异常
 except Exception:
-    image_path.unlink(missing_ok=True)   # 删除不完整的 original.{ext}
-    raise                                 # 向上抛出
+    image_path.unlink(missing_ok=True)  # ★ 只删除原始 original.{ext}
+    raise                               # ★ 不删除已生成的 webp
 ```
 
-若 minify 中 PIL 解码失败、磁盘写满等，原始上传文件会被删除，不会残留在 images/ 目录。
+**回滚不完整**：若 `original.webp` 生成成功但生成 `tiny-original.webp` 时磁盘满，`original.webp` 和 `min-original.webp` 已在磁盘上，不会被清理。
 
-### 7.3 批量导入（Bulk URL Import）失败
+### 7.3 批量导入（Bulk URL Import）DB 写入失败的孤儿目录
 
-[recipe_bulk_scraper.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/recipe_bulk_scraper.py#L82-L127)：
+[recipe_bulk_scraper.py#L82-L127](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/recipe_bulk_scraper.py#L82-L127)：
 
 ```
 并发（Semaphore 3）执行每个 URL:
-  → create_from_html() 失败 → 记录 ReportEntryCreate(success=False)，跳过
-  → create_from_html() 成功但 DB create_one() 失败 → 记录错误，跳过
-  → 全部成功 → ReportEntryCreate(success=True)
+  _do(url):
+    ① recipe, _ = await create_from_html(url, ...)
+       → 成功：recipe.id 是一个全新 UUID，{uuid}/ 目录已创建，可能有图片
+       → 失败：记录错误 entry，recipe=None，continue
+  ② 对有 recipe 的，调用 self.service.create_one(recipe) 写入 DB
+     → 成功：记录 success entry
+     → 失败（如 slug 冲突、DB 连接中断等）：记录 error entry，recipe 内存对象丢弃
 ```
 
-- 单个 URL 失败不会中断整个批量任务
-- Report 表中记录每条的成败详情，最终 report.status 为 success / failure / partial
-- 因 create_from_html 会预创建 recipe_id 目录并写图片，若后续 DB create_one 失败：**磁盘上可能残留孤立的 {recipe_id}/ 目录**，需要通过 admin maintenance 的 clean/recipe-folders 来清理（若 recipe_id 仍在 DB 则不会被清，产生孤儿数据）
+**孤儿目录产生条件**：步骤 ① create_from_html 成功（创建了 `{uuid}/` 目录）但步骤 ② DB `create_one` 抛异常。
+
+**孤儿目录特征**：
+- 目录名是合法 UUIDv4
+- DB `recipes` 表无对应 `id = {uuid}` 的行
+- 目录下可能为空、可能有三种 webp 图片、可能有临时下载文件
+
+**维护接口能否清除？—— 不能**：
+- `clean/recipe-folders` 只删除目录名不是合法 UUID 的目录（见 5.4 节），孤儿目录名是合法 UUID，会被 `continue` 跳过
+- `clean/images` 只删非 webp 文件
+- 唯一方法是管理员手工遍历 `RECIPE_DATA_DIR` 与 DB recipes.id 做差集后手动删除，或自行开发额外脚本
 
 ### 7.4 Recipe 复制失败的资源状态
 
 [RecipeService.duplicate_one](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_service.py#L358-L412)：
 
 ```python
-# DB 先创建新 recipe（带新 UUID）
-# 再 copytree 旧目录到新目录，失败仅记日志不抛出
-try:
+① new_recipe = _recipe_creation_factory(...)   # DB 先创建新 recipe（带新 UUID）
+② try:
     copytree(old_service.dir_data, new_service.dir_data, dirs_exist_ok=True)
-except Exception as e:
-    self.logger.error(f"Failed to copy assets from ...")
+  except Exception as e:
+    self.logger.error(...)   # ★ 仅记日志，不抛异常，不回滚 DB
 ```
 
 - 复制失败不会回滚已创建的 DB 记录，新 recipe 在 DB 中存在但无图片/资产
+- 复制中断（复制了部分文件后失败）可能导致不完整的 assets/ 目录内容
 
 ---
 
