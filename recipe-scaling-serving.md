@@ -1024,3 +1024,193 @@ RecipePage.vue
 - ⚠️ **前后端分数精度**：前端分母上限 10 vs 后端 32，极端情况下显示略有差异
 
 本分析覆盖了 Mealie v1.x 中 Recipe scaling 与 serving 相关的所有前端显示路径、后端处理逻辑、格式化策略、单位换算边界和营养值处理规则。
+
+---
+
+## 13. DOMPurify 净化链与 HTML/纯文本分数核准
+
+### 13.1 三套 DOMPurify 净化配置对照
+
+Mealie 前端存在三套独立的 DOMPurify 净化配置，分别用于不同场景：
+
+| 配置函数 | 所在文件 | ALLOWED_TAGS | 用途 |
+|---------|---------|-------------|------|
+| `sanitizeIngredientHTML` | [use-recipe-ingredients.ts](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/composables/recipes/use-recipe-ingredients.ts#L11-L16) | `["b", "q", "i", "strong", "sup"]` | 原料文本（quantity、unit、name、note） |
+| `sanitizeHTML` | [RecipePrintView.vue](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/components/Domain/Recipe/RecipePrintView.vue#L226-L231)、[RecipeYield.vue](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/components/Domain/Recipe/RecipeYield.vue#L44-L49) | `["strong", "sup"]` | 打印视图 Yield、RecipeYield 组件显示 |
+| `sanitizeMarkdownHtml` | [markdown.ts](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/lib/sanitize/markdown.ts#L12-L22) | `["strong","em","b","i","u","p","code","pre","sub","sup", ...]`（含 sub/sup 及大量 Markdown 标签） | SafeMarkdown 组件（步骤、描述、备注、原料 quantity/name/note） |
+
+**关键标签差异**：
+- `sanitizeIngredientHTML` 和 `sanitizeHTML` 的 `ALLOWED_TAGS` 列表中均**未显式列出** `<sub>` 和 `<span>`
+- `sanitizeMarkdownHtml` 的 `BASE_ALLOWED_TAGS` 中 `<sub>`、`<sup>`、`<span>` 均被明确列入
+
+### 13.2 HTML 分数与纯文本分数格式化核准
+
+分数格式化代码位于 [use-recipe-ingredients.ts](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/composables/recipes/use-recipe-ingredients.ts#L114-L118)：
+
+```typescript
+if (fraction[1] > 0) {
+  returnQty += includeFormating
+    ? `<sup>${fraction[1]}</sup><span>&frasl;</span><sub>${fraction[2]}</sub>`
+    : ` ${fraction[1]}/${fraction[2]}`;
+}
+```
+
+**HTML 分数格式（includeFormating=true）完整标签结构**：
+- `<sup>分子</sup>` — 上标分子
+- `<span>&frasl;</span>` — 分数斜线（Unicode ⁄，即 HTML entity `&frasl;`）
+- `<sub>分母</sub>` — 下标分母
+
+例如 1½ 的输出为：`1<sup>1</sup><span>&frasl;</span><sub>2</sub>`
+
+类似地，[use-scaled-amount.ts](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/composables/recipes/use-scaled-amount.ts#L17-L19) 的 `formatQuantity()` 函数使用完全相同的 HTML 分数结构。
+
+**纯文本分数格式（includeFormating=false）**：
+- 格式为 ` 分子/分母`（前置空格用于分隔整数部分）
+- 例如 1½ 输出为：`1 1/2`
+
+### 13.3 净化后标签存活核准
+
+尽管 `sanitizeIngredientHTML` 的 `ALLOWED_TAGS` 仅为 `["b", "q", "i", "strong", "sup"]`，未显式包含 `<sub>` 和 `<span>`，但从单元测试 [use-recipe-ingredients.test.ts](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/composables/recipes/use-recipe-ingredients.test.ts#L39-L43, L220-L228) 可验证标签实际存活情况：
+
+```typescript
+// 测试断言 sub 标签存活
+expect(parseIngredientText(ingredient, 1, true))
+  .contain("1<sup>1</sup>").and.to.contain("<sub>2</sub>");
+
+// 极小值分数 — span 标签也存活
+expect(parseIngredientText(ingredient))
+  .toEqual("&lt; <sup>1</sup><span>⁄</span><sub>10</sub> cup salt");
+```
+
+**核准结论**：`<sup>`、`<sub>`、`<span>` 三个标签均通过了 `sanitizeIngredientHTML` 的净化。原因是 `USE_PROFILES: { html: true }` 启用了 HTML profile，`ALLOWED_TAGS` 在该 profile 基础上是**追加白名单**而非完全覆盖。
+
+### 13.4 复制文本输出路径核准
+
+复制功能位于 [RecipeIngredients.vue](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/components/Domain/Recipe/RecipeIngredients.vue#L78-L93)：
+
+```typescript
+const ingredientCopyText = computed(() => {
+  components.push(parseIngredientText(ingredient, props.scale, false));
+  return components.join("\n");
+});
+```
+
+**复制文本特征**：
+- `scale = 当前 scale`（共享当前值）
+- `includeFormating = false`（纯文本分数 `1 1/2`，无 HTML 标签）
+- 净化函数：`sanitizeIngredientHTML`（纯文本输入无标签可剥离）
+- 典型输出示例：`2 1/2 cups flour`
+
+### 13.5 打印视图原料输出路径核准
+
+打印视图原料输出位于 [RecipePrintView.vue](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/components/Domain/Recipe/RecipePrintView.vue#L367-L369)：
+
+```typescript
+function parseText(ingredient: RecipeIngredient) {
+  return parseIngredientText(ingredient, props.scale);  // includeFormating 默认 true
+}
+```
+
+并通过 `<p v-html="parseText(ingredient)" />` 直接渲染。
+
+**打印视图原料特征**：
+- `scale = 当前 scale`（实际打印容器传 scale；打印预览始终 scale=1）
+- `includeFormating = true`（HTML 分数 `<sup>1</sup><span>⁄</span><sub>2</sub>`）
+- 净化函数：`sanitizeIngredientHTML`（保留 `<sup>/<sub>/<span>`）
+- 最终渲染为视觉上标/下标分数效果
+
+### 13.6 打印视图 Yield 净化链差异
+
+打印视图 Yield/Servings 显示的净化链与原料不同，位于 [RecipePrintView.vue](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/components/Domain/Recipe/RecipePrintView.vue#L226-L254)：
+
+1. [use-scaled-amount.ts](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/composables/recipes/use-scaled-amount.ts#L17-L19) 的 `formatQuantity()` 产生 HTML 分数（`<sup>/<span>/<sub>`）
+2. 经 `sanitizeHTML`（`ALLOWED_TAGS = ["strong", "sup"]`）净化
+3. 通过 `<span v-html="recipeYield" />` 渲染
+
+**关键差异**：`sanitizeHTML` 的 `ALLOWED_TAGS` 明确不包含 `<sub>` 和 `<span>`，这两个标签会被剥离，仅保留 `<sup>`。
+
+---
+
+## 14. 净化链差异对小数、分数和单位换算的边界影响
+
+### 14.1 小数模式与分数模式的 HTML/纯文本边界
+
+小数模式（`unit.fraction = false`）永远输出阿拉伯数字格式（如 `0.5`、`1.5`、`< 0.001`），**不受 `includeFormating` 参数影响**，不产生任何 HTML 标签。
+
+| 模式 | includeFormating=true | includeFormating=false |
+|------|-----------------------|------------------------|
+| 小数 | `0.5`（纯数字，无标签） | `0.5`（纯数字） |
+| 分数 | `<sup>1</sup><span>⁄</span><sub>2</sub>`（三个 HTML 标签） | `1/2`（纯文本斜线） |
+
+**边界结论**：
+- 小数模式下 `includeFormating` 参数**完全无效** — 因为小数路径不产生任何 HTML 标签
+- 只有分数模式才会因 `includeFormating` 产生 HTML 分数与纯文本分数的格式差异
+
+### 14.2 `<` 字符的 HTML 实体编码边界
+
+极小值显示（`< 0.001`、`< 1/10`）中的 `<` 字符被 DOMPurify 转义为 `&lt;`（见测试用例 `&lt; 0.001 cup salt`），这是 DOMPurify 的 HTML 实体编码安全机制。
+
+| 场景 | 存储字符串 | HTML 渲染显示 | 复制到剪贴板 |
+|------|-----------|--------------|-------------|
+| 页面 v-html 渲染 | `&lt; 0.001` | `< 0.001` | `<` 字符 |
+| 打印视图 v-html | `&lt; <sup>1</sup><span>⁄</span><sub>10</sub>` | `< ¹⁄₁₀`（上标/下标形式） | 取决于浏览器实现 |
+| 复制文本（纯文本） | `&lt; 1/10` | 无（纯字符串输出） | 取决于剪贴板 API 对 `&lt;` 的处理 |
+
+**边界结论**：HTML 渲染时 `&lt;` 正确显示为 `<`；复制纯文本时 `&lt;` 实体的实际输出取决于剪贴板处理层。
+
+### 14.3 单位换算与格式化层的独立边界
+
+1. **单位换算与格式化完全独立**：
+   - 单位换算仅发生在购物清单后端 pint 库合并逻辑，与 `includeFormating`、HTML/纯文本格式完全无关
+   - 格式化层（HTML 分数、纯文本分数、小数）仅处理 `quantity` 字段的显示形式
+
+2. **单位名称本身永远是纯文本**：
+   - 单位名称（`unit.name`、`unit.abbreviation`）始终是纯文本输出（如 `cup`、`g`、`tbsp`）
+   - 单位复数判断基于 `quantity * scale` 的数值
+   - HTML 分数或小数格式**只影响** `quantity` 字段的 display，不影响单位名称输出
+
+| 维度 | HTML 格式化层 | 单位层 |
+|------|--------------|--------|
+| 数量显示 | `<sup>1</sup><span>⁄</span><sub>2</sub>` vs `1/2` vs `0.5` | `cup`/`cups`（纯文本） |
+| 复数判断 | 基于 `quantity * scale` 数值 | 基于 `quantity * scale` 数值 |
+| 单位换算 | 完全不影响 | 仅购物清单后端 pint 换算 |
+
+### 14.4 SafeMarkdown 二次净化链边界
+
+[RecipeIngredientListItem.vue](file:///d:/fz/0601/solo-dogfeeding/code/78-mealie/frontend/app/components/Domain/Recipe/RecipeIngredientListItem.vue#L3-L31) 中，原料的 quantity/name/note 字段经过**两次净化**：
+
+```
+useParsedIngredientText → sanitizeIngredientHTML → SafeMarkdown → marked.parse → sanitizeMarkdownHtml
+```
+
+两次净化分别为：
+1. **第一次净化**：`sanitizeIngredientHTML`（ALLOWED_TAGS=`["b", "q", "i", "strong", "sup"]`）
+2. **第二次净化**：`sanitizeMarkdownHtml`（BASE_ALLOWED_TAGS 含 `sub`/`sup`/`span` 全量标签）
+
+**边界影响**：
+- 二次净化确保 HTML 分数标签 `<sup>/<sub>/<span>` 在两次过滤中均存活
+- SafeMarkdown 的 `marked.parse()` 对输入的 HTML 原样传递，不会破坏已有的分数标签结构
+
+### 14.5 各输出路径的完整格式对照表
+
+| 输出路径 | scale | includeFormating | 净化函数 | 分数格式 | 小数格式 |
+|---------|-------|-----------------|----------|---------|---------|
+| 配方页面原料列表 | 当前 scale | true | sanitizeIngredientHTML + sanitizeMarkdownHtml（二次净化） | HTML `<sup>/<sub>/<span>` | `0.5` |
+| 配方页面复制文本 | 当前 scale | false | sanitizeIngredientHTML | 纯文本 `1/2` | `0.5` |
+| 实际打印（RecipePrintContainer） | 当前 scale | true | sanitizeIngredientHTML | HTML `<sup>/<sub>/<span>` | `0.5` |
+| 打印预览（RecipeDialogPrintPreferences） | scale=1 | true | sanitizeIngredientHTML | HTML `<sup>/<sub>/<span>` | `0.5` |
+| 打印视图 Yield/Servings | 当前 scale | 强制 HTML | sanitizeHTML | HTML 仅 `<sup>`（`<sub>`/`<span>` 被过滤） | `0.5` |
+| 页面 RecipeYield 显示 | 当前 scale | 强制 HTML | sanitizeHTML | HTML 仅 `<sup>`（`<sub>`/`<span>` 被过滤） | `0.5` |
+| 购物清单对话框 | 当前 scale | true | sanitizeIngredientHTML + sanitizeMarkdownHtml（二次净化） | HTML `<sup>/<sub>/<span>` | `0.5` |
+| ingredientToParserString | scale=1 | false | sanitizeIngredientHTML | 纯文本 `1/2` | `0.5` |
+| 步骤原料自动关联匹配 | scale=1 | true | sanitizeIngredientHTML + sanitizeMarkdownHtml | HTML `<sup>/<sub>/<span>` | `0.5` |
+
+### 14.6 最终边界总结
+
+**核心事实**：
+1. **小数模式与 `includeFormating` 完全无关** — 小数永远是阿拉伯数字，不产生任何 HTML 标签
+2. **只有分数模式产生 HTML vs 纯文本差异** — `<sup>`/`<sub>`/`<span>` 标签 vs 纯文本 `x/y`
+3. **单位名称永远是纯文本** — HTML 格式化层仅作用于 `quantity` 字段，单位名称与复数判断独立
+4. **营养值完全独立** — 所有路径的营养值完全不受 scale、includeFormating、净化链影响
+5. **`<` 字符统一转义** — DOMPurify 将 `<` 统一转义为 `&lt;`，HTML 渲染时正确显示
+6. **Yield/Servings 的 `sanitizeHTML` 存在标签过滤** — 仅允许 `<strong>/<sup>`，`<sub>/<span>` 被剥离，Yield 显示的分数可能缺少分母下标和分数斜线
