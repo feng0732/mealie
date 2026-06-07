@@ -228,8 +228,20 @@ Cookbook 的 `household_id` 是**实际存储的列**，与创建者用户的 ho
 
 ### 5.4 锁定/解锁权限：can_lock_unlock()
 
-**[代码支撑]** `mealie/services/recipe/recipe_service.py#L133-L134`：
-- 仅 Recipe 的创建者可以锁定或解锁 Recipe
+**[代码支撑]** 权限检查实现（`mealie/services/recipe/recipe_service.py#L133-L134`）：
+```python
+def can_lock_unlock(self, recipe: Recipe) -> bool:
+    return recipe.user_id == self.user.id
+```
+
+**[代码支撑]** 关键发现：
+1. **仅创建者本人可以锁定/解锁**：检查逻辑只比较 `recipe.user_id == self.user.id`，**没有任何 Admin 绕过**
+2. **与删除权限形成对比**：`can_delete()` 方法（同文件 L70-L72）有 `if self.user.admin: return True`，但 `can_lock_unlock()` 完全没有类似逻辑
+3. **调用路径**：`_pre_update_check()`（L462-L478）会先检查 `can_update()`，然后**额外单独检查**如果请求中 `settings.locked` 发生了变化，则必须通过 `can_lock_unlock()`
+4. **批量接口保护**：Bulk Service 的 `set_settings()`（`mealie/services/recipe/recipe_bulk_service.py#L62-L76`）显式执行 `settings.locked = recipe.settings.locked`，**强制锁定状态不变**，从批量 API 层面完全阻止了锁定状态的修改
+5. **无 Admin 专用路由**：`mealie/routes/admin/` 下没有任何 Recipe 管理路由，所有 Recipe 更新统一走 `BaseRecipeController`（继承自 `BaseUserController`，非 Admin 控制器）
+
+**结论**：Admin 不能锁定/解锁非自己创建的 Recipe，与普通用户权限一致。
 
 ### 5.5 Last Made 更新
 
@@ -457,7 +469,7 @@ Household 删除前会检查是否有用户隶属于该 Household，有则拒绝
 | 编辑他人 Recipe（未锁定） | ✅ | 取决于对方 Household 设置 | ✅ | 取决于对方 Household 设置 | ❌ |
 | 编辑他人 Recipe（已锁定） | ✅ | ❌（除非是所有者） | ❌（除非是所有者） | ❌ | ❌ |
 | 删除他人 Recipe | ✅ | ❌ | ❌ | ❌ | ❌ |
-| 锁定/解锁 Recipe | ✅（？需验证） | 仅自己创建的 | 仅自己创建的 | ❌ | ❌ |
+| 锁定/解锁 Recipe | ❌（除非是该 Recipe 的创建者本人） | 仅自己创建的 | 仅自己创建的 | ❌ | ❌ |
 | 查看 MealPlan/ShoppingList | ✅ | ✅（同 Household） | ✅ | ❌（被 Repository 过滤） | ❌ |
 | 查看 Cookbook | ✅ | ✅（同 Household） | ✅ | ❌（被 Repository 过滤） | ❌ |
 | 管理 Household 成员 | ✅ | ✅ | ❌ | ❌ | ❌ |
