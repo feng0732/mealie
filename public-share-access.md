@@ -436,35 +436,151 @@ def _filter_builder(self, **kwargs) -> dict[str, Any]:
 
 ## 十、撤销分享后的缓存边界
 
-### 10.1 应用层：无缓存
+### 10.1 应用层（DB 查询）：无缓存
 
 Share Token 查询不经过任何内存/Redis 缓存，每次请求直查数据库。Token 被删除后下一次请求立即返回 404。
 
-### 10.2 HTTP 响应缓存头差异
+### 10.2 MealieCrudRoute 的缓存头：有条件触发
 
-- **用户/管理 API**（通过 `MealieCrudRoute` 自定义路由类）：强制设置 `Cache-Control: no-cache, no-store, must-revalidate`，见 [routes/_base/routers.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/_base/routers.py#L48-L49)
-- **Share Token 匿名 API**（使用默认 `APIRouter`）：未设置任何 `Cache-Control` 头，可能被浏览器/CDN 默认缓存
-- **SPA HTML**：显式设置 `Cache-Control: no-cache`
-- **SPA 静态资源（_nuxt/*）**：`Cache-Control: public, max-age=31536000, immutable`，靠 hash 文件名失效
+`MealieCrudRoute` 是自定义 `APIRoute` 子类，定义于 [routes/_base/routers.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/_base/routers.py#L27-L52)，其缓存头设置逻辑为：
 
-### 10.3 图片版本化缓存
+```python
+async def custom_route_handler(request: Request) -> Response:
+    response = await original_route_handler(request)
+    response_body = json.loads(response.body)
 
-图片 URL 格式：`/api/media/recipes/{recipe_id}/images/original.webp?version={recipe.image}`
-- `recipe.image` 是 0-255 随机整数，每次更新图片时重新生成
-- 通过 URL 查询参数变化实现浏览器缓存自动失效
+    if isinstance(response_body, dict):               # 条件 1：响应体必须是 dict
+        if last_modified := response_body.get("updatedAt"):  # 条件 2：必须有 updatedAt 字段
+            response.headers["last-modified"] = last_modified
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
 
-### 10.4 缓存边界总表
+    return response
+```
 
-| 层面 | 缓存策略 | 撤销分享后失效时机 |
-|-----|---------|-----------------|
+**两个条件必须同时满足**才会设置 `Cache-Control` 头：
+1. 响应 JSON body 必须是 `dict` 类型（list 类型不触发，如分页列表）
+2. 该 dict 中必须包含 `"updatedAt"` 键（camelCase）
+
+### 10.3 各路由缓存头现状全景
+
+显式使用 `route_class=MealieCrudRoute` 的路由（grep 结果）：
+
+| 路由 | 文件 | route_class | 响应类型 | 是否触发 Cache-Control |
+|-----|------|------------|---------|----------------------|
+| `/api/units` | [unit_and_foods/units.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/unit_and_foods/units.py#L21) | MealieCrudRoute | dict/list | 单条 dict ✅，列表 ❌ |
+| `/api/foods` | [unit_and_foods/foods.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/unit_and_foods/foods.py#L21) | MealieCrudRoute | dict/list | 单条 dict ✅，列表 ❌ |
+| `/api/recipes`（用户 CRUD） | [recipe/recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/recipe/recipe_crud_routes.py#L85) | MealieCrudRoute | dict/list | 单条 Recipe dict ✅，列表 ❌ |
+| `/api/recipes/timeline/events` | [recipe/timeline_events.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/recipe/timeline_events.py#L26) | MealieCrudRoute | dict/list | 单条 dict ✅，列表 ❌ |
+| `/api/households/events/notifications` | [controller_group_notifications.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/households/controller_group_notifications.py#L32) | MealieCrudRoute | dict/list | 单条 dict ✅，列表 ❌ |
+| `/api/households/cookbooks` | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/households/controller_cookbooks.py#L24) | MealieCrudRoute | dict/list | 单条 dict ✅，列表 ❌ |
+| `/api/groups/labels` | [controller_labels.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/groups/controller_labels.py#L21) | MealieCrudRoute | dict/list | 单条 dict ✅，列表 ❌ |
+
+**公开/匿名路由均未使用 MealieCrudRoute**，因此全部没有 `Cache-Control` 头：
+
+| 公开/匿名路由 | Router 类型 | route_class | Cache-Control |
+|-------------|------------|-------------|---------------|
+| `/api/recipes/shared/{token_id}` | 默认 `APIRouter` | 默认 | ❌ 无 |
+| `/api/recipes/shared/{token_id}/zip` | 默认 `APIRouter` | 默认 | ❌ 无（StreamingResponse 无 body） |
+| `/api/explore/groups/{group_slug}/...` | 默认 `APIRouter` | 默认 | ❌ 无 |
+| `/api/shared/recipes`（用户管理 Token） | `UserAPIRouter` | 默认 | ❌ 无 |
+| `/api/media/recipes/...`、`/api/media/users/...` | 默认 `APIRouter` | 默认 | ❌ 无（FileResponse 无 JSON body） |
+
+### 10.4 动态分享页面（SPA Meta 注入）的缓存头
+
+以下三条路由通过 `app.get()` 直接注册，返回 `Response(..., media_type="text/html")`：
+
+| 路由 | 注册位置 | Cache-Control |
+|-----|---------|---------------|
+| `GET /g/{group_slug}/r/{recipe_slug}` | [spa/__init__.py#L253](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/spa/__init__.py#L253) | ❌ 未设置 |
+| `GET /g/{group_slug}/shared/r/{token_id}` | [spa/__init__.py#L254](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/spa/__init__.py#L254) | ❌ 未设置 |
+| `response_404()` 返回 | [spa/__init__.py#L183-L184](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/spa/__init__.py#L183-L184) | ❌ 未设置 |
+
+代码证据：
+```python
+# 均返回纯 Response 对象，未设置任何缓存头
+return Response(content_with_meta(group_slug, recipe), media_type="text/html")
+return Response(__contents, media_type="text/html", status_code=404)
+```
+
+这些路由由 FastAPI 路由表优先匹配，**完全不走 `SPAStaticFiles`**。
+
+### 10.5 静态 SPA fallback 的 no-cache 规则
+
+`SPAStaticFiles`（继承自 `StaticFiles`）的缓存策略仅对走静态文件服务的请求生效，见 [spa/__init__.py#L34-L52](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/spa/__init__.py#L34-L52)：
+
+```python
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        try:
+            response = await super().get_response(path, scope)
+        except HTTPException as ex:
+            if ex.status_code == 404:
+                response = await super().get_response("index.html", scope)  # fallback
+            else:
+                raise ex
+
+        if path.startswith("_nuxt/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path == "." or response.media_type == "text/html":
+            response.headers["Cache-Control"] = "no-cache"
+
+        return response
+```
+
+**生效路径**（仅当无显式路由匹配时，请求落到 `app.mount("/", SPAStaticFiles(...))`）：
+
+| 请求路径 | 返回内容 | Cache-Control |
+|---------|---------|---------------|
+| `/_nuxt/abc123.js` | 静态构建产物 | `public, max-age=31536000, immutable` |
+| `/`（path == "."） | index.html | `no-cache` |
+| `/foo/bar`（无路由匹配） | index.html fallback（media_type == "text/html"） | `no-cache` |
+
+**不生效路径**：
+- 显式注册的 `app.get("/g/{group_slug}/shared/r/{token_id}")`
+- 显式注册的 `app.get("/g/{group_slug}/r/{recipe_slug}")`
+- 所有 API 路由
+
+### 10.6 图片版本化缓存
+
+Recipe 图片 URL 格式：`/api/media/recipes/{recipe_id}/images/original.webp?version={recipe.image}`
+- `recipe.image` 是 0-255 随机整数，每次调用 `update_image` 时重新生成（见 [repository_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/repos/repository_recipes.py#L155-L159)）
+- 通过 URL query 参数变化实现浏览器缓存自动失效
+
+### 10.7 缓存边界总表
+
+| 路由/资源 | 缓存策略 | 撤销分享后失效时机 |
+|----------|---------|-----------------|
 | DB 查询 | 无缓存 | 立即 |
-| Share Token API 响应头 | **未设置** Cache-Control | 取决于浏览器/CDN 默认策略 |
-| Explore/User/Admin API 响应头 | `no-cache, no-store` | 立即 |
-| Recipe 图片 | URL 带 version 参数 | 立即（新 URL 不走旧缓存） |
-| Recipe 附件 | 无特殊缓存头 | 取决于浏览器默认策略 |
-| User 头像 | 无特殊缓存头 | 取决于浏览器默认策略 |
-| SPA HTML 页面 | `no-cache` | 立即 |
-| SPA 静态资源 | 永久缓存（hash 文件名） | 重新发布构建后 |
+| **Share Token 匿名 API** (`/api/recipes/shared/{id}`) | ❌ 无 Cache-Control | 取决于浏览器/CDN 默认策略 |
+| **Explore 公开浏览** (`/api/explore/...`) | ❌ 无 Cache-Control | 取决于浏览器/CDN 默认策略 |
+| **Share Token 用户管理** (`/api/shared/recipes`) | ❌ 无 Cache-Control（UserAPIRouter 无 MealieCrudRoute） | 取决于浏览器/CDN 默认策略 |
+| **用户 Recipe CRUD 单条** (`/api/recipes/{slug}` GET) | ✅ `no-cache, no-store`（MealieCrudRoute + dict + updatedAt） | 立即 |
+| **用户 Recipe CRUD 列表** (`/api/recipes` 分页) | ❌ 无 Cache-Control（list 类型不触发 MealieCrudRoute） | 取决于浏览器/CDN 默认策略 |
+| **SPA Meta 注入页面**（`/g/.../shared/r/...` 等显式路由） | ❌ 无 Cache-Control | 取决于浏览器/CDN 默认策略 |
+| **SPA 404 页面** (`response_404()`) | ❌ 无 Cache-Control | 取决于浏览器/CDN 默认策略 |
+| **SPA fallback HTML**（无显式路由匹配时） | ✅ `no-cache`（SPAStaticFiles） | 立即 |
+| **SPA _nuxt/* 静态资源** | ✅ 永久缓存（hash 文件名） | 重新发布构建后 |
+| **Recipe 图片** | URL 带 `?version=` 参数 | 立即（新 URL 不走旧缓存） |
+| **Recipe 附件、时间线图片** | ❌ 无特殊缓存头 | 取决于浏览器默认策略 |
+| **User 头像** | ❌ 无特殊缓存头 | 取决于浏览器默认策略 |
+
+### 10.8 差异对撤销分享后可见内容的实际影响
+
+| 撤销/变更操作 | 受影响资源 | 缓存行为 | 用户可能看到旧内容的窗口 |
+|-------------|-----------|---------|----------------------|
+| **用户删除 Share Token** | `/api/recipes/shared/{id}` | 无缓存头 | 浏览器/CDN 默认缓存 TTL（通常几分钟到几小时） |
+| **用户删除 Share Token** | `/g/{group_slug}/shared/r/{id}` Meta | 无缓存头 | 浏览器/CDN 默认缓存 TTL |
+| **Token 过期被惰性删除** | `/api/recipes/shared/{id}` | 无缓存头 + 立即删 DB | 仅浏览器端缓存（若有） |
+| **Recipe 由 public 改为 private** | `/api/explore/.../recipes/{slug}` | 无缓存头 | 浏览器/CDN 默认缓存 TTL |
+| **Household 改为 private** | Explore 列表 | 无缓存头 | 浏览器/CDN 默认缓存 TTL |
+| **Recipe 被删除** | 级联清理 Token → API 404 | 无缓存头 | 浏览器/CDN 默认缓存 TTL |
+| **用户 CRUD 单条 Recipe** | `/api/recipes/{slug}` | `no-cache, no-store` | 立即 |
+| **用户 CRUD 分页列表** | `/api/recipes` 列表 | 无缓存头（list 不触发） | 浏览器/CDN 默认缓存 TTL |
+| **用户列出自己的 Share Token** | `/api/shared/recipes` | 无缓存头 | 浏览器/CDN 默认缓存 TTL |
+| **Recipe 图片更新** | `/api/media/recipes/{id}/images/original.webp` | `?version=` 变更 | 立即（新 URL） |
+| **Recipe 附件更新** | `/api/media/recipes/{id}/assets/{file}` | 无缓存头 + 同文件名 | 取决于浏览器默认策略（可能有 ETag/Last-Modified） |
+
+**结论**：绝大多数公开/匿名接口以及用户侧列表接口都**没有**显式 `Cache-Control` 头，撤销分享后的可见内容受浏览器和中间 CDN 的默认缓存策略影响。只有通过 `MealieCrudRoute` 且满足条件（dict + updatedAt）的单条对象查询接口，以及 SPA fallback HTML，才保证不缓存。
 
 ---
 
@@ -490,10 +606,10 @@ Pydantic Recipe Schema 序列化（输出含 userId/groupId/householdId）
 
 ### 11.2 已知安全边界
 
-1. **身份归属字段泄露**：公开 Recipe 响应包含 `userId`、`groupId`、`householdId`（camelCase）
-2. **Media 路由完全无校验**：Recipe 图片/附件、时间线图片、用户头像均无认证，也不校验 Recipe 公开性或 Share Token 有效性，仅靠 UUID 不可猜测保护
-3. **Share Token API 无 Cache-Control**：响应可能被浏览器/CDN 缓存
-4. **SPA Meta 不检查 Token 过期**：过期 Token 在被清理前，仍可通过 `/g/{group_slug}/shared/r/{token_id}` 获取 OG Meta
+1. **身份归属字段泄露**：公开 Recipe 响应包含 `userId`、`groupId`、`householdId`（camelCase 形式），Share Token 匿名访问和 Explore 公开浏览均会输出
+2. **Media 路由完全无校验**：Recipe 图片/附件/时间线图片、用户头像均无认证，也不校验 Recipe 公开性或 Share Token 有效性，仅靠 UUID 不可猜测保护
+3. **绝大多数公开接口无 Cache-Control**：不仅 Share Token 匿名 API，Explore 公开浏览、Share Token 用户管理列表（`/api/shared/recipes`）、SPA Meta 注入页面（`/g/.../shared/r/...`）、用户 Recipe 分页列表等均未设置显式缓存头，撤销分享后浏览器/CDN 可能返回旧内容；仅 MealieCrudRoute + dict 响应 + 含 updatedAt 的单条查询以及 SPA fallback HTML 保证不缓存
+4. **SPA Meta 不检查 Token 过期**：过期 Token 在被惰性删除或定时清理前，仍可通过 `/g/{group_slug}/shared/r/{token_id}` 获取 OG Meta（title/description/image/JSON-LD）
 5. **Share Token 无速率限制**：理论可暴力枚举（UUID 空间足够大，实际不可行）
 
 ### 11.3 有效防护措施
