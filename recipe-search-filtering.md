@@ -235,6 +235,135 @@ function getParams(orderBy, orderDirection, orderByNullPosition, query, queryFil
 | Pinia stores (categories/foods/...) | Pinia 内存 | **否**（仅缓存 taxonomy 选项列表） | 参与参数还原（URL ID → 对象映射） |
 | Recipe Explorer debounce | 前端定时器 | **否**（仅防抖） | 不参与 |
 
+### A.7 前端 API 层数组参数的序列化方式
+
+`getParams()` 返回的参数对象（包含 `categories`、`tags`、`tools`、`foods`、`households` 等数组字段）会经过两层处理：
+
+**第一层：`BaseCRUDAPIReadOnly.getAll()` 过滤 null/undefined**
+
+定义于 [base-clients.ts L48-L51](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/lib/api/base/base-clients.ts#L48-L51)：
+
+```typescript
+async getAll(page = 1, perPage = -1, params = {} as Record<string, QueryValue>, config?: AxiosRequestConfig) {
+  params = Object.fromEntries(Object.entries(params).filter(([_, v]) => v !== null && v !== undefined));
+  return await this.requests.get<PaginationData<ReadType>>(route(this.baseRoute, { page, perPage, ...params }), undefined, config);
+}
+```
+
+**第二层：`route()` 函数对数组的序列化**
+
+定义于 [route.ts L22-L38](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/lib/api/base/route.ts#L22-L38)：
+
+```typescript
+export function route(rest: string, params: Record<string, QueryValue> | null = null): string {
+  const url = new URL(parts.prefix + rest, parts.host);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          url.searchParams.append(key, String(item));   // 对每个数组元素重复追加同一个 key
+        }
+      } else {
+        url.searchParams.append(key, String(value));
+      }
+    }
+  }
+  return url.toString().replace("http://localhost.com", "");
+}
+```
+
+**序列化结果示例**：
+
+```javascript
+// 输入 params
+{ categories: ["uuid-cat1", "uuid-cat2"], foods: ["uuid-food1"], search: "tomato", requireAllCategories: true }
+
+// 序列化后的 URL query string
+?categories=uuid-cat1&categories=uuid-cat2&foods=uuid-food1&search=tomato&requireAllCategories=true
+```
+
+即：**数组用重复的同一个 query key 表示**，这是 URL 查询参数数组的标准格式，FastAPI 的 `list[...]` 类型标注会自动解析为 Python 列表。
+
+### A.8 camelCase 参数到后端 snake_case 的别名解析
+
+前端传的参数名是 camelCase（如 `requireAllCategories`、`orderBy`、`paginationSeed`、`perPage`、`queryFilter`），但后端 Pydantic Schema 字段定义全是 snake_case（如 `require_all_categories`、`order_by`、`pagination_seed`、`per_page`、`query_filter`）。两者通过以下机制自动匹配。
+
+#### 全局 alias_generator + populate_by_name
+
+所有 Recipe 搜索相关的 Schema（`RecipeSearchQuery`、`RequestQuery` / `PaginationQuery`、`RecipeSuggestionQuery`）都继承自 `MealieModel`，其配置定义于 [mealie_model.py L45-L53](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/_mealie/mealie_model.py#L45-L53)：
+
+```python
+class MealieModel(BaseModel):
+    model_config = ConfigDict(alias_generator=camelize, populate_by_name=True)
+```
+
+- `alias_generator=camelize`（`humps.main.camelize`）：为每个 snake_case 字段自动生成 camelCase 别名
+  - `require_all_categories` → `requireAllCategories`
+  - `pagination_seed` → `paginationSeed`
+  - `order_by` → `orderBy`
+  - `query_filter` → `queryFilter`
+  - `per_page` → `perPage`
+- `populate_by_name=True`：同时接受 snake_case 原名和 camelCase 别名赋值，两者皆可
+
+因此，前端 `?requireAllCategories=true&paginationSeed=abc&orderBy=created_at` 能被后端 `require_all_categories: bool`、`pagination_seed: str | None`、`order_by: str | None` 正确解析。
+
+#### 特殊字段：UpdatedAtField 的多别名支持
+
+部分字段（如 `updated_at`）使用显式的 `AliasChoices` 多别名定义，见 [mealie_model.py L20-L37](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/_mealie/mealie_model.py#L20-L37)：
+
+```python
+kwargs["validation_alias"] = AliasChoices("update_at", "updateAt", "updated_at", "updatedAt")
+kwargs["serialization_alias"] = "updatedAt"
+```
+
+#### 响应序列化：返回 camelCase
+
+后端返回响应时统一调用 `model_dump(by_alias=True)`，如 [recipe_crud_routes.py L392](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/recipe/recipe_crud_routes.py#L392)：
+
+```python
+json_compatible_response = orjson.dumps(pagination_response.model_dump(by_alias=True))
+```
+
+同时，`PaginationBase.set_pagination_guides()` 在构造 next/previous 链接时，也用 `camelize(query_params)` 将内部 snake_case 参数名转换回 camelCase 写入 URL，见 [pagination.py L78-L84](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/response/pagination.py#L78-L84)：
+
+```python
+def set_pagination_guides(self, route: str, query_params: dict[str, Any] | None) -> None:
+    valid_dict: dict[str, Any] = camelize(query_params) if query_params else {}
+```
+
+#### query_filter 字符串内部的属性名转换
+
+用户通过 `queryFilter`（前端参数名）传入的过滤表达式（如 `settings.public = TRUE`）中的属性名，会在 `QueryFilterBuilder` 内部通过 `decamelize` 转换为 snake_case 匹配数据库列，见 [builder.py L69](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/services/query_filter/builder.py#L69) 和 [builder.py L232](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/services/query_filter/builder.py#L232)。
+
+### A.9 用户 API 与公共 Explore API 的实际路径区分
+
+Recipe 搜索/建议有两套独立的 API 端点，分别对应已登录用户的个人空间和匿名用户可访问的 Explore 公共空间。
+
+#### 前端 API Class 与 baseRoute
+
+| 场景 | 前端 Class | baseRoute | 定义位置 |
+|------|-----------|-----------|---------|
+| 已登录用户（个人空间） | `RecipeAPI`（extends `BaseCRUDAPI`） | `/api/recipes` | [recipe.ts L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/lib/api/user/recipes/recipe.ts#L34-L39) |
+| Explore 公共空间 | `PublicRecipeApi`（extends `BaseCRUDAPIReadOnly`） | `/api/explore/groups/{groupSlug}/recipes` | [recipes.ts L7-L22](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/lib/api/public/explore/recipes.ts#L7-L22) |
+
+对应的 Suggestions 路径：
+- 用户：`/api/recipes/suggestions`
+- 公共：`/api/explore/groups/{groupSlug}/recipes/suggestions`
+
+#### 后端路由注册位置与路径
+
+| 场景 | 后端 Controller / Router | 基础路径前缀 | 完整路径 |
+|------|--------------------------|-------------|---------|
+| 已登录用户 | `RecipeController(APIRouter)` in [recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/recipe/recipe_crud_routes.py) | `/api/recipes`（在 app 路由注册时自动挂载） | `GET /api/recipes`、`GET /api/recipes/suggestions` |
+| Explore 公共空间 | `controller_public_recipes.py` [APIRouter 注册](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/explore/controller_public_recipes.py#L16-L20) | `/api/explore/groups/{group_slug}/recipes` | `GET /api/explore/groups/{group_slug}/recipes`、`GET /api/explore/groups/{group_slug}/recipes/suggestions` |
+
+#### Repository 与权限差异
+
+| 场景 | Repository 构造 | 额外权限过滤 |
+|------|----------------|-------------|
+| 用户 API | `group_recipes`：group_id=用户group_id, household_id=None → by_user(user.id) | 仅 Repository 层基础 group_id 过滤 |
+| 公共 Explore API | `cross_household_repos`：group_id=group_slug 对应 group, household_id=None | 在路由层将 `(household.preferences.privateHousehold = FALSE AND settings.public = TRUE)` 注入 `query_filter` |
+
 ---
 
 ## 三、文本搜索的实现
