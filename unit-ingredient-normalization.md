@@ -119,38 +119,41 @@ def can_convert(self, unit, to_unit) -> bool:
     return unit.is_compatible_with(to_unit)
 ```
 
-#### 3.1.1 Pint 的三级单位识别
+#### 3.1.1 Pint 的四级单位识别
 
-Pint 对单位字符串有三种截然不同的响应，直接决定了后续所有行为：
+Pint 对单位字符串有**四种**截然不同的响应，直接决定了后续所有行为：
 
-| 级别 | 特征 | `uc.parse()` 返回值 | `isinstance(x, pint.Unit)` | 示例 |
-|------|------|-------------------|---------------------------|------|
-| **T1：Pint 原生可识别** | Pint 内置定义的物理/化学单位 | `pint.Unit` 对象 | `True` | `cup`、`pint`、`pound`、`gram`、`milliliter`、`ounce`、`fluid_ounce` |
-| **T2：dimensionless（无量纲）** | 合法的 Pint 单位，量纲为 `{}` | `pint.Unit` 对象，`dimensionality == dimensionless` | `True` | 空字符串 `""`、`count`（若已定义） |
-| **T3：Pint 完全不认识** | Pint 注册表中不存在该单位 | 原始输入字符串（非 `Unit`） | `False` | `"pinch"`、`"dash"`、`"splash"`、`"serving"`、`"head"`、`"clove"`、`"can"`、`"bunch"`、`"pack"`、`"sprig"` |
+| 级别 | 特征 | `uc.parse()` 返回值 | `isinstance(x, pint.Unit)` | 量纲 | 示例 |
+|------|------|-------------------|---------------------------|------|------|
+| **T1：Pint 原生可识别** | Pint 内置定义的物理/化学单位，识别结果正确 | `pint.Unit` 对象 | `True` | `[length]³` 或 `[mass]` 等 | `cup`、`pint`、`pound`、`gram`、`milliliter`、`ounce`、`fluid_ounce`、`teaspoon`、`tablespoon` |
+| **T2：dimensionless（无量纲）** | 合法的 Pint 单位，但没有物理量纲 | `pint.Unit` 对象 | `True` | `dimensionless`（`{}`） | 空字符串 `""`（无单位时的隐式状态） |
+| **T3：被 Pint 误识别** | Pint 认识但**识别错误**，解析成了另一种物理单位 | `pint.Unit` 对象 | `True` | **[length]**（长度） | `"pinch"` / `"pinches"` → 被解析为 **picoinch**（皮英寸 = 10⁻¹² 英寸） |
+| **T4：Pint 完全未定义** | Pint 注册表中完全不存在该单位 | 原始输入字符串（非 `Unit`） | `False` | — | `"dash"`、`"splash"`、`"serving"`、`"head"`、`"clove"`、`"can"`、`"bunch"`、`"pack"`、`"sprig"` 及其复数形式 |
 
-#### 3.1.2 dimensionless vs T3（未定义单位）的关键区别
+#### 3.1.2 四级分类的关键区别
 
-这是两个完全不同的概念：
-
-| 维度 | dimensionless (T2) | 未定义单位 (T3) |
-|------|-------------------|----------------|
-| Pint 响应 | 返回合法 `pint.Unit`，量纲 `{}` | 抛异常后 `parse()` 回退返回字符串 |
-| `can_convert(自身, 自身)` | `True`（与自己兼容） | `False`（返回非 Unit，提前短路） |
-| `can_convert(自身, cup)` | `False`（量纲不兼容） | `False`（返回非 Unit，提前短路） |
-| `can_convert(自身, pound)` | `False`（量纲不兼容） | `False`（返回非 Unit，提前短路） |
+| 维度 | T1（正确识别） | T2（dimensionless） | T3（误识别 pinch） | T4（未定义） |
+|------|--------------|-------------------|-------------------|------------|
+| Pint 响应 | 返回 `pint.Unit` | 返回 `pint.Unit` | 返回 `pint.Unit` | 返回原始字符串 |
+| `can_convert(自身, 自身)` | `True` | `True` | `True`（[length] 与 [length] 兼容） | `False`（非 Unit 提前短路） |
+| `can_convert(自身, cup)` | T1 体积→`True`；T1 质量→`False` | `False`（量纲不兼容） | `False`（[length] 与 `[length]³` 不兼容） | `False`（非 Unit 提前短路） |
+| `can_convert(自身, pound)` | T1 体积→`False`；T1 质量→`True` | `False` | `False`（[length] 与 `[mass]` 不兼容） | `False`（非 Unit 提前短路） |
+| Mealie 中 `standard_unit` | ✅ 有值 | N/A（无单位对象） | ❌ `None` | ❌ `None` |
 
 #### 3.1.3 实际单位族映射
 
 根据 Pint 实际识别结果：
 
-| 量纲 (Dimensionality) | 单位族 | 实际 Pint 可识别单位 (T1) |
+| 量纲 (Dimensionality) | 单位族 | Pint 可识别单位 (T1 / T3) |
 |----------------------|--------|-------------------------|
 | `[length] ** 3` | 体积 (Volume) | cup, pint, quart, gallon, fluid_ounce, milliliter, liter, teaspoon, tablespoon |
 | `[mass]` | 质量 (Mass/Weight) | pound, ounce, gram, kilogram, milligram |
-| `dimensionless` | 无量纲 | 空字符串（无单位时的隐式默认） |
+| `[length]` | 长度（误识别） | **pinch / pinches**（被误解析为 picoinch，T3） |
+| `dimensionless` | 无量纲 | 空字符串（无单位时的隐式默认，T2） |
 
-> ⚠️ **重要更正**：`pinch`、`dash`、`splash`、`serving`、`head`、`clove`、`can`、`bunch`、`pack`、`sprig` 这些单位虽然存在于 Mealie 的种子数据（[en-US.json](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/seed/resources/units/locales/en-US.json)）中，但 **Pint 并不认识它们**，属于 T3 级别。在 [RepositoryUnit._add_standardized_unit](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/repository_units.py#L43-L107) 的 match 语句中，它们落入 `case _: pass` 分支，`standard_quantity` 和 `standard_unit` 均为 `None`。因此它们既不能被 Pint 识别，也没有标准化数据，无法参与任何跨单位换算。
+> ⚠️ **重要更正**：`pinch` / `pinches` 并非 Pint 未定义，而是被**误识别**为 `picoinch`（皮英寸，长度单位 `[length]`），属于 T3 级别。`dash`、`splash`、`serving`、`head`、`clove`、`can`、`bunch`、`pack`、`sprig` 及其复数才是真正的 T4（未定义）。
+>
+> 但 T3 和 T4 在 [RepositoryUnit._add_standardized_unit](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/repository_units.py#L43-L107) 的 match 语句中都落入 `case _: pass` 分支，**两者的 `standard_quantity` 和 `standard_unit` 均为 `None`**。因此在 Mealie 的购物清单合并逻辑中，T3 和 T4 的行为是一致的——都无法参与跨单位换算（详见 8.3 节）。
 
 ### 3.2 特殊处理：盎司 (Ounce) 的歧义消除
 
@@ -549,36 +552,39 @@ use_plural = self.quantity and self.quantity > 1
 
 ## 八、未知单位与边界情况的影响
 
-结合第 3.1 节的三级单位分类，"未知单位"在 Mealie 中实际对应 **T2（dimensionless）** 和 **T3（Pint 不认识且无标准化数据）** 两种情况：
+结合第 3.1 节的**四级**单位分类，"未知单位边界"在 Mealie 中实际包含 T2（dimensionless）、T3（误识别）、T4（未定义）三类。关键区别在于 T3/T4 的 `standard_unit` 均为 `None`，这决定了它们在购物清单合并中的行为高度一致。
 
-| 分类 | 典型代表 | Pint 识别 | `standard_unit` | 数据库中存在 |
-|------|---------|----------|----------------|-------------|
-| T1（已知） | cup, gram, pound | ✅ `pint.Unit` | ✅ 有 | ✅ |
-| T2（dimensionless） | 空字符串 / 无单位 | ✅ `pint.Unit`（量纲`{}`） | ❌ 无 | ✅（作为隐式状态） |
-| T3-A（种子但无换算） | pinch, dash, splash, serving, head, clove, can, bunch, pack, sprig | ❌ 返回字符串 | ❌ 无 | ✅（来自种子数据） |
-| T3-B（真正自定义） | 用户创建的 "handful"、"sprinkle" 等 | ❌ 返回字符串 | ❌ 无（除非手动配置） | ✅（用户创建） |
+| 分类 | 典型代表 | Pint 识别结果 | `standard_unit` | 数据库中存在 |
+|------|---------|-------------|----------------|-------------|
+| T1（正确识别） | cup, gram, pound, pint | ✅ `pint.Unit`（量纲正确） | ✅ 有 | ✅ |
+| T2（dimensionless） | 空字符串 / 无单位 | ✅ `pint.Unit`（量纲 `{}`） | N/A（无单位对象） | ✅（隐式状态） |
+| **T3（误识别）** | **pinch / pinches** | ✅ `pint.Unit`，但**错解析为 picoinch（量纲 `[length]`）** | ❌ `None` | ✅（来自种子数据） |
+| T4-A（种子但未定义） | dash, splash, serving, head, clove, can, bunch, pack, sprig | ❌ 返回原始字符串 | ❌ `None` | ✅（来自种子数据） |
+| T4-B（用户自定义） | "handful"、"sprinkle" 等 | ❌ 返回原始字符串 | ❌ `None`（除非手动配置） | ✅（用户创建） |
 
 ### 8.1 单位转换行为
 
-- `UnitConverter.can_convert()`：
+- `UnitConverter.can_convert()`（底层 Pint 级，直接用单位名）：
   - T1 + T1 且量纲兼容 → `True`
   - T1 + T2 → `False`（无量纲与体积/质量不兼容）
   - T2 + T2 → `True`（dimensionless 与自己兼容）
-  - 任何含 T3 → `False`（T3 返回字符串，非 `pint.Unit`，在 [`can_convert` L72](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/parser_services/parser_utils/unit_utils.py#L72) 被直接短路返回 False）
-- `UnitConverter.convert()` / `merge()`：任一单位为 T3 时抛出 `UnitNotFound` 异常
-- `merge_quantity_and_unit()`：任一单位缺少 `standard_quantity` 或 `standard_unit` 时抛出 `ValueError`
+  - T3 + T3 → `True`（pinch 解析为 [length]，与 [length] 兼容）
+  - T3 + T1（体积/质量）→ `False`（[length] 与 `[length]³` / `[mass]` 不兼容）
+  - 任何含 T4 → `False`（T4 返回字符串，非 `pint.Unit`，在 [`can_convert` L72](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/parser_services/parser_utils/unit_utils.py#L72) 被直接短路）
+- `UnitConverter.convert()` / `merge()`（strict 模式）：任一单位为 T4 时抛出 `UnitNotFound`；T3 不会抛异常但会按 picoinch（长度）做错误换算
+- `merge_quantity_and_unit()`：任一单位缺少 `standard_quantity` 或 `standard_unit` 时抛出 `ValueError`（T3、T4 均触发）
 
 ### 8.2 对显示 (Display) 的影响
 
-T2（无单位/dimensionless）与 T3（不认识）在前后端的显示行为：
+T2（无单位）、T3（pinch 误识别）、T4（dash/splash 等未定义）在前后端的显示行为：
 
 **后端 Schema 层**（[RecipeIngredientBase._format_*](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/schema/recipe/recipe_ingredient.py#L228-L323)）：
-- **数量格式**：`CreateIngredientUnit.fraction` 默认为 `True`，因此 T3 类单位（pinch、dash 等种子单位及用户自定义单位）的数量默认按**分数**格式显示。若单位对象不存在（T2 无单位），则走无单位分支，仍按分数格式化
+- **数量格式**：`CreateIngredientUnit.fraction` 默认为 `True`，因此 T3（pinch）、T4（dash 等种子单位及用户自定义单位）的数量默认按**分数**格式显示。若单位对象不存在（T2 无单位），则走无单位分支，仍按分数格式化
 - **单位名称**：
-  - T3 类单位（有单位对象）：直接使用 `name` / `plural_name` / `abbreviation`，是否缩写取决于 `use_abbreviation`（默认 `False`）
+  - T3/T4（有单位对象）：直接使用 `name` / `plural_name` / `abbreviation`，是否缩写取决于 `use_abbreviation`（默认 `False`）。**Pint 的误识别对显示无影响**——显示始终用数据库中的单位名，而非 Pint 解析结果
   - T2（无单位，`unit_id is None`）：单位名部分完全不显示（见 [_format_display L298](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/schema/recipe/recipe_ingredient.py#L298-L323)，`use_unit` 为 `False` 时 unit 传空字符串）
 - **单复数**：
-  - T3：`quantity > 1` 时使用复数形式，无 `plural_name` 则回退 `name`
+  - T3/T4：`quantity > 1` 时使用复数形式，无 `plural_name` 则回退 `name`
   - T2：不涉及
 
 **前端显示层**（[use-recipe-ingredients.ts](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/frontend/app/composables/recipes/use-recipe-ingredients.ts#L82-L143)）：
@@ -588,34 +594,45 @@ T2（无单位/dimensionless）与 T3（不认识）在前后端的显示行为�
 
 ### 8.3 对购物清单汇总 (Aggregation) 的影响
 
-[ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 中对单位的检查：
+[ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 中对单位的检查有**两层短路**，第一层是 `standard_unit` 是否存在，第二层才是 Pint 的 `can_convert`：
 
 ```python
 if item1.unit_id != item2.unit_id:
-    # 如果单位不同，两个单位都必须有 standard_unit 且可换算
+    # 第一层短路：任一单位没有 standard_unit → 直接返回 False
     if not (item1_unit and item1_unit.standard_unit):
         return False
     if not (item2_unit and item2_unit.standard_unit):
         return False
+    # 第二层短路：standard_unit 传给 can_convert 做 Pint 量纲检查
     uc = UnitConverter()
     if not uc.can_convert(item1_unit.standard_unit, item2_unit.standard_unit):
         return False
 ```
 
-各分类的实际汇总结果对照：
+> ⚠️ **关键事实**：由于 T3（pinch）的 `standard_unit` 为 `None`，它在**第一层短路就被拦截**，Pint 对 pinch 的误识别（解析为 picoinch 长度单位）**在购物清单合并中完全不会生效**。T3 和 T4 在购物清单合并中的行为是完全一致的。
 
-| 场景 | 能否合并 | 原因 | 结果 |
-|------|---------|------|------|
-| 相同 `unit_id`（无论 T1/T3-A/T3-B） | ✅ 可以 | `unit_id == unit_id` 跳过单位检查 | 数量直接相加，单位不变 |
-| 两个不同的 T1 单位，量纲兼容（如 cup + pint） | ✅ 可以 | 都有 `standard_unit`，且 Pint 可换算 | 调用 `merge_quantity_and_unit`，换算后智能合并 |
-| 两个不同的 T1 单位，量纲不兼容（cup + pound） | ❌ 不行 | `can_convert` 返回 False | 相同食材显示为两行 |
-| T1 + T3（任意子类型），不同 `unit_id` | ❌ 不行 | T3 无 `standard_unit`，在 L61-L64 被短路 | 相同食材显示为两行 |
-| T3-A + T3-A，不同 `unit_id`（如 pinch + dash） | ❌ 不行 | 都无 `standard_unit` | 相同食材显示为两行 |
-| T3-A + T3-B，不同 `unit_id`（如 pinch + handful） | ❌ 不行 | 都无 `standard_unit` | 相同食材显示为两行 |
+各分类的实际汇总结果对照（考虑两层短路）：
+
+| 场景 | 能否合并 | 在哪一层被判定 | 结果 |
+|------|---------|---------------|------|
+| 相同 `unit_id`（任意 T1/T3/T4-A/T4-B） | ✅ 可以 | `unit_id == unit_id` 跳过单位检查 | 数量直接相加，单位不变 |
+| 两个不同的 T1 单位，量纲兼容（cup + pint） | ✅ 可以 | 第一层通过；第二层 `can_convert("cup", "pint") = True` | 调用 `merge_quantity_and_unit`，换算后智能合并 |
+| 两个不同的 T1 单位，量纲不兼容（cup + pound） | ❌ 不行 | 第一层通过；第二层 `can_convert("cup", "pound") = False` | 相同食材显示为两行 |
+| T1 + T3（pinch），不同 `unit_id` | ❌ 不行 | 第一层短路：T3 的 `standard_unit = None` | 相同食材显示为两行 |
+| T1 + T4（dash），不同 `unit_id` | ❌ 不行 | 第一层短路：T4 的 `standard_unit = None` | 相同食材显示为两行 |
+| T3（pinch）+ T4（dash），不同 `unit_id` | ❌ 不行 | 第一层短路：两者 `standard_unit` 均为 `None` | 相同食材显示为两行 |
+| T4-A + T4-A，不同 `unit_id`（dash + splash） | ❌ 不行 | 第一层短路：两者 `standard_unit` 均为 `None` | 相同食材显示为两行 |
+| T3（pinch）+ T3（pinch），**相同** `unit_id` | ✅ 可以 | 同 unit_id，跳过单位检查 | 数量直接相加（T3 的误识别完全不影响此路径） |
 | T2（无单位，`unit_id=None`）+ T2，相同备注 | ✅ 可以 | 走备注完全相同分支 | 数量直接相加 |
 | T2（无单位，`unit_id=None`）+ T2，不同备注 | ❌ 不行 | 备注不同 | 相同食材显示为两行 |
 
-**典型案例**：一个食谱含有 "1 pinch salt" 和 "2 dashes salt"。两者 `food_id` 相同（盐），但 `unit_id` 不同（pinch vs dash），且两者都是 T3-A（无 `standard_unit`）。加入购物清单后会显示为两条独立记录，无法自动合并。
+**典型案例**：一个食谱含有 "1 pinch salt" 和 "2 dashes salt"。两者 `food_id` 相同（盐），但 `unit_id` 不同（pinch vs dash），且两者 `standard_unit` 均为 `None`（T3 和 T4 都在第一层短路）。加入购物清单后会显示为两条独立记录，无法自动合并。
+
+**T3（pinch）误识别的唯一潜在风险场景**：如果用户**手动**将 pinch 的 `standard_unit` 改为 `"pinch"`，则：
+1. 第一层短路不再触发（`standard_unit` 非空）
+2. 第二层 `can_convert("pinch", "pinch")` 调用 Pint，pinch 被解析为 picoinch（[length]），与自己兼容 → 返回 `True`
+3. 此时 pinch + pinch 可以跨 unit_id 合并（但实际应是同 unit_id，所以此场景罕见）
+4. 若另一单位 `standard_unit="cup"`，则 `can_convert("pinch", "cup")`：[length] vs [length]³ → `False`，行为仍正确（不合并）
 
 ---
 
@@ -701,9 +718,11 @@ for to_ref in to_item.recipe_references:
 
 | 场景 | 限制 / 行为 | 影响 |
 |------|------------|------|
-| **T3 级单位（pinch/dash/splash/serving 等）** | Pint 不认识，无 `standard_unit`，种子数据中落入 `case _: pass` | 不同 T3 单位间**无法跨单位换算/合并**；同食材但不同 T3 单位（如 pinch vs dash）在购物清单中显示为多行；只有相同 `unit_id` 才能合并 |
-| **T2 dimensionless vs T3 未定义单位** | T2 是合法的 `pint.Unit`（量纲 `{}`），T3 是非 Unit 字符串 | T2 与自己兼容（`can_convert(T2, T2)=True`），但 T3 与任何单位（包括自己）都不兼容（非 Unit 提前短路返回 False） |
-| **T3 单位显示** | `fraction` 默认为 `True`，`use_abbreviation` 默认为 `False` | 数量默认以分数格式显示，单位默认使用全名而非缩写 |
+| **T3：pinch 被 Pint 误识别** | `"pinch"` / `"pinches"` 被 Pint 解析为 **picoinch（皮英寸，量纲 `[length]`）**，而非未定义 | 对购物清单合并**无直接影响**（因 `standard_unit=None` 在第一层短路被拦截）；若用户**手动**将 pinch 的 `standard_unit` 设为 `"pinch"`，误识别才会生效，但即便生效，与 cup/pound 的 can_convert 仍为 False，行为正确 |
+| **T4：dash/splash/serving 等 Pint 未定义** | Pint 返回 `UndefinedUnitError`，`uc.parse()` 回退为原始字符串 | 与 T3 合并行为一致：`standard_unit=None` → 不同 unit_id 间无法跨单位换算合并，同 unit_id 可正常累加 |
+| **T2 dimensionless vs T3/T4 的本质区别** | T2 是合法 `pint.Unit`（量纲 `{}`），T3 是错误量纲的 `pint.Unit`，T4 是字符串 | T2 自兼容（`can_convert(T2,T2)=True`）；T3 与自身（长度量纲）兼容；T4 与任何单位（包括自己）都不兼容（非 Unit 短路） |
+| **购物清单合并的两层短路** | 第一层：任一 `standard_unit` 为 `None` 即返回 False；第二层才是 Pint 量纲检查 | T3（pinch 误识别）在第一层就被拦截，误识别结果**永远不会**传入第二层的 `can_convert`。T3 和 T4 在购物清单合并中行为完全一致 |
+| **T3/T4 单位显示** | `fraction` 默认为 `True`，`use_abbreviation` 默认为 `False` | 数量默认以分数格式显示，单位默认使用全名而非缩写。Pint 的误识别对显示**无影响**——显示始终用数据库中的单位名 |
 | **盎司歧义消除** | 仅在与体积单位合用时才自动转液盎司 | 纯盎司合并（如 8 oz + 1 lb）按重量处理；单独的盎司条目保持不变 |
 | **模糊匹配阈值** | 食材 85 / 单位 70 / 购物清单标签匹配 80 | 拼写差异过大可能匹配失败，需要手动纠正或添加别名 |
 | **非 ASCII 字符** | 规范化时使用 unidecode 转写 | 中文等表意文字转写后可能完全丢失语义，匹配严重依赖于用户创建的别名 |
