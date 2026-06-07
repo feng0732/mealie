@@ -167,6 +167,8 @@ def normalize(cls, val: str) -> str:
 | `mealie/alembic/versions/2025-02-09-15.31.00_7cf3054cbbcc_remove_instructions_index.py` | 截断所有 `_normalized` 字段到 255 字符（PostgreSQL btree 索引限制），并移除 `ix_recipe_instructions_text` 索引 |
 | `mealie/alembic/versions/2026-05-10-18.44.53_c7427796f7b6_more_aggresive_normalization.py` | **更激进的规范化**：将所有标点符号（除单/双引号）替换为空格，对 6 张表全部重新规范化 |
 
+这三次规范化迁移全部使用 **普通 `UPDATE ... SET ... WHERE id = :id` + `session.commit()`**，不依赖数据库冲突机制保证幂等，而是依赖 Alembic revision 的单次执行特性（详见第六章）。
+
 此外，每次迁移后的 `mealie/db/fixes/fix_migration_data.py` 还会检查并补填缺失的规范化字段（`fix_recipe_normalized_search_properties`、`fix_normalized_unit_and_food_names`）。
 
 ### 5.2 评分与收藏体系重构（用户级兼容）
@@ -186,21 +188,32 @@ def normalize(cls, val: str) -> str:
 数据迁移策略：
 1. 将 `users_to_favorites` 全部记录复制为 `is_favorite=True` 的行
 2. 对每个 group，将 `recipes.rating` 复制给该 group 的 **所有用户**（因为不知道是谁评的分）
-3. 用 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE` 保证幂等
+3. 这是整个代码库中 **唯一使用 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE` 保证幂等的数据迁移**：
+
+```python
+# PostgreSQL
+INSERT INTO users_to_recipes (...) VALUES (...) ON CONFLICT DO NOTHING
+-- SQLite
+INSERT OR IGNORE INTO users_to_recipes (...) VALUES (...)
+```
+
+对于已存在的 `(user_id, recipe_id)` 行（可能由第一步收藏迁移插入），第二步还会通过 `UPDATE` 语句覆写 rating 值以确保最终一致。
 
 ### 5.3 Household 引入（组织层级兼容）
 
 这是最大规模的架构变更，涉及两个迁移：
 
 **阶段1 — `mealie/alembic/versions/2024-07-12-16.16.29_feecc8ffb956_add_households.py`**
-- 为每个 Group 创建一个默认 Household（名称来自 settings.DEFAULT_HOUSEHOLD）
-- 将 group_preferences 的配置复制为 household_preferences（`private_group` → `private_household`）
-- 给 cookbooks、users、webhooks、invite_tokens 等 7 张表添加 `household_id` 列并回填
+- 为每个 Group 创建一个默认 Household（名称来自 settings.DEFAULT_HOUSEHOLD），使用纯 `INSERT INTO households`（无冲突处理）
+- 将 group_preferences 的配置复制为 household_preferences（`private_group` → `private_household`），使用纯 `INSERT INTO household_preferences`
+- 给 cookbooks、users、webhooks、invite_tokens 等 7 张表添加 `household_id` 列，用纯 `UPDATE ... SET household_id = :household_id WHERE group_id = :group_id` 批量回填
 
 **阶段2 — `mealie/alembic/versions/2024-11-20-17.30.41_b9e516e2d3b3_add_household_to_recipe_last_made_.py`**
-- 新建 `households_to_recipes` 关联表，将 `recipes.last_made` 迁移为每个 household 独立的 last_made 记录
-- 新建 `households_to_ingredient_foods`、`households_to_tools`，迁移 on_hand 标记
+- 新建 `households_to_recipes` 关联表，将 `recipes.last_made` 迁移为每个 household 独立的 last_made 记录，使用 ORM `session.add(HouseholdToRecipe(...))` 逐行插入
+- 新建 `households_to_ingredient_foods`、`households_to_tools`，迁移 on_hand 标记，使用纯 `INSERT INTO` 语句
 - 同样采用"每个 group 的所有 household 各复制一份"策略
+
+两个阶段均 **未使用任何冲突检测/忽略机制**，完全依赖 Alembic revision 单次执行保证数据正确性。
 
 ### 5.4 类型变更兼容（Quantity 整数→浮点）
 
@@ -216,11 +229,63 @@ if is_postgres():
 
 ---
 
-## 六、失败恢复机制与各层边界
+## 六、幂等性与 Alembic revision 单次执行边界
+
+### 6.1 幂等性实际使用情况核对
+
+**结论：整个代码库中只有「评分与收藏迁移」这一个数据迁移脚本使用了 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`。** 其余所有数据迁移都依赖 Alembic 的 revision 追踪机制来避免重复执行。
+
+逐脚本核对结果：
+
+| 迁移脚本 | 数据写入方式 | 是否使用 ON CONFLICT / INSERT OR IGNORE |
+|---------|------------|:---:|
+| `5ab195a474eb`（规范化搜索字段） | `UPDATE ... SET ... WHERE id = :id` + `session.commit()` | 否 |
+| `d7c6efd2de42`（评分与收藏迁移） | `INSERT ... ON CONFLICT DO NOTHING` / `INSERT OR IGNORE` + `UPDATE` | **是**（全库唯一） |
+| `feecc8ffb956`（引入 households） | `INSERT INTO households` / `INSERT INTO household_preferences` / `UPDATE ... SET household_id` | 否 |
+| `b9e516e2d3b3`（last_made/on_hand 迁移） | `session.add(...)`（ORM INSERT） / 纯 `INSERT INTO` 关联表 | 否 |
+| `7cf3054cbbcc`（截断规范化字段） | ORM `setattr(record, field.key, field_value[:255])` + `session.commit()` | 否 |
+| `c7427796f7b6`（更激进规范化） | `UPDATE ... SET col = :col WHERE id = :id` + `session.commit()` | 否 |
+| `dded3119c1fe`（唯一约束前去重） | ORM 属性修改 + `DELETE FROM ... WHERE CTID > t2.CTID` + 多次 `session.commit()` | 否 |
+| `263dd6707191`（quantity 类型转换） | 仅 DDL，无数据迁移 | — |
+
+### 6.2 Alembic revision 单次执行的边界
+
+绝大多数数据迁移脚本的正确性依赖以下前提：**每个 Alembic revision 在一个数据库实例上只会被执行一次。**
+
+这个前提由 Alembic 内置机制保证：
+
+1. `alembic_version` 表记录所有已成功执行的 revision 编号
+2. `command.upgrade(cfg, "head")` 只会执行当前未出现在 `alembic_version` 中的 revision
+3. 迁移脚本在 `context.begin_transaction()` 包裹的数据库事务中执行，失败回滚后该 revision 不会写入 `alembic_version`，下次启动会重新尝试
+
+**revision 单次执行的边界条件（即该前提失效的场景）：**
+
+- **手动修改 `alembic_version` 表**：删除已执行 revision 的记录后再次启动应用，对应迁移会被重新执行
+- **执行 `alembic downgrade` 后再 upgrade**：downgrade 会从 `alembic_version` 移除记录，再次 upgrade 时重新执行
+- **SQLite `batch_alter_table` 内部表重建失败**：表重建阶段如果进程崩溃，可能留下临时表但 revision 未记录，属于数据库损坏级别的故障
+
+**边界失效时的后果：**
+- 纯 DDL 操作（`op.create_table` / `op.add_column` 等）：Alembic 内部会判断对象是否存在，一般不会出错
+- 纯 `UPDATE` 操作（规范化字段重算）：结果正确但产生重复计算开销
+- 纯 `INSERT` 操作（household 创建、last_made 关联表插入等）：**会产生重复数据**。例如 `feecc8ffb956` 的 `create_household()` 重复执行会给同一个 group 创建多个同名 household；`b9e516e2d3b3` 重复执行会插入重复的 `HouseholdToRecipe` 行（若没有唯一约束则数据冗余，若有唯一约束则抛出 IntegrityError 导致迁移失败）
+- 评分与收藏迁移（`d7c6efd2de42`）：由于使用了 `ON CONFLICT DO NOTHING`，即使重复执行也不会产生重复数据
+
+### 6.3 普通 UPDATE / INSERT / session.commit 的事务边界
+
+迁移脚本内的数据迁移代码虽然使用 SQLAlchemy Session，但与 Alembic 外层事务的关系如下：
+
+- **Alembic 外层事务**：由 `context.begin_transaction()` 开启，包裹整个 revision 的 DDL 和数据迁移代码。revision 成功则 commit，任何异常则 rollback。
+- **迁移内 Session**：通过 `orm.Session(bind=op.get_bind())` 创建，共享同一个数据库连接，因此参与 Alembic 的外层事务。
+- **迁移内 `session.commit()`**：实际上是对共享连接提交内层事务点（PostgreSQL 下相当于 SAVEPOINT 行为），提交的内容在 Alembic 外层事务 rollback 时依然会被回滚。但如果迁移脚本在异常捕获后 `raise`，外层事务整体回滚；如果不 `raise`（如 `7cf3054cbbcc` 的 `truncate_normalized_fields()`），已 commit 的子任务不会被外层回滚。
+- **fixes 层的 Session**：使用独立的 `session_context()` 创建，**不参与 Alembic 事务**。fixes 在 `command.upgrade()` 成功返回后才执行，一旦失败被 `safe_try` 捕获，已执行的数据库变更不会被自动回滚。
+
+---
+
+## 七、失败恢复机制与各层边界
 
 > **重要区分**：Alembic schema 迁移失败和连接失败是**致命的**（将导致应用启动中断）；只有 fixes 层的数据修复脚本失败是非致命的（仅记录日志，应用继续启动）。
 
-### 6.1 数据库连接重试——边界：10 次后强制终止
+### 7.1 数据库连接重试——边界：10 次后强制终止
 
 位置：`mealie/db/init_db.py:86-102`
 
@@ -236,11 +301,11 @@ while True:
         raise ConnectionError("Database connection failed - exiting application.")
 ```
 
-- **覆盖范围**：仅数据库连接建立阶段
+- **覆盖范围**：仅数据库连接建立阶段，尚未触及任何迁移逻辑
 - **行为**：最多重试 10 次，每次间隔 1 秒
-- **失败后果**：抛出 `ConnectionError`，沿调用栈向上传播到 FastAPI lifespan，**应用启动中断（致命）**
+- **失败后果**：抛出 `ConnectionError`，沿调用栈向上传播到 FastAPI lifespan，**应用启动中断（致命）**，无数据被修改
 
-### 6.2 Alembic 迁移事务层——边界：command.upgrade() 无外层捕获，失败即中断
+### 7.2 Alembic 迁移事务层——边界：command.upgrade() 无外层捕获，失败即中断
 
 位置：`mealie/alembic/env.py:102-103`
 
@@ -262,9 +327,9 @@ else:
 - **事务粒度**：单个迁移脚本（revision）内的所有操作在一个数据库事务中执行，失败自动回滚该脚本的全部变更
 - **失败后果**：`command.upgrade()` 抛出的任何异常都**没有外层 try/except 捕获**，直接传播到 lifespan，**应用启动中断（致命）**
 
-这意味着：**任何一个 Alembic 迁移脚本失败，整个应用都无法启动。** 管理员必须修复数据库或迁移脚本后重新启动。
+这意味着：**任何一个 Alembic 迁移脚本失败，整个应用都无法启动。** 管理员必须修复数据库或迁移脚本后重新启动。数据库会停留在最后一个成功的 revision 版本。
 
-### 6.3 迁移脚本内部的局部 try/except——边界：不同迁移策略不同
+### 7.3 迁移脚本内部的局部 try/except——边界：不同迁移策略不同
 
 迁移脚本内部的数据迁移子任务有时会自带 try/except，但行为分为两类：
 
@@ -283,8 +348,8 @@ for migration_func in [...]:
         raise  # 显式向上抛出，终止整个迁移
 ```
 
-- 行为：回滚当前子任务的 session，记录错误日志，然后 `raise` 重新抛出
-- 失败后果：被外层 `context.run_migrations()` 捕获，触发事务回滚，最终导致**应用启动中断（致命）**
+- 行为：回滚当前子任务的 session 保存点，记录错误日志，然后 `raise` 重新抛出
+- 失败后果：被外层 `context.run_migrations()` 捕获，触发事务整体回滚，最终导致**应用启动中断（致命）**
 
 **类型 B：捕获后不 raise（局部失败，不影响同脚本其他子任务）**
 
@@ -300,10 +365,10 @@ for model in models:
         session.rollback()  # 不 raise，继续处理下一个模型
 ```
 
-- 行为：单个模型失败仅回滚该模型的更新，记录日志后继续处理后续模型
+- 行为：单个模型失败仅回滚该模型的 session 保存点，记录日志后继续处理后续模型
 - 失败后果：该迁移脚本本身标记为成功执行（Alembic revision 前进），但部分数据可能未被正确规范化；应用可正常启动，属于**静默数据不完整**风险
 
-### 6.4 Fixes 层的 safe_try——边界：仅记录日志，绝不阻塞启动
+### 7.4 Fixes 层的 safe_try——边界：仅记录日志，绝不阻塞启动
 
 位置：`mealie/db/init_db.py:69-73`
 
@@ -328,10 +393,10 @@ if run_fixes:
   1. `mealie/db/fixes/fix_migration_data.py`（悬垂引用清理、规范化字段补填、标签设置修复、group slug 生成、单位/食品规范化）
   2. `mealie/db/fixes/fix_slug_foods.py`（食品种子数据名称同步）
   3. `mealie/db/fixes/fix_group_with_no_name.py`（空名称 group 赋默认值）
-- **行为**：捕获所有 Exception，写完整堆栈日志，不重新抛出
-- **失败后果**：**非致命，不阻塞应用启动**。但失败意味着某些数据质量问题未被修复，后续使用中可能因脏数据引发业务逻辑错误
+- **行为**：捕获所有 Exception，写完整堆栈日志，不重新抛出。fixes 使用独立 Session，不参与 Alembic 事务。
+- **失败后果**：**非致命，不阻塞应用启动**。但失败意味着某些数据质量问题未被修复，后续使用中可能因脏数据引发业务逻辑错误。已部分执行的变更不会被自动回滚。
 
-### 6.5 IntegrityError 重试——边界：fix_group_with_no_name 内的局部重试
+### 7.5 IntegrityError 重试——边界：fix_group_with_no_name 内的局部重试
 
 位置：`mealie/db/fixes/fix_group_with_no_name.py:22-48`
 
@@ -358,24 +423,24 @@ for i, group in enumerate(groups):
 - **行为**：最多重试 3 次（通过递增后缀数字规避冲突）
 - **失败后果**：超过重试次数后 `raise Exception`——但由于整个 `fix_group_with_no_name` 被 `safe_try` 包裹，异常最终被 safe_try 捕获，仅记日志不中断启动
 
-### 6.6 各层致命性总览
+### 7.6 各层致命性总览
 
 | 层级 | 机制 | 失败是否中断启动 | 数据一致性影响 |
 |------|------|:---:|---|
 | 数据库连接 | 10 次重试 → `ConnectionError` | **是** | 未建立连接，无数据操作 |
-| Alembic 迁移事务 | `command.upgrade()` 无外层捕获，迁移脚本事 务回滚 | **是** | 当前 revision 的 DDL 回滚，已成功的 revision 不会回滚（数据库停留在中间版本） |
-| 迁移脚本内（类型 A） | try/except + `raise` 重抛 | **是** | 子任务 session 回滚，整脚本事 务回滚 |
+| Alembic 迁移事务 | `command.upgrade()` 无外层捕获，迁移脚本事务回滚 | **是** | 当前 revision 的 DDL 回滚，已成功的 revision 不会回滚（数据库停留在中间版本） |
+| 迁移脚本内（类型 A） | try/except + `raise` 重抛 | **是** | 子任务 session 回滚，整脚本事务回滚 |
 | 迁移脚本内（类型 B） | try/except + 不 raise | 否 | 局部数据可能不完整（如某模型规范化未执行） |
 | Fixes 层 | `safe_try` 吞掉所有异常 | 否 | 数据质量问题遗留（悬垂引用、缺失规范化、冲突 slug 等） |
 | IntegrityError 重试 | 3 次后 `raise`，但外层有 `safe_try` | 否 | 个别空名称 group 未修复 |
 
 ---
 
-## 七、索引变更策略
+## 八、索引变更策略
 
 索引是影响查询性能和迁移时间的关键因素。Mealie 历史上发生过 3 类索引变更：
 
-### 7.1 大规模补建索引
+### 8.1 大规模补建索引
 
 `mealie/alembic/versions/2023-02-07-20.57.21_ff5f73b01a7a_add_missing_foreign_key_and_order_.py` 一次性补建了 **90+ 个索引**，涵盖：
 - 所有外键列（`*_id`）
@@ -383,7 +448,7 @@ for i, group in enumerate(groups):
 - 排序字段（`position`）
 - 频繁筛选列（`slug`、`name`、`token`、`rating` 等）
 
-### 7.2 唯一约束 ↔ 普通索引的转换
+### 8.2 唯一约束 ↔ 普通索引的转换
 
 | 迁移 | 操作 |
 |------|------|
@@ -391,7 +456,7 @@ for i, group in enumerate(groups):
 | `mealie/alembic/versions/2023-10-04-14.29.26_dded3119c1fe_added_unique_constraints.py` | 11 张 M2M 表 + ingredient_foods/units/labels 全部加上组合唯一约束（先去重再加约束） |
 | `mealie/alembic/versions/2024-07-12-16.16.29_feecc8ffb956_add_households.py` | cookbooks 增加 `(slug, group_id)` 唯一约束，迁移前先执行 `dedupe_cookbook_slugs()` 去重 |
 
-### 7.3 搜索索引演进
+### 8.3 搜索索引演进
 
 规范化字段引入时，**先建索引再填数据** 的反向操作：
 
@@ -410,11 +475,11 @@ PostgreSQL 还需要在 `mealie/db/init_db.py:118-119` 创建 `pg_trgm` 扩展�
 
 ---
 
-## 八、外键清理与悬垂引用修复
+## 九、外键清理与悬垂引用修复
 
 `mealie/db/fixes/fix_migration_data.py` 中的 `fix_dangling_refs()` 是外键清理的核心。
 
-### 8.1 两类引用的不同处理策略
+### 9.1 两类引用的不同处理策略
 
 ```python
 REASSIGN_REF_TABLES = ["group_meal_plans", "recipes", "shopping_lists"]
@@ -424,7 +489,7 @@ DELETE_REF_TABLES = ["long_live_tokens", "password_reset_tokens", "recipe_commen
 - **REASSIGN（重新分配）**：业务上重要的数据（如 recipe 本身），找到同 group 的 admin 用户（或第一个用户）作为兜底所有者，通过 UPDATE ... WHERE user_id NOT IN (...) 重新分配。
 - **DELETE（直接删除）**：附属数据（token、评论、时间线事件），user_id 无效时直接 DELETE。
 
-### 8.2 唯一约束前的外键重定向
+### 9.2 唯一约束前的外键重定向
 
 `mealie/alembic/versions/2023-10-04-14.29.26_dded3119c1fe_added_unique_constraints.py` 在为 foods/units/labels 加唯一约束前，必须先合并重复项：
 
@@ -447,7 +512,7 @@ WHERE EXISTS (
 )
 ```
 
-### 8.3 购物清单标签设置修复
+### 9.3 购物清单标签设置修复
 
 `mealie/db/fixes/fix_migration_data.py:103-133` 的 `fix_shopping_list_label_settings()`：
 - 删除已不存在的 label 对应的 label_setting
@@ -455,7 +520,7 @@ WHERE EXISTS (
 
 ---
 
-## 九、整体架构关系图
+## 十、整体架构关系图
 
 ```
                     ┌─────────────────────┐
@@ -504,13 +569,14 @@ WHERE EXISTS (
 
 ---
 
-## 十、关键设计总结
+## 十一、关键设计总结
 
 1. **迁移 ≠ 修复**：Alembic 负责 schema 演进，`db/fixes/` 负责数据质量修复。两者分离，修复可独立重跑。
 2. **先建结构再填数据最后卸磨杀驴**：新 NOT NULL 列先给 `server_default`，数据填充后移除 server_default。
-3. **幂等优先**：所有数据迁移使用 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`，可重复执行。
+3. **幂等性并非普遍原则**：**只有评分与收藏迁移（`d7c6efd2de42`）** 这一个脚本使用了 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`；其余所有数据迁移均依赖 Alembic revision 的单次执行特性（`alembic_version` 表追踪），使用普通 `UPDATE` / `INSERT` / `session.commit()`。若 revision 单次执行前提被破坏（手动改表、downgrade 再 upgrade），纯 INSERT 类迁移会产生重复数据。
 4. **中间模型自包含**：迁移脚本内部定义临时 ORM 模型，不依赖外部模型文件，避免未来模型变更破坏历史迁移。
 5. **跨方言兼容**：GUID、数量类型、唯一约束都按 dialect 分支处理；SQLite 用 batch_alter_table 模拟 DDL。
 6. **规范化字段是搜索的真相来源**：算法三次演进，每次全量重算，fix 层兜底补填。
 7. **去重是加唯一约束的前置动作**：M2M 表靠数据库内部行号，实体表靠外键重定向+删除。
-8. **失败的致命性分层明确**：连接失败和 Alembic schema 迁移失败是**致命的**（应用无法启动，数据库可能停留在中间 revision 版本）；迁移脚本内部个别数据子任务失败可能静默遗留数据不完整；fixes 层数据修复失败**非致命**但会遗留脏数据风险，需人工排查日志处理。
+8. **事务边界分层清晰**：Alembic 外层事务包裹整个 revision，迁移内 Session 共享连接但可独立 commit/rollback 子任务；fixes 层使用独立 Session，不参与 Alembic 事务，失败由 `safe_try` 吞异常。
+9. **失败的致命性分层明确**：连接失败和 Alembic schema 迁移失败是**致命的**（应用无法启动，数据库可能停留在中间 revision 版本）；迁移脚本内部个别数据子任务失败（不 raise 类型）可能静默遗留数据不完整；fixes 层数据修复失败**非致命**但会遗留脏数据风险，需人工排查日志处理。
