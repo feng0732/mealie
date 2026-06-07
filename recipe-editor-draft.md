@@ -535,36 +535,161 @@ Tab A signOut()
 
 前述 6.8 节的链路分析依赖几个容易被忽略的底层前提。本节逐一澄清。
 
-#### 6.9.1 Nuxt useCookie 对跨 Tab Cookie 变更的感知边界
+#### 6.9.1 Nuxt Cookie 同步机制与跨 Tab 感知边界
 
-`useCookie(name)` 是 Nuxt 提供的 composable，返回一个 Vue `Ref`。它的读取行为分为两种语义：
+##### 项目配置确认
+
+从 `frontend/nuxt.config.ts` 提取关键配置：
+
+| 配置项 | 值 | 含义 |
+|-------|---|------|
+| `ssr` | `false` | 纯 SPA 模式，没有服务端渲染，所有代码在浏览器执行 |
+| `future.compatibilityVersion` | `4` | Nuxt 4 兼容模式 |
+| `compatibilityDate` | `"2026-04-08"` | 最新兼容日期 |
+| `experimental.cookieStore` | **未配置**（默认 `false`） | 不启用浏览器 Cookie Store API |
+| `refreshCookie` | **未使用**（全局搜索无结果） | — |
+| `cookieStore` / `CookieStore` / `cookie.onchange` | **未使用**（全局搜索无结果） | — |
+
+Nuxt 版本：`nuxt@^4.4.2`（`frontend/package.json`）。
+
+##### `useCookie` 的两种底层实现
+
+Nuxt 的 `useCookie()` 有两套底层实现，由 `experimental.cookieStore` 配置开关控制：
+
+---
+
+**模式 A：document.cookie（本项目默认，未启用 cookieStore）**
+
+所有读写都走浏览器传统的同步 `document.cookie` API：
 
 ```typescript
-// use-auth-backend.ts
+// 读取：每次 .value 访问都会重新解析整串 document.cookie
+const raw = document.cookie;  // "foo=bar; mealie.access_token=eyJhbGc...; other=1"
+// 按分号分割，按 name 匹配，解码值
+
+// 写入：通过赋值 document.cookie 追加/覆盖单条 cookie
+document.cookie = "mealie.access_token=; max-age=0; path=/; secure";
+```
+
+特性：
+- **同步 API**：读写都阻塞 JS 线程
+- **无事件通知**：`document.cookie` 没有任何变更事件（早期 `cookiechange` 草案已废弃）
+- **整串解析**：每次读取都要解析完整的 cookie 字符串，性能随 cookie 数量增多而下降
+- **受 HttpOnly 限制**：HttpOnly 的 cookie 无法通过 `document.cookie` 读取
+
+本项目中 `tokenCookie` 的配置（`frontend/app/composables/use-auth-backend.ts`）：
+```typescript
 const tokenCookie = useCookie(tokenName, {
-  maxAge: $appInfo.tokenTime * 60 * 60,
-  secure: $appInfo.production && window?.location?.protocol === "https:",
+  maxAge: $appInfo.tokenTime * 60 * 60,     // 有效期 = TOKEN_TIME 小时
+  secure: $appInfo.production                 // 生产环境 HTTPS 时才标记 Secure
+            && window?.location?.protocol === "https:",
+  // 未设置 httpOnly → 默认为 false，JS 可读可写
+  // 未设置 sameSite → 使用 Nuxt 默认值
+  // 未设置 path → 默认为 "/"
 });
 ```
 
-**读取语义 A：初始化时的一次性读取**
-- 组件/composable 首次调用 `useCookie()` 时，从 `document.cookie` 解析一次值，作为 ref 的内部初始值
-- 此时建立的是 ref 内部状态和 cookie 字符串的一次性快照，不建立监听
+**重要**：项目未配置 `httpOnly: true`，因此 `mealie.access_token` 是一个**非 HttpOnly cookie**，JS 可以自由读写。这是 axios 拦截器能把 token 从 cookie 取出来放到 Authorization header 的前提。
 
-**读取语义 B：每次 `.value` 访问的惰性重读**
-- Nuxt 对 `useCookie()` 返回的 ref 做了自定义 getter，每次 `ref.value` 访问都会**重新解析 `document.cookie` 字符串**，不是从 ref 内部缓存取值
-- 这一行为对调用方透明，与普通 ref 语义不同
+---
 
-**写入语义：`.value = xxx` 触发 `document.cookie = "name=xxx; ..."`**
-- 浏览器的 `document.cookie` 写入是同步操作，写入后同渲染进程的所有代码立即能读到新值
-- 由于同源下所有 Tab 共享同一个浏览器级 Cookie Jar，Tab A 写入后，Tab B 在**下一次读取 `document.cookie` 时**能看到新值
+**模式 B：Cookie Store API（本项目未启用）**
 
-**跨 Tab 感知的关键限制**：
-- 浏览器**没有 `cookiechange` 事件**（早期草案已废弃），Cookie 的变更不会主动推送给其他 Tab
-- Tab B 的 `tokenCookie.value` 只有在被代码主动访问时（如 axios 请求拦截器每次发请求时），才会重新解析 `document.cookie` 并看到 Tab A 删除后的结果
-- `authStatus` 和 `authUser` 是模块级 `ref`，与 cookie 没有任何响应式绑定，它们的变更只能通过 `signOut()` / `getSession()` / `handleAuthError()` / `refresh()` 等显式函数调用来触发，不会随 Cookie 变化自动更新
+如果配置了 `experimental.cookieStore: true`，Nuxt 会优先使用浏览器现代的 [Cookie Store API](https://developer.mozilla.org/en-US/docs/Web/API/Cookie_Store_API)：
 
-**项目中无 refreshCookie / cookieStore / BroadcastChannel 等同步机制**：全局搜索确认没有使用上述 API。各 Tab 对认证状态的感知完全依赖「下次发请求时重新读 cookie → 后端返回 401 → 触发对应分支」这条隐式链路。
+```javascript
+// 读取：异步 Promise API
+const cookie = await cookieStore.get("mealie.access_token");
+
+// 写入：异步 Promise API
+await cookieStore.set({
+  name: "mealie.access_token",
+  value: "...",
+  expires: ...,
+});
+
+// 监听变更（包括跨 Tab 的变更！）
+cookieStore.addEventListener("change", (event) => {
+  console.log("Cookie changed:", event.changed, event.deleted);
+});
+```
+
+特性对比：
+
+| 特性 | document.cookie（项目实际使用） | Cookie Store API（项目未启用） |
+|-----|--------------------------------|-------------------------------|
+| API 风格 | 同步 | 异步 Promise |
+| 跨 Tab 变更通知 | ❌ 无任何机制 | ✅ `cookieStore.onchange` 事件 |
+| 性能 | 每次读整串解析 | 浏览器内部优化 |
+| 浏览器支持 | 100% | Chrome 87+ / Edge / Safari 17+ / **Firefox 不支持** |
+| HttpOnly 可读 | ❌ | ❌（安全限制相同） |
+
+**关键结论**：即使本项目启用了 `experimental.cookieStore`，代码中也**没有注册 `cookieStore.onchange` 事件监听器**，所以仍然不会自动感知跨 Tab 的 cookie 清除。Firefox 不支持也是一个实际障碍。
+
+---
+
+##### `refreshCookie` 的作用
+
+`refreshCookie()` 是 Nuxt 提供的一个 composable，主要用于 **SSR/ISR 场景**：
+- 在 SSR 模式下，服务端渲染时读取的 cookie 来自 HTTP 请求头
+- 客户端 hydration 后，cookie 可能被 JS 修改过
+- `refreshCookie(name)` 强制让客户端的 `useCookie` ref 重新从浏览器读取值，同步服务端和客户端的状态
+
+但本项目 `ssr: false`（纯 SPA），没有服务端渲染阶段，因此：
+- `refreshCookie()` 对本项目**无实际意义**
+- 项目代码中确实没有任何 `refreshCookie` 调用
+
+##### Tab B 感知 cookie 清除的精确条件
+
+Tab B **绝对不会自动感知** Tab A 的登出操作。感知仅在 Tab B 代码主动读取 cookie 时发生：
+
+| Tab B 中的代码位置 | 何时执行 | 是否触发重新读取 `document.cookie` |
+|------------------|---------|----------------------------------|
+| axios 请求拦截器 | 每次发起 API 请求前 | ✅ `useCookie(tokenName).value` 每次都会重新解析 |
+| `useAuthBackend().token` computed 被访问 | 组件模板渲染或 JS 显式访问 | ✅ `computed(() => tokenCookie.value)` 每次 getter 都会重新解析 |
+| `getSession()` 函数 | 应用初始化、登录后、refresh 后 | ✅ 开头有 `if (!tokenCookie.value)` 检查 |
+| `refresh()` 函数 | 显式调用刷新 token | ✅ 开头有 `if (!tokenCookie.value)` 检查 |
+| `authStatus.value` 被访问 | 任何时刻 | ❌ 这是模块级 ref，与 cookie 无绑定，只在 `signOut/getSession/handleAuthError/refresh` 中显式更新 |
+| `authUser.value` 被访问 | 任何时刻 | ❌ 同上，无响应式绑定 |
+
+**实际体感**：Tab B 用户在登出后如果不触发任何 API 请求，界面上的用户名、头像、登录状态看起来一切正常——因为 `authStatus` 和 `authUser` 还停留在旧值。直到用户点击保存等操作触发 API 请求，才会通过 401 间接感知到登出。
+
+##### Tab B 仍然可能携带旧 JWT 的场景（基于代码分析）
+
+在 cookie 已从浏览器 Cookie Jar 清除的前提下，代码逻辑上 Tab B **不会**再携带有效的 JWT。因为：
+1. axios 请求拦截器每次都会**重新解析** `document.cookie`，不使用缓存
+2. `useCookie()` ref 的 `.value` getter 每次都会重新解析，不使用缓存
+3. 项目代码中没有任何地方把 JWT 单独缓存到 localStorage/sessionStorage/内存变量里再读出来
+
+但在**时间竞态**场景下，Tab B 仍然可能携带并提交有效的旧 JWT：
+
+**场景 1：请求发出竞态（最常见）**
+
+Tab B 的保存请求在 Tab A 的 `setToken(null)` 执行之前就已经携带 Authorization header 进入网络层：
+
+```
+时间线：
+T1: Tab B 用户点击保存 → axios 拦截器读 cookie → 读到有效 JWT → 设置 Authorization: Bearer <jwt> → 请求进入浏览器网络栈
+T2: Tab A 用户点击登出 → setToken(null) → document.cookie 清除 → Cookie Jar 更新
+T3: Tab B 的请求到达后端 → jwt.decode() 验证通过 → Recipe 保存成功
+```
+
+此时 cookie 虽然已被清除，但请求已经带着有效的 JWT header 发出，后端不吊销 JWT，保存成功。
+
+**场景 2：refresh() 竞态（少见，但真实存在）**
+
+Tab B 恰好在 Tab A 登出的同时触发了 token 刷新流程：
+
+```
+时间线：
+T1: Tab B 某逻辑调用 auth.refresh() → 先检查 tokenCookie.value → 读到有效 JWT → 发起 GET /api/auth/refresh
+T2: Tab A 执行 signOut() → setToken(null) → cookie 被清除 → 跳转 /login
+T3: 后端收到 Tab B 的 /api/auth/refresh → JWT 仍有效 → 返回新的 access_token
+T4: Tab B 收到 refresh 响应 → setToken(new_access_token) → cookie 被**重新写回**！
+T5: Tab B 用户点击保存 → 请求携带新的 JWT → 保存成功
+```
+
+这种场景下，Tab A 的登出操作实际上被 Tab B 的 refresh 「撤销」了——cookie 虽然被删过一次，但 refresh 流程又把新 token 写了回去。
 
 #### 6.9.2 后端 logout 不吊销短期 JWT（JWT 无状态）
 
@@ -756,3 +881,5 @@ Tab A 的 logout 请求和 Tab B 的保存请求同时在网络上传输，存�
 | 后端 auth 路由（token/logout/refresh） | `mealie/routes/auth/auth.py` | 64-162 |
 | JWT 创建（create_access_token） | `mealie/core/security/security.py` | 31-40 |
 | 后端认证依赖（get_current_user + 双来源 token 读取） | `mealie/core/dependencies/dependencies.py` | 88-123 |
+| Nuxt 主配置（ssr/experimental/cookie 相关） | `frontend/nuxt.config.ts` | 1-273 |
+| 前端依赖版本（Nuxt 4.4.2 等） | `frontend/package.json` | 1-74 |
