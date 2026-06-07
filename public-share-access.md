@@ -493,6 +493,30 @@ class PaginationBase[DataT: BaseModel](BaseModel):
 - **分页对象**：`@router.get("", response_model=PaginationBase[RecipeSummary])`
 - **裸 list**：`@router.get("", response_model=list[RecipeShareTokenSummary])`（如 [routes/shared/__init__.py#L26](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/shared/__init__.py#L26)）
 
+### 10.2.2 两种不同的无缓存头场景归因
+
+重要区分：接口无缓存头可能出于两个完全不同的原因，不可混淆：
+
+| 场景 | Router 配置 | 响应类型 | 无缓存头的根因 |
+|-----|------------|---------|--------------|
+| **场景 A**：使用了 `MealieCrudRoute` 的用户 CRUD 分页端点 | `route_class=MealieCrudRoute` | 分页 PaginationBase dict | 代码已执行了 json.loads + isinstance 检查，但 PaginationBase 顶层**无 `updatedAt` 键**，不满足条件 2 |
+| **场景 B**：Explore/Share Token 等公开/匿名端点 | 默认 `APIRouter`（无 MealieCrudRoute） | 任意（单条 dict / 分页 dict / 裸 list） | **根本没有 MealieCrudRoute 自定义路由处理逻辑**，`custom_route_handler` 从未被调用，无论响应结构如何都不会设置缓存头 |
+
+**场景 A（分页对象顶层无 updatedAt）仅适用于以下 7 个自定义路由**（均显式配置了 `route_class=MealieCrudRoute`）：
+- `/api/units`（用户 ingredient units CRUD）
+- `/api/foods`（用户 ingredient foods CRUD）
+- `/api/recipes`（用户 Recipe CRUD）
+- `/api/recipes/timeline/events`（用户时间线事件 CRUD）
+- `/api/households/events/notifications`（用户通知 CRUD）
+- `/api/households/cookbooks`（用户 Cookbook CRUD）
+- `/api/groups/labels`（用户 Group labels CRUD）
+
+**Explore 所有公开接口（场景 B）不属于场景 A**——它们使用默认 `APIRouter`，完全不涉及 MealieCrudRoute，因此无缓存头与 PaginationBase 顶层字段无关。Explore Router 代码证据：
+- [routes/explore/__init__.py#L11](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/explore/__init__.py#L11)：`router = APIRouter(prefix="/explore/groups/{group_slug}")`
+- [routes/explore/controller_public_recipes.py#L17](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/explore/controller_public_recipes.py#L17)：`router = APIRouter(prefix="/recipes")`
+- [routes/explore/controller_public_organizers.py#L13-L15](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/explore/controller_public_organizers.py#L13-L15)：全部使用默认 `APIRouter`
+- Explore Controller 基类为 `BasePublicGroupExploreController` 或 `BasePublicHouseholdExploreController`，无自定义 route_class
+
 ### 10.3 各路由缓存头现状全景
 
 显式使用 `route_class=MealieCrudRoute` 的路由（grep 结果）：
@@ -507,16 +531,16 @@ class PaginationBase[DataT: BaseModel](BaseModel):
 | `/api/households/cookbooks` | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/households/controller_cookbooks.py#L24) | MealieCrudRoute | 单条 dict + 分页 PaginationBase | 单条 GET ✅，分页列表 ❌ |
 | `/api/groups/labels` | [controller_labels.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/groups/controller_labels.py#L21) | MealieCrudRoute | 单条 dict + 分页 PaginationBase | 单条 GET ✅，分页列表 ❌ |
 
-**公开/匿名路由均未使用 MealieCrudRoute**，因此即便响应是单条 dict（如 Share Token 返回的 Recipe），也不会触发 `Cache-Control` 头设置：
+**公开/匿名路由均未使用 MealieCrudRoute**，因此 `custom_route_handler` 从未被调用，无论响应结构如何（单条 dict、分页 dict 或裸 list）都不会设置 `Cache-Control` 头：
 
-| 公开/匿名路由 | Router 类型 | route_class | 响应类型 | Cache-Control |
-|-------------|------------|-------------|---------|---------------|
-| `GET /api/recipes/shared/{token_id}` | 默认 `APIRouter` | 默认 | 单条 Recipe dict | ❌ 无（虽为 dict 且有 updatedAt，但无 MealieCrudRoute 处理） |
-| `GET /api/recipes/shared/{token_id}/zip` | 默认 `APIRouter` | 默认 | StreamingResponse | ❌ 无（非 JSON 响应，不执行 json.loads） |
-| `GET /api/explore/groups/{group_slug}/recipes` | 默认 `APIRouter` | 默认 | PaginationBase dict | ❌ 无（分页顶层无 updatedAt） |
-| `GET /api/explore/groups/{group_slug}/recipes/{slug}` | 默认 `APIRouter` | 默认 | 单条 Recipe dict | ❌ 无（虽为 dict 且有 updatedAt，但无 MealieCrudRoute 处理） |
-| `GET /api/shared/recipes`（用户管理 Token 列表） | `UserAPIRouter` | 默认 | 裸 `list[RecipeShareTokenSummary]` | ❌ 无（顶层 list 不触发） |
-| `GET /api/media/recipes/...`、`/api/media/users/...` | 默认 `APIRouter` | 默认 | FileResponse | ❌ 无（非 JSON 响应） |
+| 公开/匿名路由 | Router 类型 | route_class | 响应类型 | Cache-Control 归因（场景 B：无 MealieCrudRoute） |
+|-------------|------------|-------------|---------|-----------------------------------------------|
+| `GET /api/recipes/shared/{token_id}` | 默认 `APIRouter` | 默认 | 单条 Recipe dict | ❌ 无（默认 APIRouter，无 MealieCrudRoute；虽为单条 dict 含 updatedAt 但 custom_route_handler 从未执行） |
+| `GET /api/recipes/shared/{token_id}/zip` | 默认 `APIRouter` | 默认 | StreamingResponse | ❌ 无（默认 APIRouter，无 MealieCrudRoute；且非 JSON 响应） |
+| `GET /api/explore/groups/{group_slug}/recipes` | 默认 `APIRouter` | 默认 | PaginationBase dict | ❌ 无（默认 APIRouter，无 MealieCrudRoute；与 PaginationBase 顶层字段无关） |
+| `GET /api/explore/groups/{group_slug}/recipes/{slug}` | 默认 `APIRouter` | 默认 | 单条 Recipe dict | ❌ 无（默认 APIRouter，无 MealieCrudRoute；虽为单条 dict 含 updatedAt 但 custom_route_handler 从未执行） |
+| `GET /api/shared/recipes`（用户管理 Token 列表） | `UserAPIRouter` | 默认（无 MealieCrudRoute） | 裸 `list[RecipeShareTokenSummary]` | ❌ 无（UserAPIRouter 未指定 route_class；与顶层 list 结构无关，因为处理逻辑从未执行） |
+| `GET /api/media/recipes/...`、`/api/media/users/...` | 默认 `APIRouter` | 默认 | FileResponse | ❌ 无（默认 APIRouter，无 MealieCrudRoute；且非 JSON 响应） |
 
 ### 10.4 动态分享页面（SPA Meta 注入）的缓存头
 
@@ -581,16 +605,16 @@ Recipe 图片 URL 格式：`/api/media/recipes/{recipe_id}/images/original.webp?
 
 ### 10.7 缓存边界总表
 
-| 路由/资源 | 缓存策略 | 撤销分享后失效时机 |
-|----------|---------|-----------------|
+| 路由/资源 | 缓存策略与精确归因 | 撤销分享后失效时机 |
+|----------|------------------|-----------------|
 | DB 查询 | 无缓存 | 立即 |
-| **Share Token 匿名 API** (`/api/recipes/shared/{id}`) | ❌ 无 Cache-Control（默认 APIRouter，无 MealieCrudRoute；虽为单条 dict 含 updatedAt 但无处理逻辑） | 取决于浏览器/CDN 默认策略 |
-| **Explore 公开浏览列表** (`/api/explore/.../recipes`) | ❌ 无 Cache-Control（PaginationBase dict 顶层无 updatedAt） | 取决于浏览器/CDN 默认策略 |
-| **Explore 公开浏览单条** (`/api/explore/.../recipes/{slug}`) | ❌ 无 Cache-Control（默认 APIRouter，无 MealieCrudRoute；虽为单条 dict 含 updatedAt 但无处理逻辑） | 取决于浏览器/CDN 默认策略 |
-| **Share Token 用户管理列表** (`/api/shared/recipes`) | ❌ 无 Cache-Control（顶层为裸 `list`，`isinstance(response_body, dict)` 直接为 False） | 取决于浏览器/CDN 默认策略 |
-| **用户 Recipe CRUD 单条** (`/api/recipes/{slug}` GET) | ✅ `no-cache, no-store`（MealieCrudRoute + 顶层 dict + 含 `updatedAt`） | 立即 |
-| **用户 Recipe CRUD 分页列表** (`/api/recipes`) | ❌ 无 Cache-Control（PaginationBase dict 顶层无 `updatedAt`，不递归检查 items） | 取决于浏览器/CDN 默认策略 |
-| **SPA Meta 注入页面**（`/g/.../shared/r/...` 等显式 `app.get()` 路由） | ❌ 无 Cache-Control（纯 `Response()` 对象，不走 SPAStaticFiles） | 取决于浏览器/CDN 默认策略 |
+| **Share Token 匿名 API** (`/api/recipes/shared/{id}`) | ❌ 无 Cache-Control（场景 B：默认 APIRouter，无 MealieCrudRoute；虽为单条 dict 含 updatedAt 但 custom_route_handler 从未执行） | 取决于浏览器/CDN 默认策略 |
+| **Explore 公开浏览列表** (`/api/explore/.../recipes`) | ❌ 无 Cache-Control（场景 B：默认 APIRouter，无 MealieCrudRoute；与 PaginationBase 顶层字段无关） | 取决于浏览器/CDN 默认策略 |
+| **Explore 公开浏览单条** (`/api/explore/.../recipes/{slug}`) | ❌ 无 Cache-Control（场景 B：默认 APIRouter，无 MealieCrudRoute；虽为单条 dict 含 updatedAt 但 custom_route_handler 从未执行） | 取决于浏览器/CDN 默认策略 |
+| **Share Token 用户管理列表** (`/api/shared/recipes`) | ❌ 无 Cache-Control（场景 B：UserAPIRouter 未指定 route_class；与顶层 list 结构无关，因为处理逻辑从未执行） | 取决于浏览器/CDN 默认策略 |
+| **用户 Recipe CRUD 单条** (`/api/recipes/{slug}` GET) | ✅ `no-cache, no-store`（场景 A：MealieCrudRoute + 顶层 dict + 含 `updatedAt`） | 立即 |
+| **用户 Recipe CRUD 分页列表** (`/api/recipes`) | ❌ 无 Cache-Control（场景 A：有 MealieCrudRoute，但 PaginationBase dict 顶层无 `updatedAt`，不递归检查 items） | 取决于浏览器/CDN 默认策略 |
+| **SPA Meta 注入页面**（`/g/.../shared/r/...` 等显式 `app.get()` 路由） | ❌ 无 Cache-Control（纯 `Response()` 对象，不走 SPAStaticFiles，也无 MealieCrudRoute） | 取决于浏览器/CDN 默认策略 |
 | **SPA 404 页面** (`response_404()`) | ❌ 无 Cache-Control（纯 `Response()` 对象） | 取决于浏览器/CDN 默认策略 |
 | **SPA fallback HTML**（无显式路由匹配时，走 SPAStaticFiles） | ✅ `no-cache`（`path == "."` 或 `media_type == "text/html"`） | 立即 |
 | **SPA _nuxt/* 静态资源** | ✅ 永久缓存（hash 文件名） | 重新发布构建后 |
@@ -600,26 +624,25 @@ Recipe 图片 URL 格式：`/api/media/recipes/{recipe_id}/images/original.webp?
 
 ### 10.8 差异对撤销分享后可见内容的实际影响
 
-| 撤销/变更操作 | 受影响资源 | 无缓存头的具体原因 | 用户可能看到旧内容的窗口 |
-|-------------|-----------|-----------------|----------------------|
-| **用户删除 Share Token** | `/api/recipes/shared/{id}` JSON | 默认 APIRouter，无 MealieCrudRoute | 浏览器/CDN 默认缓存 TTL（通常几分钟到几小时） |
-| **用户删除 Share Token** | `/g/{group_slug}/shared/r/{id}` Meta HTML | 显式 `app.get()` 路由，纯 `Response()` 无缓存头 | 浏览器/CDN 默认缓存 TTL |
-| **Token 过期被惰性删除** | `/api/recipes/shared/{id}` | 默认 APIRouter，无 MealieCrudRoute | 仅浏览器端缓存（若有） |
-| **Recipe 由 public 改为 private** | `/api/explore/.../recipes/{slug}` 单条 | 默认 APIRouter，无 MealieCrudRoute | 浏览器/CDN 默认缓存 TTL |
-| **Household 改为 private** | Explore 分页列表 | PaginationBase dict 顶层无 `updatedAt` | 浏览器/CDN 默认缓存 TTL |
-| **Recipe 被删除** | 级联清理 Token → API 404 | 默认 APIRouter，无 MealieCrudRoute | 浏览器/CDN 默认缓存 TTL |
-| **用户 CRUD 单条 Recipe** | `/api/recipes/{slug}` | MealieCrudRoute + dict + `updatedAt` → 触发 no-cache | 立即 |
-| **用户 CRUD 分页列表** | `/api/recipes` 列表 | PaginationBase dict 顶层无 `updatedAt`，不递归检查 items | 浏览器/CDN 默认缓存 TTL |
-| **用户列出自己的 Share Token** | `/api/shared/recipes` | 顶层为裸 `list[RecipeShareTokenSummary]`，`isinstance(..., dict)` 为 False | 浏览器/CDN 默认缓存 TTL |
+| 撤销/变更操作 | 受影响资源 | 无缓存头的具体原因（场景 A/B） | 用户可能看到旧内容的窗口 |
+|-------------|-----------|------------------------------|----------------------|
+| **用户删除 Share Token** | `/api/recipes/shared/{id}` JSON | 场景 B：默认 APIRouter，无 MealieCrudRoute | 浏览器/CDN 默认缓存 TTL（通常几分钟到几小时） |
+| **用户删除 Share Token** | `/g/{group_slug}/shared/r/{id}` Meta HTML | 场景 B：显式 `app.get()` 路由，纯 `Response()` 无缓存头 | 浏览器/CDN 默认缓存 TTL |
+| **Token 过期被惰性删除** | `/api/recipes/shared/{id}` | 场景 B：默认 APIRouter，无 MealieCrudRoute | 仅浏览器端缓存（若有） |
+| **Recipe 由 public 改为 private** | `/api/explore/.../recipes/{slug}` 单条 | 场景 B：默认 APIRouter，无 MealieCrudRoute | 浏览器/CDN 默认缓存 TTL |
+| **Household 改为 private** | Explore 分页列表 | 场景 B：默认 APIRouter，无 MealieCrudRoute；与 PaginationBase 结构无关 | 浏览器/CDN 默认缓存 TTL |
+| **Recipe 被删除** | 级联清理 Token → API 404 | 场景 B：默认 APIRouter，无 MealieCrudRoute | 浏览器/CDN 默认缓存 TTL |
+| **用户 CRUD 单条 Recipe** | `/api/recipes/{slug}` | 场景 A：MealieCrudRoute + dict + `updatedAt` → 触发 no-cache | 立即 |
+| **用户 CRUD 分页列表** | `/api/recipes` 列表 | 场景 A：有 MealieCrudRoute，但 PaginationBase dict 顶层无 `updatedAt`，不递归检查 items | 浏览器/CDN 默认缓存 TTL |
+| **用户列出自己的 Share Token** | `/api/shared/recipes` | 场景 B：UserAPIRouter 未指定 route_class；处理逻辑从未执行 | 浏览器/CDN 默认缓存 TTL |
 | **Recipe 图片更新** | `/api/media/recipes/{id}/images/original.webp` | URL `?version=` 参数随更新变化 | 立即（新 URL） |
 | **Recipe 附件更新** | `/api/media/recipes/{id}/assets/{file}` | FileResponse 无 Cache-Control，同文件名 | 取决于浏览器默认策略（可能有 ETag/Last-Modified 协商缓存） |
 
-**结论**：绝大多数公开/匿名接口以及用户侧列表接口都**没有**显式 `Cache-Control` 头，但其原因各不相同：
-- Share Token / Explore 单条等接口：**根本没有 MealieCrudRoute**，即使响应是单条 dict 含 `updatedAt` 也不会处理
-- 分页列表接口（PaginationBase）：有 MealieCrudRoute，但**顶层 dict 无 `updatedAt`**，且代码不递归检查 `items` 内部对象
-- 裸 list 接口（如 `/api/shared/recipes`）：`json.loads` 结果为 `list`，**`isinstance(..., dict)` 直接为 False**
+**结论**：绝大多数公开/匿名接口以及用户侧列表接口都**没有**显式 `Cache-Control` 头，但需精确区分两种无缓存头场景：
+- **场景 B（公开/匿名接口，占绝大多数）**：**根本没有 MealieCrudRoute**（默认 APIRouter / UserAPIRouter 未指定 route_class），`custom_route_handler` 从未被调用，无论响应是单条 dict、分页 dict 还是裸 list 都不会设置缓存头。包括：Share Token 匿名 API、Explore 全部公开接口、Share Token 用户管理列表、SPA Meta 注入页面等
+- **场景 A（7 个用户 CRUD 路由的分页端点）**：有 MealieCrudRoute，但 PaginationBase 顶层 dict **无 `updatedAt`**，且代码只检查顶层键、不递归检查 `items` 内部对象。仅适用于：`/api/units`、`/api/foods`、`/api/recipes`、`/api/recipes/timeline/events`、`/api/households/events/notifications`、`/api/households/cookbooks`、`/api/groups/labels` 这 7 个路由的分页 GET 端点
 
-只有通过 `MealieCrudRoute` 且响应为**单条顶层 dict** 并直接包含 `updatedAt` 键的查询，以及 SPA fallback HTML（走 SPAStaticFiles），才保证不缓存。
+只有同时满足 **有 MealieCrudRoute + 响应为单条顶层 dict + 直接含 `updatedAt` 键** 三个条件的单条对象查询（7 个路由的单条 GET），以及走 SPAStaticFiles 的 fallback HTML，才保证不缓存。
 
 ---
 
@@ -647,12 +670,11 @@ Pydantic Recipe Schema 序列化（输出含 userId/groupId/householdId）
 
 1. **身份归属字段泄露**：公开 Recipe 响应包含 `userId`、`groupId`、`householdId`（camelCase 形式），Share Token 匿名访问和 Explore 公开浏览均会输出
 2. **Media 路由完全无校验**：Recipe 图片/附件/时间线图片、用户头像均无认证，也不校验 Recipe 公开性或 Share Token 有效性，仅靠 UUID 不可猜测保护
-3. **绝大多数公开接口无 Cache-Control**，且原因分三类：
-   - **无 MealieCrudRoute**：Share Token 匿名 API、Explore 单条查询、SPA Meta 注入页面等使用默认 `APIRouter`，即使响应为单条 dict 含 `updatedAt` 也不会触发缓存头设置
-   - **PaginationBase 顶层无 updatedAt**：分页列表接口虽然顶层是 dict（且可能有 MealieCrudRoute），但顶层字段为 `page/per_page/total/total_pages/items/next/previous`，无 `updatedAt`，且代码不递归检查 `items` 内部对象
-   - **裸 list**：如 `/api/shared/recipes` 返回 `list[RecipeShareTokenSummary]`，`json.loads` 结果为 list，`isinstance(response_body, dict)` 直接为 False
+3. **绝大多数公开接口无 Cache-Control**，需精确区分两种场景：
+   - **场景 B（占绝大多数）：根本没有 MealieCrudRoute**：Explore 所有接口（含 Explore 分页列表和 Explore 单条）、Share Token 匿名 API、Share Token 用户管理列表、SPA Meta 注入页面等使用默认 `APIRouter` / `UserAPIRouter`（未指定 route_class），`custom_route_handler` 从未被调用，无论响应是单条 dict、分页 dict 还是裸 list 都不会设置缓存头。**Explore 分页无缓存头与 PaginationBase 顶层字段无关**
+   - **场景 A（仅 7 个用户 CRUD 路由的分页端点）：有 MealieCrudRoute，但 PaginationBase 顶层无 updatedAt**：仅 `/api/units`、`/api/foods`、`/api/recipes`、`/api/recipes/timeline/events`、`/api/households/events/notifications`、`/api/households/cookbooks`、`/api/groups/labels` 这 7 个路由的分页 GET 端点命中此场景
    
-   只有 MealieCrudRoute + 单条顶层 dict + 直接含 `updatedAt` 键的查询，以及走 SPAStaticFiles 的 fallback HTML，才保证不缓存
+   只有同时满足 **有 MealieCrudRoute + 响应为单条顶层 dict + 直接含 `updatedAt` 键** 三个条件的单条对象查询（上述 7 个路由的单条 GET），以及走 SPAStaticFiles 的 fallback HTML，才保证不缓存
 4. **SPA Meta 不检查 Token 过期**：过期 Token 在被惰性删除或定时清理前，仍可通过 `/g/{group_slug}/shared/r/{token_id}` 获取 OG Meta（title/description/image/JSON-LD）
 5. **Share Token 无速率限制**：理论可暴力枚举（UUID 空间足够大，实际不可行）
 
@@ -683,7 +705,8 @@ Pydantic Recipe Schema 序列化（输出含 userId/groupId/householdId）
 | PaginationBase 分页响应 Schema（page/per_page/total/total_pages/items） | [schema/response/pagination.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/schema/response/pagination.py) |
 | Controller 基类与 Scope | [routes/_base/base_controllers.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/_base/base_controllers.py) |
 | Repository Scope 过滤 | [repos/repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/repos/repository_generic.py) |
-| Explore 公开 Recipes | [routes/explore/controller_public_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/explore/controller_public_recipes.py) |
+| Explore 公开 Recipes Controller | [routes/explore/controller_public_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/explore/controller_public_recipes.py) |
+| Explore 路由注册（使用默认 APIRouter，无 MealieCrudRoute） | [routes/explore/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/explore/__init__.py) |
 | Media Router 注册 | [routes/media/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/media/__init__.py) |
 | Recipe 媒体路由（图片/附件） | [routes/media/media_recipe.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/media/media_recipe.py) |
 | User 头像路由 | [routes/media/media_user.py](file:///d:/fz/0601/solo-dogfeeding/code/79-mealie/mealie/routes/media/media_user.py) |
