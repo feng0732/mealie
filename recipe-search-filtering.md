@@ -6,7 +6,7 @@
 
 ## 一、整体调用链路
 
-### 1.1 用户 API 入口
+### 1.1 普通搜索用户 API 入口
 
 请求从路由层的 `GET /api/recipes` 端点进入：
 
@@ -26,7 +26,7 @@ RecipeController.get_all()
               └─> 返回 RecipePagination
 ```
 
-### 1.2 公共 API (Explore) 入口
+### 1.2 普通搜索公共 API (Explore) 入口
 
 公共探索接口在：[controller_public_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/explore/controller_public_recipes.py#L30-L92)
 
@@ -39,6 +39,10 @@ if q.query_filter:
 else:
     q.query_filter = public_filter
 ```
+
+### 1.3 推荐建议 (Suggestions) API 入口
+
+详见本文第十一章。用户 API 在 [recipe_crud_routes.py L397-L413](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/recipe/recipe_crud_routes.py#L397-L413)，公共 API 在 [controller_public_recipes.py L94-L112](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/explore/controller_public_recipes.py#L94-L112)。
 
 ---
 
@@ -67,10 +71,10 @@ else:
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `cookbook` | UUID4 \| str \| None | None | 食谱书 ID 或 slug，使用其内置的 query_filter_string |
-| `require_all_categories` | bool | False | categories 是否需要全部匹配（AND） |
-| `require_all_tags` | bool | False | tags 是否需要全部匹配（AND） |
-| `require_all_tools` | bool | False | tools 是否需要全部匹配（AND） |
-| `require_all_foods` | bool | False | foods 是否需要全部匹配（AND） |
+| `require_all_categories` | bool | **False** | categories 是否需要全部匹配（AND） |
+| `require_all_tags` | bool | **False** | tags 是否需要全部匹配（AND） |
+| `require_all_tools` | bool | **False** | tools 是否需要全部匹配（AND） |
+| `require_all_foods` | bool | **False** | foods 是否需要全部匹配（AND） |
 | `search` | str \| None | None | 文本搜索关键词 |
 
 ### 2.3 独立 Query 参数（Taxonomy 筛选）
@@ -103,8 +107,10 @@ if search:
 ```python
 def add_search_to_query(self, query: Select, schema: type[Schema], search: str) -> Select:
     search_filter = SearchFilter(self.session, search, schema._normalize_search)
-    return search_filter.filter_query_by_search_query(query, schema, self.model)
+    return search_filter.filter_query_by_search(query, schema, self.model)
 ```
+
+> **代码事实纠正**：方法名是 `filter_query_by_search`，不是 `filter_query_by_search_query`。定义于 [query_search.py L66](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/response/query_search.py#L66)。
 
 ### 3.2 SearchFilter 搜索类型决策
 
@@ -207,7 +213,26 @@ ORDER BY (name_normalized LIKE '%完整搜索词%') DESC
 1. 尝试将每个 item 解析为 UUID
 2. 解析失败的视为 slug，通过数据库查询获取对应 ID
 
-### 4.3 _build_recipe_filter 条件构造
+### 4.3 requireAll 默认值的真实语义
+
+**这是一个容易混淆的点，需注意三层默认值的差异：**
+
+| 位置 | 默认值 | 说明 |
+|------|--------|------|
+| `RecipeSearchQuery`（路由参数接收） | **False** | 定义于 [pagination.py L24-L27](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/response/pagination.py#L24-L27)，HTTP API 请求不传时生效 |
+| `RepositoryRecipes.page_all()` 方法签名 | **True** | 定义于 [repository_recipes.py L230-L233](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/repos/repository_recipes.py#L230-L233)，仅在直接调用 page_all 且不传这些参数时生效 |
+| `_build_recipe_filter()` 方法签名 | **True** | 定义于 [repository_recipes.py L302-L305](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/repos/repository_recipes.py#L302-L305)，同上 |
+| `CookBook` 数据库模型字段 | **True** | 定义于 [cookbook.py L42/L45/L48](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/db/models/household/cookbook.py#L42)，但 CookBook 现在走 `query_filter_string` 不再走独立 taxonomy 过滤 |
+
+**实际生效的默认值（用户 API + 公共 API）：`False`（OR 语义）**
+
+原因：路由层在调用 page_all 时**始终显式传递** `search_query.require_all_categories` 等参数：
+- 用户 API：[recipe_crud_routes.py L378-L381](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/recipe/recipe_crud_routes.py#L378-L381)
+- 公共 API：[controller_public_recipes.py L75-L78](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/explore/controller_public_recipes.py#L75-L78)
+
+传递的是 `RecipeSearchQuery` 中的值，而其默认值是 `False`。page_all 方法签名上的 `True` 默认值只有在绕过路由层、直接以 Python 代码调用 page_all 且不传这些参数时才会生效。
+
+### 4.4 _build_recipe_filter 条件构造
 
 定义于 [repository_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/repos/repository_recipes.py#L295-L337)。
 
@@ -222,7 +247,7 @@ if self.household_id:
 
 #### Categories 过滤
 
-- `require_all_categories=True`（默认在 page_all 中传 True）：对每个分类 ID 分别加 `.any(Category.id == cat_id)` → **AND** 语义（必须包含所有分类）
+- `require_all_categories=True`：对每个分类 ID 分别加 `.any(Category.id == cat_id)` → **AND** 语义（必须包含所有分类）
 - `require_all_categories=False`：`.any(Category.id IN (categories))` → **OR** 语义（包含任一分类即可）
 
 #### Tags / Tools / Foods 过滤
@@ -442,7 +467,7 @@ recipe.image = cache.cache_key.new_key()  # 例如 "aB3x"
 
 ---
 
-## 十、完整执行顺序总结
+## 十、普通搜索完整执行顺序总结
 
 以用户 API `GET /api/recipes` 为例，完整的查询构造顺序：
 
@@ -452,13 +477,279 @@ recipe.image = cache.cache_key.new_key()  # 例如 "aB3x"
 | 2 | 调用 `by_user(user_id)` 绑定当前用户（用于 last_made/rating 计算列） | repository_recipes.py |
 | 3 | 基础查询：`SELECT * FROM recipes WHERE household_id IS NOT NULL` | repository_recipes.py L238 |
 | 4 | 基础权限过滤：`filter_by(group_id=..., household_id=...)` | _filter_builder |
-| 5 | CookBook / Taxonomy 条件过滤 | _build_recipe_filter 或合并 cookbook.query_filter_string |
-| 6 | 文本搜索：添加 fuzzy/tokenized 搜索条件及搜索排序 | add_search_to_query → Recipe.filter_search_query |
+| 5 | CookBook / Taxonomy 条件过滤（requireAll 默认 **False** 即 OR） | _build_recipe_filter 或合并 cookbook.query_filter_string |
+| 6 | 文本搜索：调用 `SearchFilter.filter_query_by_search()` 添加 fuzzy/tokenized 搜索条件及排序 | add_search_to_query → Recipe.filter_search_query |
 | 7 | query_filter 高级过滤（包含公共 API 的权限条件） | QueryFilterBuilder.filter_query |
-| 8 | COUNT 查询：计算符合条件的总条数 | add_pagination_to_query L376-L379 |
+| 8 | COUNT 查询：基于已过滤未排序 query 计算总条数 | add_pagination_to_query L376-L379 |
 | 9 | 计算 total_pages，处理特殊分页值 | add_pagination_to_query L381-L398 |
 | 10 | 应用排序（默认 created_at / 搜索排序 / 自定义 / 随机） | add_order_by_to_query |
 | 11 | 应用 LIMIT / OFFSET | add_pagination_to_query L402-L405 |
 | 12 | 添加 SQLAlchemy loader_options（joinedload/selectinload）避免 N+1 | page_all 末尾 |
 | 13 | 执行查询，结果序列化为 RecipeSummary 列表 | page_all 末尾 |
 | 14 | 构造 RecipePagination，设置 next/previous 链接 | 路由层 |
+
+---
+
+## 十一、Recipe Suggestions（推荐建议）过滤链路
+
+### 11.1 路由入口
+
+#### 用户 API
+
+[recipe_crud_routes.py L397-L413](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/recipe/recipe_crud_routes.py#L397-L413)
+
+```python
+@router.get("/suggestions", response_model=RecipeSuggestionResponse)
+def suggest_recipes(
+    self,
+    q: RecipeSuggestionQuery = Depends(make_dependable(RecipeSuggestionQuery)),
+    foods: list[UUID4] | None = Query(None),
+    tools: list[UUID4] | None = Query(None),
+) -> RecipeSuggestionResponse:
+    group_recipes_by_user = get_repositories(
+        self.session, group_id=self.group_id, household_id=None
+    ).recipes.by_user(self.user.id)
+
+    recipes = group_recipes_by_user.find_suggested_recipes(q, foods, tools)
+```
+
+- Repository：`group_id=用户group_id, household_id=None`（全组范围），并绑定 `by_user(user.id)`
+- 接收参数：`RecipeSuggestionQuery`（继承 `RequestQuery`）+ 独立的 `foods` 和 `tools` Query 参数
+
+#### 公共 Explore API
+
+[controller_public_recipes.py L94-L112](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/explore/controller_public_recipes.py#L94-L112)
+
+与用户 API 的区别在于**先注入公共权限过滤**到 `q.query_filter`：
+
+```python
+public_filter = "(household.preferences.privateHousehold = FALSE AND settings.public = TRUE)"
+if q.query_filter:
+    q.query_filter = f"({q.query_filter}) AND {public_filter}"
+else:
+    q.query_filter = public_filter
+```
+
+然后调用 `self.cross_household_repos.find_suggested_recipes(q, foods, tools)`。
+
+### 11.2 RecipeSuggestionQuery 参数结构
+
+定义于 [recipe_suggestion.py L7-L15](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/recipe/recipe_suggestion.py#L7-L15)，继承自 `RequestQuery`：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| **继承自 RequestQuery** | | | |
+| `order_by` | str \| None | None | 用户自定义排序字段 |
+| `order_direction` | OrderDirection | desc | 排序方向 |
+| `order_by_null_position` | OrderByNullPosition \| None | None | NULL 值排序位置 |
+| `query_filter` | str \| None | None | 高级查询过滤表达式 |
+| `pagination_seed` | str \| None | None | 随机排序种子 |
+| **Suggestion 专属** | | | |
+| `limit` | int | **10** | 返回结果最大数量 |
+| `max_missing_foods` | int | **5** | 允许缺少的最大食材数 |
+| `max_missing_tools` | int | **5** | 允许缺少的最大工具数 |
+| `include_foods_on_hand` | bool | **True** | 是否包含用户家庭已有的食材 |
+| `include_tools_on_hand` | bool | **True** | 是否包含用户家庭已有的工具 |
+
+### 11.3 find_suggested_recipes 完整执行流程
+
+定义于 [repository_recipes.py L361-L532](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/repos/repository_recipes.py#L361-L532)。
+
+#### 步骤 1：默认排序兜底
+
+```python
+if not params.order_by:
+    params.order_by = "created_at"
+```
+
+若用户未指定排序，默认按 `created_at` 排序。这与普通搜索的默认排序一致，但 suggestions 的排序是**叠加在缺失度排序之后**的（见步骤 5）。
+
+#### 步骤 2：处理 foods/tools + on_hand（已有物品）
+
+```python
+user_food_ids = list(set(food_ids or []))
+user_tool_ids = list(set(tool_ids or []))
+
+food_ids_with_on_hand = user_food_ids.copy()
+tool_ids_with_on_hand = user_tool_ids.copy()
+```
+
+- `user_food_ids` / `user_tool_ids`：用户通过 Query 参数显式传入的 ID（去重），这些是用户**想要使用**的物品
+- `food_ids_with_on_hand` / `tool_ids_with_on_hand`：后续将追加用户家庭**已拥有**的物品 ID，用于计算"缺少"时排除已有物品
+
+##### 步骤 2a：合并用户家庭已有食材（on-hand foods）
+
+当 `include_foods_on_hand=True` 且存在 `self.user_id` 时：
+
+```python
+if params.include_foods_on_hand and self.user_id:
+    foods_on_hand_query = (
+        sa.select(households_to_ingredient_foods.c.food_id)
+        .join(User, households_to_ingredient_foods.c.household_id == User.household_id)
+        .filter(
+            sa.not_(households_to_ingredient_foods.c.food_id.in_(food_ids_with_on_hand)),
+            User.id == self.user_id,
+        )
+    )
+    foods_on_hand = self.session.execute(foods_on_hand_query).scalars().all()
+    food_ids_with_on_hand.extend(foods_on_hand)
+```
+
+- 通过关联表 `households_to_ingredient_foods` 查出用户所在家庭已标记为"在手"的食材
+- 排除已在 `user_food_ids` 中的重复项
+- 追加到 `food_ids_with_on_hand`
+
+##### 步骤 2b：合并用户家庭已有工具（on-hand tools）
+
+逻辑完全同食材，只是查询关联表 `households_to_tools`。
+
+最终语义：
+- `food_ids_with_on_hand` = 用户显式传入的食材 ∪ 家庭已有食材
+- `tool_ids_with_on_hand` = 用户显式传入的工具 ∪ 家庭已有工具
+- 计算"缺少"时，用这两个集合判断是否已拥有
+
+#### 步骤 3：基础查询与权限过滤
+
+```python
+q = sa.select(self.model).filter(self.model.household_id.is_not(None))
+fltr = self._filter_builder()
+q = q.filter_by(**fltr)
+```
+
+- 过滤掉没有 household_id 的菜谱
+- 应用 group_id / household_id 基础权限（同普通搜索）
+
+#### 步骤 4：工具缺失度子查询 + 过滤 + 排序（仅当 user_tool_ids 非空时）
+
+```python
+if user_tool_ids:
+    unmatched_tools_query = (
+        sa.select(recipes_to_tools.c.recipe_id, sa.func.count().label("unmatched_tools_count"))
+        .join(tools_alias, recipes_to_tools.c.tool_id == tools_alias.id)
+        .filter(sa.not_(tools_alias.id.in_(tool_ids_with_on_hand)))
+        .group_by(recipes_to_tools.c.recipe_id)
+        .subquery()
+    )
+```
+
+子查询逻辑：统计每个菜谱**不包含在** `tool_ids_with_on_hand`（用户拥有的全部工具）中的工具数量 → 即"缺少的工具数"。
+
+```python
+q = (
+    q.outerjoin(unmatched_tools_query, self.model.id == unmatched_tools_query.c.recipe_id)
+    .filter(
+        sa.or_(
+            unmatched_tools_query.c.unmatched_tools_count.is_(None),  # 该菜谱没有任何工具需求
+            unmatched_tools_query.c.unmatched_tools_count <= params.max_missing_tools,
+        )
+    )
+    .order_by(unmatched_tools_query.c.unmatched_tools_count.asc().nulls_first())
+)
+```
+
+- `outerjoin`：没有工具需求的菜谱 unmatched_tools_count 为 NULL
+- `filter`：允许"缺少工具数 ≤ max_missing_tools"或"完全没有工具需求"的菜谱
+- `order_by`：**缺少工具数升序**（缺得越少越靠前），NULL 排最前
+
+#### 步骤 5：食材缺失度子查询 + 过滤 + 排序（仅当 user_food_ids 非空时）
+
+```python
+if user_food_ids:
+    unmatched_foods_query = (
+        sa.select(ingredients_alias.recipe_id, sa.func.count().label("unmatched_foods_count"))
+        .filter(sa.not_(ingredients_alias.food_id.in_(food_ids_with_on_hand)))
+        .filter(ingredients_alias.food_id.isnot(None))
+        .group_by(ingredients_alias.recipe_id)
+        .subquery()
+    )
+    total_user_foods_query = (
+        sa.select(ingredients_alias.recipe_id, sa.func.count().label("total_user_foods_count"))
+        .filter(ingredients_alias.food_id.in_(user_food_ids))  # 注意这里用 user_food_ids，不含 on_hand
+        .group_by(ingredients_alias.recipe_id)
+        .subquery()
+    )
+```
+
+两个子查询：
+- `unmatched_foods_query`：统计每个菜谱中**不在** `food_ids_with_on_hand` 中的食材数量 → "缺少的食材数"
+- `total_user_foods_query`：统计每个菜谱中**恰好匹配**用户显式传入食材（不含 on-hand）的数量 → "用户想要用的食材匹配数"
+
+```python
+q = (
+    q.join(settings_alias, self.model.settings)
+    .outerjoin(unmatched_foods_query, self.model.id == unmatched_foods_query.c.recipe_id)
+    .outerjoin(total_user_foods_query, self.model.id == total_user_foods_query.c.recipe_id)
+    .filter(
+        sa.or_(
+            unmatched_foods_query.c.unmatched_foods_count.is_(None),
+            unmatched_foods_query.c.unmatched_foods_count <= params.max_missing_foods,
+        ),
+    )
+    .order_by(
+        unmatched_foods_query.c.unmatched_foods_count.asc().nulls_first(),
+        total_user_foods_query.c.total_user_foods_count.desc().nulls_last(),
+    )
+)
+```
+
+- 过滤：允许"缺少食材数 ≤ max_missing_foods"的菜谱
+- 排序优先级（叠加在工具排序之后）：
+  1. **缺少食材数升序**（越少越前）
+  2. **用户显式传入食材匹配数降序**（越多越前，越符合用户意图）
+
+```python
+# 额外过滤：必须至少匹配一个用户显式传入的食材
+if user_food_ids:
+    q = q.filter(total_user_foods_query.c.total_user_foods_count > 0)
+```
+
+这意味着：用户如果传了 foods 参数，结果**必须至少包含其中一个**食材，避免推荐毫不相关的菜谱。
+
+#### 步骤 6：附加条件（group / household / query_filter）
+
+```python
+if self.group_id:
+    q = q.filter(self.model.group_id == self.group_id)
+if self.household_id:
+    q = q.filter(self.model.household_id == self.household_id)
+if params.query_filter:
+    query_filter_builder = QueryFilterBuilder(params.query_filter)
+    q = query_filter_builder.filter_query(q, model=self.model)
+```
+
+注意：这里 group_id / household_id 又加了一遍过滤（与步骤 3 的 filter_by 有重叠，但 SQLAlchemy 会合并处理）。公共 API 的权限过滤通过 `params.query_filter` 注入到这里。
+
+#### 步骤 7：用户自定义排序 + limit
+
+```python
+q = self.add_order_by_to_query(q, params)
+q = q.limit(params.limit).options(*RecipeSummary.loader_options())
+```
+
+- `add_order_by_to_query` 追加用户指定排序（默认 `created_at`）。由于 SQL `ORDER BY` 是**按出现顺序优先级从高到低**，因此最终排序优先级为：
+  1. 缺少工具数升序（步骤 4）→ 最高优先级
+  2. 缺少食材数升序（步骤 5）
+  3. 用户食材匹配数降序（步骤 5）
+  4. 用户自定义排序 / created_at（步骤 7）→ 最低优先级
+- `limit(params.limit)`：限制返回数量，默认 10
+- `loader_options`：joinedload 预加载 category/tag/tool/user 关联
+
+#### 步骤 8：Python 层计算缺失物品并返回
+
+查询执行后，在 Python 层再次遍历每个菜谱的 ingredients 和 tools，基于 `food_ids_with_on_hand` / `tool_ids_with_on_hand` 计算实际缺失的物品列表，封装为 `RecipeSuggestionResponseItem` 返回。
+
+### 11.4 Suggestions 执行顺序总表
+
+| 步骤 | 操作 | 条件 |
+|------|------|------|
+| 1 | 默认 order_by = "created_at" | 仅当用户未指定 |
+| 2 | foods/tools 参数去重，初始化 *_with_on_hand 集合 | 始终 |
+| 3 | 合并家庭已有食材（on-hand foods） | include_foods_on_hand=True 且有 user_id |
+| 4 | 合并家庭已有工具（on-hand tools） | include_tools_on_hand=True 且有 user_id |
+| 5 | 基础查询 + _filter_builder 权限过滤 | 始终 |
+| 6 | 工具缺失度子查询 → outerjoin → 过滤（≤max_missing_tools）→ 排序（缺越少越前） | user_tool_ids 非空 |
+| 7 | 食材缺失度 + 食材匹配数子查询 → outerjoin → 过滤（≤max_missing_foods 且 ≥1 匹配）→ 排序（缺越少越前、匹配越多越前） | user_food_ids 非空 |
+| 8 | 附加 group_id/household_id/query_filter 过滤 | 始终 |
+| 9 | 追加用户自定义排序（叠加在缺失度排序之后） | 始终 |
+| 10 | LIMIT + loader_options | 始终 |
+| 11 | Python 层计算缺失物品明细，封装返回 | 始终 |
