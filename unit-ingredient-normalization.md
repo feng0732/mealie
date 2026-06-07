@@ -97,7 +97,7 @@ def normalize(cls, val: str) -> str:
 
 单位族并非用显式的枚举定义，而是通过 **Pint 库的量纲 (dimensionality)** 来判定。
 
-### 3.1 Pint 量纲系统
+### 3.1 Pint 量纲系统与单位识别边界
 
 核心类是 [UnitConverter](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/parser_services/parser_utils/unit_utils.py#L20-L104)，它封装了 Pint 的 `UnitRegistry`：
 
@@ -119,13 +119,38 @@ def can_convert(self, unit, to_unit) -> bool:
     return unit.is_compatible_with(to_unit)
 ```
 
-常见单位族及示例：
+#### 3.1.1 Pint 的三级单位识别
 
-| 量纲 (Dimensionality) | 单位族 | 示例单位 |
-|----------------------|--------|---------|
-| `[length] ** 3` | 体积 (Volume) | cup, pint, quart, gallon, fluid_ounce, milliliter, liter |
+Pint 对单位字符串有三种截然不同的响应，直接决定了后续所有行为：
+
+| 级别 | 特征 | `uc.parse()` 返回值 | `isinstance(x, pint.Unit)` | 示例 |
+|------|------|-------------------|---------------------------|------|
+| **T1：Pint 原生可识别** | Pint 内置定义的物理/化学单位 | `pint.Unit` 对象 | `True` | `cup`、`pint`、`pound`、`gram`、`milliliter`、`ounce`、`fluid_ounce` |
+| **T2：dimensionless（无量纲）** | 合法的 Pint 单位，量纲为 `{}` | `pint.Unit` 对象，`dimensionality == dimensionless` | `True` | 空字符串 `""`、`count`（若已定义） |
+| **T3：Pint 完全不认识** | Pint 注册表中不存在该单位 | 原始输入字符串（非 `Unit`） | `False` | `"pinch"`、`"dash"`、`"splash"`、`"serving"`、`"head"`、`"clove"`、`"can"`、`"bunch"`、`"pack"`、`"sprig"` |
+
+#### 3.1.2 dimensionless vs T3（未定义单位）的关键区别
+
+这是两个完全不同的概念：
+
+| 维度 | dimensionless (T2) | 未定义单位 (T3) |
+|------|-------------------|----------------|
+| Pint 响应 | 返回合法 `pint.Unit`，量纲 `{}` | 抛异常后 `parse()` 回退返回字符串 |
+| `can_convert(自身, 自身)` | `True`（与自己兼容） | `False`（返回非 Unit，提前短路） |
+| `can_convert(自身, cup)` | `False`（量纲不兼容） | `False`（返回非 Unit，提前短路） |
+| `can_convert(自身, pound)` | `False`（量纲不兼容） | `False`（返回非 Unit，提前短路） |
+
+#### 3.1.3 实际单位族映射
+
+根据 Pint 实际识别结果：
+
+| 量纲 (Dimensionality) | 单位族 | 实际 Pint 可识别单位 (T1) |
+|----------------------|--------|-------------------------|
+| `[length] ** 3` | 体积 (Volume) | cup, pint, quart, gallon, fluid_ounce, milliliter, liter, teaspoon, tablespoon |
 | `[mass]` | 质量 (Mass/Weight) | pound, ounce, gram, kilogram, milligram |
-| `dimensionless` | 计数/无单位 | serving, pinch, dash, splash, head, clove, can |
+| `dimensionless` | 无量纲 | 空字符串（无单位时的隐式默认） |
+
+> ⚠️ **重要更正**：`pinch`、`dash`、`splash`、`serving`、`head`、`clove`、`can`、`bunch`、`pack`、`sprig` 这些单位虽然存在于 Mealie 的种子数据（[en-US.json](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/seed/resources/units/locales/en-US.json)）中，但 **Pint 并不认识它们**，属于 T3 级别。在 [RepositoryUnit._add_standardized_unit](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/repository_units.py#L43-L107) 的 match 语句中，它们落入 `case _: pass` 分支，`standard_quantity` 和 `standard_unit` 均为 `None`。因此它们既不能被 Pint 识别，也没有标准化数据，无法参与任何跨单位换算。
 
 ### 3.2 特殊处理：盎司 (Ounce) 的歧义消除
 
@@ -342,35 +367,131 @@ new_item = ShoppingListItemCreate(
 - `recipe_scale` = 该食谱被添加的份数（缩放因子）
 - 子食谱（referenced_recipe）会递归处理，缩放因子相乘：`sub_scale = ingredient.quantity * scale`
 
-#### 6.2.1 同食谱内重复食材的数量累加
+#### 6.2.1 同食谱内重复食材的数量累加（误差来源）
 
 当同一食谱中多次出现相同食材（如两个条目都是 "cup flour"），在 `get_shopping_list_items_from_recipe` 内部会提前合并（[shopping_lists.py L387-L406](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L387-L406)）：
 
 ```python
-# some recipes have the same ingredient multiple times, so we check to see if we can combine them
-merged = False
-for existing_item in list_items:
-    if not self.can_merge(existing_item, new_item):
-        continue
-
-    # since this is the same recipe, we combine the quanities, rather than the scales
-    # all items will have exactly one recipe reference
-    if ingredient.quantity:
-        existing_item.quantity += ingredient.quantity
-        existing_item.recipe_references[0].recipe_quantity += ingredient.quantity
-
-    # merge notes
-    ...
+# since this is the same recipe, we combine the quanities, rather than the scales
+# all items will have exactly one recipe reference
+if ingredient.quantity:
+    existing_item.quantity += ingredient.quantity
+    existing_item.recipe_references[0].recipe_quantity += ingredient.quantity
 ```
 
-**累加逻辑详解**（以 scale=3、食谱内有 "1 cup flour" 和 "2 cup flour" 为例）：
+注意关键细节：第一个条目的 `quantity` 被正确设置为 `ingredient.quantity * scale`（已缩放），但合并时累加的是 **未缩放** 的 `ingredient.quantity`，而不是 `new_item.quantity`。
 
-| 步骤 | existing_item.quantity | existing_item.recipe_quantity | 说明 |
-|------|----------------------|-----------------------------|------|
-| 处理第 1 条 "1 cup flour" | `1 * 3 = 3` (缩放后) | `1` (原始量) | 新条目加入列表 |
-| 处理第 2 条 "2 cup flour" | `3 + 2 = 5` | `1 + 2 = 3` | 累加的是**未缩放**的 `ingredient.quantity` |
+**误差产生推演**（以 scale=3、食谱内有 "1 cup flour" 和 "2 cup flour" 为例）：
 
-⚠️ **注意**：此时代码将 `ingredient.quantity`（未缩放的原始量 2）直接加到了 `existing_item.quantity`（已缩放为 3）上，最终得到 5 而非正确的 `(1+2)*3 = 9`。但 `recipe_quantity` 被正确累计为 3，后续若按份数增减操作仍可用 `recipe_quantity * recipe_scale` 重新计算。
+| 步骤 | 操作 | `quantity` | `recipe_quantity` | `recipe_scale` | 期望值 `(recipe_quantity * recipe_scale)` |
+|------|------|-----------|-------------------|---------------|-----------------------------------------|
+| 处理第 1 条 "1 cup flour" | 新建条目 | `1 * 3 = 3` | `1` | `3` | 3 |
+| 处理第 2 条 "2 cup flour" | 合并累加 | `3 + 2 = 5` ❌ | `1 + 2 = 3` ✅ | `3` | 9 |
+| **误差** | | **少了 4** | — | — | |
+
+此时：
+- `quantity = 5`，但 `recipe_quantity * recipe_scale = 3 * 3 = 9`
+- 两者已经不一致。后续所有使用 `quantity` 的地方都偏小。
+
+#### 6.2.2 场景一：减少食谱份数（remove_recipe_ingredients_from_list）
+
+减少份数的逻辑在 [shopping_lists.py L457-L539](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L457-L539)，核心代码：
+
+```python
+if ref.recipe_scale > recipe_decrement:
+    # remove only part of the reference
+    item.quantity -= recipe_decrement * ref.recipe_quantity
+else:
+    # remove everything that's left on the reference
+    item.quantity -= ref.recipe_scale * ref.recipe_quantity
+
+ref.recipe_scale -= recipe_decrement
+```
+
+注意：扣除数量时使用的是 **正确公式** `recipe_decrement * ref.recipe_quantity`（或 `recipe_scale * recipe_quantity`），这个公式假设了 `quantity == recipe_quantity * recipe_scale`。但由于同食谱累加时的误差，这个等式不成立。
+
+**延续上例，逐步减少份数**：
+
+| 操作 | 扣除量计算 | `quantity` 变化 | `recipe_scale` 变化 | 实际剩余 `quantity` | 应有剩余 `recipe_quantity * recipe_scale` |
+|------|----------|----------------|--------------------|-------------------|-----------------------------------------|
+| 初始状态 | — | 5 | 3 | 5 | 9 |
+| 减少 1 份 (`recipe_decrement=1`) | `1 * 3 = 3` | `5 - 3 = 2` | `3 - 1 = 2` | 2 | `3 * 2 = 6` |
+| 再减少 1 份 | `1 * 3 = 3` | `2 - 3 = -1` ❌ | `2 - 1 = 1` | -1 | `3 * 1 = 3` |
+| 再减少 1 份（全部移除） | `1 * 3 = 3`（走 else 分支） | `-1 - 3 = -4` | `1 - 1 = 0`（引用被删） | -4 | 0（无引用） |
+
+**误差影响**：
+- 第一次减份后，`quantity` 从 **偏小 4** 变成 **偏小 4**（2 vs 6），差距仍然是 4
+- 第二次减份时，`quantity` 已经变成 **负数**（-1），但 `recipe_scale` 仍为 1，理论上还应该有 3 cup flour
+- 第三次减份后，`recipe_scale` 归零、引用被删除，但 `quantity` 为 -4，由于 `quantity < 0`，条目会被 `delete_items` 删除（[L506](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L506)）——虽然最终会删除，但 `quantity` 的值完全失真
+- 如果该条目同时还有其他食谱的引用（见 6.2.4），负数 `quantity` 会继续污染跨食谱合并结果
+
+#### 6.2.3 场景二：引用被删除
+
+当 `recipe_scale` 被减到 0 或以下时，该食谱引用会从 `recipe_references` 列表中移除：
+
+```python
+ref.recipe_scale -= recipe_decrement
+if ref.recipe_scale <= 0:
+    item.recipe_references.remove(ref)
+```
+
+条目是否被删除的判断逻辑（[L505-L507](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L505-L507)）：
+
+```python
+# only remove a 0 quantity item if we removed its last recipe reference
+if item.quantity < 0 or (item.quantity == 0 and not item.recipe_references):
+    delete_items.append(item.id)
+```
+
+**删除判定矩阵**：
+
+| `quantity` | 是否还有其他引用 | 结果 |
+|-----------|----------------|------|
+| `< 0` | 无论有无 | **被删除**（即使还有其他食谱引用！） |
+| `== 0` | 无 | **被删除** |
+| `== 0` | 有 | 保留（还有其他食谱） |
+| `> 0` | 无论有无 | 保留 |
+
+**由累加误差引发的异常**：
+- 在上例中，减到第 2 份时 `quantity = -1`（但 `recipe_scale = 1`，还有引用）
+- `quantity < 0` 直接触发删除，导致该购物清单项连同**可能存在的其他食谱引用**一起被误删
+- 如果只有这一个食谱引用，最终虽然删除了条目，但过程中 `quantity` 已经过多次负值
+
+#### 6.2.4 场景三：跨食谱合并
+
+当存在同食谱累加误差的条目与另一个食谱的相同食材在购物清单中合并时，误差通过 `merge_items` 传播。
+
+**推演**：已有条目 A（来自食谱 R1，有累加误差：`quantity=5, recipe_quantity=3, recipe_scale=3`，"cup flour"），再添加食谱 R2 的 "2 cup flour"（scale=2）：
+
+1. R2 的新条目 B 被创建：`quantity = 2 * 2 = 4`, `recipe_quantity = 2`, `recipe_scale = 2`
+2. `bulk_create_items` 中 A 与 B 调用 `merge_items`（[L191-L201](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L191-L201)）
+3. `merge_items` 对数量的处理（[L86-L96](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L86-L96)）：
+
+```python
+if to_item_unit and to_item_unit.standard_unit and from_item_unit and from_item_unit.standard_unit:
+    merged_qty, merged_unit = merge_quantity_and_unit(
+        from_item.quantity or 0, from_item_unit, to_item.quantity or 0, to_item_unit
+    )
+    to_item.quantity = merged_qty
+else:
+    # No conversion needed, just sum the quantities
+    to_item.quantity += from_item.quantity
+```
+
+由于 cup 是 T1（有 standard_unit），走 `merge_quantity_and_unit` 分支：
+
+| 项目 | `quantity` | 对合并结果的贡献 |
+|------|-----------|----------------|
+| A（有误差） | 5（应为 9） | 5 |
+| B（无误差） | 4 | 4 |
+| **合并结果** | **5 + 4 = 9** | **应为 9 + 4 = 13** |
+
+食谱引用的合并（[L109-L127](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L109-L127)）：
+- 不同 recipe_id 的引用各自保留
+- 因此合并后：`recipe_references` 包含 R1 (`recipe_quantity=3, recipe_scale=3`) 和 R2 (`recipe_quantity=2, recipe_scale=2`)
+- 引用合计理论量：`3*3 + 2*2 = 13`，但 `quantity = 9`，**差距为 4**（与原误差一致）
+
+**结论**：跨食谱合并时，误差被**原样继承**到合并后的条目中，不会放大也不会缩小。后续对 R1 或 R2 的份数增减都会继续以错误的 `quantity` 为基础，而扣除时仍使用正确的 `recipe_decrement * recipe_quantity` 公式，使 `quantity` 越来越偏离真实值。
 
 备注合并逻辑：用 `" | "` 分隔符连接去重后的备注集合。
 
@@ -426,60 +547,75 @@ use_plural = self.quantity and self.quantity > 1
 
 ---
 
-## 八、未知单位 (Unknown Units) 的影响
+## 八、未知单位与边界情况的影响
 
-"未知单位"在此处指两类：
-1. **Pint 不认识的单位**：`uc.parse()` 返回原始字符串而非 `pint.Unit`（如自定义的 "pinch"、"dash"、"splash" 等计数类单位）
-2. **无标准化数据的单位**：`standard_quantity` 或 `standard_unit` 为 `None`（可能是用户创建时未配置，或本地化种子中无匹配）
+结合第 3.1 节的三级单位分类，"未知单位"在 Mealie 中实际对应 **T2（dimensionless）** 和 **T3（Pint 不认识且无标准化数据）** 两种情况：
+
+| 分类 | 典型代表 | Pint 识别 | `standard_unit` | 数据库中存在 |
+|------|---------|----------|----------------|-------------|
+| T1（已知） | cup, gram, pound | ✅ `pint.Unit` | ✅ 有 | ✅ |
+| T2（dimensionless） | 空字符串 / 无单位 | ✅ `pint.Unit`（量纲`{}`） | ❌ 无 | ✅（作为隐式状态） |
+| T3-A（种子但无换算） | pinch, dash, splash, serving, head, clove, can, bunch, pack, sprig | ❌ 返回字符串 | ❌ 无 | ✅（来自种子数据） |
+| T3-B（真正自定义） | 用户创建的 "handful"、"sprinkle" 等 | ❌ 返回字符串 | ❌ 无（除非手动配置） | ✅（用户创建） |
 
 ### 8.1 单位转换行为
 
-- `UnitConverter.can_convert()`：任一单位不被 Pint 识别时返回 `False`
-- `UnitConverter.convert()` / `merge()`：任一单位不被 Pint 识别时抛出 `UnitNotFound` 异常
-- `merge_quantity_and_unit()`：任一单位缺少标准化数据时抛出 `ValueError: "Both units must contain standardized unit data"`
+- `UnitConverter.can_convert()`：
+  - T1 + T1 且量纲兼容 → `True`
+  - T1 + T2 → `False`（无量纲与体积/质量不兼容）
+  - T2 + T2 → `True`（dimensionless 与自己兼容）
+  - 任何含 T3 → `False`（T3 返回字符串，非 `pint.Unit`，在 [`can_convert` L72](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/parser_services/parser_utils/unit_utils.py#L72) 被直接短路返回 False）
+- `UnitConverter.convert()` / `merge()`：任一单位为 T3 时抛出 `UnitNotFound` 异常
+- `merge_quantity_and_unit()`：任一单位缺少 `standard_quantity` 或 `standard_unit` 时抛出 `ValueError`
 
 ### 8.2 对显示 (Display) 的影响
 
-未知单位在前后端的显示行为如下：
+T2（无单位/dimensionless）与 T3（不认识）在前后端的显示行为：
 
 **后端 Schema 层**（[RecipeIngredientBase._format_*](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/schema/recipe/recipe_ingredient.py#L228-L323)）：
-- **数量格式**：`CreateIngredientUnit.fraction` 默认为 `True`，因此未知单位的数量默认按**分数**格式显示（如 `1 ½` 而非 `1.5`）。若用户手动将单位的 `fraction` 设为 `False`，则改为十进制显示
-- **单位名称**：直接使用单位对象的 `name` / `plural_name` / `abbreviation` / `plural_abbreviation`，是否使用缩写取决于 `use_abbreviation` 标志（默认 `False`）
-- **单复数**：`quantity > 1` 时尝试使用复数形式，若 `plural_name` 未设置则回退到单数 `name`
+- **数量格式**：`CreateIngredientUnit.fraction` 默认为 `True`，因此 T3 类单位（pinch、dash 等种子单位及用户自定义单位）的数量默认按**分数**格式显示。若单位对象不存在（T2 无单位），则走无单位分支，仍按分数格式化
+- **单位名称**：
+  - T3 类单位（有单位对象）：直接使用 `name` / `plural_name` / `abbreviation`，是否缩写取决于 `use_abbreviation`（默认 `False`）
+  - T2（无单位，`unit_id is None`）：单位名部分完全不显示（见 [_format_display L298](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/schema/recipe/recipe_ingredient.py#L298-L323)，`use_unit` 为 `False` 时 unit 传空字符串）
+- **单复数**：
+  - T3：`quantity > 1` 时使用复数形式，无 `plural_name` 则回退 `name`
+  - T2：不涉及
 
 **前端显示层**（[use-recipe-ingredients.ts](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/frontend/app/composables/recipes/use-recipe-ingredients.ts#L82-L143)）：
-- 同样根据 `unit.fraction` 决定分数/十进制显示（分数最大分母 10，十进制 3 位有效数字）
-- 单位名仅在 `quantity` 非零且存在时才显示（`unitName && quantity` 检查）
-- 若单位缺失（`unit` 为 `undefined`），则单位部分不显示
+- 同样按 `unit.fraction` 决定分数/十进制显示（分数分母最大 10，十进制 3 位有效数字）
+- 单位名仅在 `unitName && quantity` 同时为真时显示（[L131](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/frontend/app/composables/recipes/use-recipe-ingredients.ts#L131)），因此 T2（无 unit 对象）和零数量都不显示单位名
+- `ingredientToParserString` 中若 `!parsed.unit && !parsed.food` 会直接返回 `note`
 
 ### 8.3 对购物清单汇总 (Aggregation) 的影响
 
 [ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 中对单位的检查：
 
 ```python
-def can_merge(self, item1, item2) -> bool:
-    # ... food_id 必须相同，且都未勾选
-    if item1.unit_id != item2.unit_id:
-        # 如果单位不同，两个单位都必须有 standard_unit 且可换算
-        if not (item1_unit and item1_unit.standard_unit):
-            return False
-        if not (item2_unit and item2_unit.standard_unit):
-            return False
-        uc = UnitConverter()
-        if not uc.can_convert(item1_unit.standard_unit, item2_unit.standard_unit):
-            return False
+if item1.unit_id != item2.unit_id:
+    # 如果单位不同，两个单位都必须有 standard_unit 且可换算
+    if not (item1_unit and item1_unit.standard_unit):
+        return False
+    if not (item2_unit and item2_unit.standard_unit):
+        return False
+    uc = UnitConverter()
+    if not uc.can_convert(item1_unit.standard_unit, item2_unit.standard_unit):
+        return False
 ```
 
-不同场景的汇总结果：
+各分类的实际汇总结果对照：
 
-| 场景 | 能否合并 | 结果 |
-|------|---------|------|
-| 相同 `unit_id`（无论是否有标准化数据） | ✅ 可以 | 数量直接相加，单位不变 |
-| 不同 `unit_id`，**两者都有** `standard_unit` 且量纲兼容 | ✅ 可以 | 调用 `merge_quantity_and_unit` 换算合并 |
-| 不同 `unit_id`，**至少一方无** `standard_unit` | ❌ 不行 | 相同食材显示为两行独立条目 |
-| 不同 `unit_id`，都有 `standard_unit` 但量纲不兼容（如 cup vs pound） | ❌ 不行 | 相同食材显示为两行独立条目 |
+| 场景 | 能否合并 | 原因 | 结果 |
+|------|---------|------|------|
+| 相同 `unit_id`（无论 T1/T3-A/T3-B） | ✅ 可以 | `unit_id == unit_id` 跳过单位检查 | 数量直接相加，单位不变 |
+| 两个不同的 T1 单位，量纲兼容（如 cup + pint） | ✅ 可以 | 都有 `standard_unit`，且 Pint 可换算 | 调用 `merge_quantity_and_unit`，换算后智能合并 |
+| 两个不同的 T1 单位，量纲不兼容（cup + pound） | ❌ 不行 | `can_convert` 返回 False | 相同食材显示为两行 |
+| T1 + T3（任意子类型），不同 `unit_id` | ❌ 不行 | T3 无 `standard_unit`，在 L61-L64 被短路 | 相同食材显示为两行 |
+| T3-A + T3-A，不同 `unit_id`（如 pinch + dash） | ❌ 不行 | 都无 `standard_unit` | 相同食材显示为两行 |
+| T3-A + T3-B，不同 `unit_id`（如 pinch + handful） | ❌ 不行 | 都无 `standard_unit` | 相同食材显示为两行 |
+| T2（无单位，`unit_id=None`）+ T2，相同备注 | ✅ 可以 | 走备注完全相同分支 | 数量直接相加 |
+| T2（无单位，`unit_id=None`）+ T2，不同备注 | ❌ 不行 | 备注不同 | 相同食材显示为两行 |
 
-**典型案例**：用户创建了自定义单位 " handful "（无标准化数据），又创建了 "sprinkle"（也无标准化数据）。两者都用于同一种食材时，购物清单中会出现两条独立记录，无法自动合并。
+**典型案例**：一个食谱含有 "1 pinch salt" 和 "2 dashes salt"。两者 `food_id` 相同（盐），但 `unit_id` 不同（pinch vs dash），且两者都是 T3-A（无 `standard_unit`）。加入购物清单后会显示为两条独立记录，无法自动合并。
 
 ---
 
@@ -539,7 +675,7 @@ for to_ref in to_item.recipe_references:
     base_ref.recipe_scale += to_ref.recipe_scale
 ```
 
-此时 `quantity` 是两个条目的缩放后数量直接合并，而 `recipe_scale` 按 recipe_id 分别累加，两者保持一致。
+此时 `quantity` 是两个条目的缩放后数量直接合并，而 `recipe_scale` 按 recipe_id 分别累加。关于同食谱累加误差如何在跨食谱合并中传播的详细分析见 [6.2.4 节](#624-场景三跨食谱合并)。
 
 ---
 
@@ -565,12 +701,16 @@ for to_ref in to_item.recipe_references:
 
 | 场景 | 限制 / 行为 | 影响 |
 |------|------------|------|
-| 未知/自定义单位 | 无 `standard_unit` 则无法跨单位换算 | 购物清单中相同食材、不同未知单位会显示为多行；只有相同 `unit_id` 才能合并 |
-| 未知单位显示 | `fraction` 默认为 `True`，`use_abbreviation` 默认为 `False` | 数量默认以分数格式显示，单位默认使用全名而非缩写 |
-| 盎司歧义消除 | 仅在与体积单位合用时才自动转液盎司 | 纯盎司合并（如 8 oz + 1 lb）按重量处理；单独的盎司条目保持不变 |
-| 模糊匹配阈值 | 食材 85 / 单位 70 / 购物清单标签匹配 80 | 拼写差异过大可能匹配失败，需要手动纠正或添加别名 |
-| 非 ASCII 字符 | 规范化时使用 unidecode 转写 | 中文等表意文字转写后可能完全丢失语义，匹配严重依赖于用户创建的别名 |
-| 本地化种子缺失 | 缺失 locale 文件时自动回退英文 `en-US.json` | 英文单位名始终可匹配标准化；纯本地语言名在无对应 locale 种子时无法自动注入标准化 |
-| 同食谱重复食材累加 | 累加的是未缩放的 `ingredient.quantity` 而非已缩放的 `new_item.quantity` | 可能导致 `quantity` 字段值不准确；但 `recipe_quantity` 被正确累计，按份数增减时仍可用 `recipe_quantity * recipe_scale` |
-| 分数显示精度 | 最大分母 32（后端 `limit_denominator`）/ 10（前端 `frac`） | 某些精确小数无法以分数准确表示，会有舍入误差 |
-| 未勾选合并约束 | 已勾选 (`checked=true`) 的条目永不参与合并 | 购物清单中手动勾选过的相同食材会保持为独立行 |
+| **T3 级单位（pinch/dash/splash/serving 等）** | Pint 不认识，无 `standard_unit`，种子数据中落入 `case _: pass` | 不同 T3 单位间**无法跨单位换算/合并**；同食材但不同 T3 单位（如 pinch vs dash）在购物清单中显示为多行；只有相同 `unit_id` 才能合并 |
+| **T2 dimensionless vs T3 未定义单位** | T2 是合法的 `pint.Unit`（量纲 `{}`），T3 是非 Unit 字符串 | T2 与自己兼容（`can_convert(T2, T2)=True`），但 T3 与任何单位（包括自己）都不兼容（非 Unit 提前短路返回 False） |
+| **T3 单位显示** | `fraction` 默认为 `True`，`use_abbreviation` 默认为 `False` | 数量默认以分数格式显示，单位默认使用全名而非缩写 |
+| **盎司歧义消除** | 仅在与体积单位合用时才自动转液盎司 | 纯盎司合并（如 8 oz + 1 lb）按重量处理；单独的盎司条目保持不变 |
+| **模糊匹配阈值** | 食材 85 / 单位 70 / 购物清单标签匹配 80 | 拼写差异过大可能匹配失败，需要手动纠正或添加别名 |
+| **非 ASCII 字符** | 规范化时使用 unidecode 转写 | 中文等表意文字转写后可能完全丢失语义，匹配严重依赖于用户创建的别名 |
+| **本地化种子缺失** | 缺失 locale 文件时自动回退英文 `en-US.json` | 英文单位名始终可匹配标准化；纯本地语言名在无对应 locale 种子时无法自动注入标准化 |
+| **同食谱重复食材累加误差** | 累加的是未缩放的 `ingredient.quantity` 而非已缩放的 `new_item.quantity` | `quantity` 字段值偏小，但 `recipe_quantity` 被正确累计 |
+| **减少份数时误差延续** | 扣除使用正确公式 `recipe_decrement * recipe_quantity`，但基数 `quantity` 已有误差 | `quantity` 可能提前变负；减到 0 之前条目就可能因 `quantity < 0` 被误删（连同其他食谱引用一起） |
+| **引用删除判定** | `quantity < 0` 时无条件删除 | 有累加误差的条目在减份时可能提前触发此条件，导致仍有有效引用时条目被删除 |
+| **跨食谱合并误差传播** | 数量直接按 `quantity` 字段合并，误差原样继承 | 误差不会放大也不会缩小，但后续对任一食谱的份数增减会让 `quantity` 进一步偏离 |
+| **分数显示精度** | 最大分母 32（后端 `limit_denominator`）/ 10（前端 `frac`） | 某些精确小数无法以分数准确表示，会有舍入误差 |
+| **已勾选条目** | `checked=true` 的条目永不参与合并 | 购物清单中手动勾选过的相同食材会保持为独立行 |
