@@ -14,30 +14,37 @@ Mealie 的通知系统采用**事件总线（Event Bus）**架构，由以下核
   - `ApprisePublisher`：通过 Apprise 库发送多渠道通知
 - **调度器** (`SchedulerService`)：定时触发 webhook 任务
 
-关键文件目录：
+关键文件（仓库相对路径）：
 
 ```
-mealie/services/event_bus_service/        # 事件总线核心
-mealie/services/scheduler/                # 定时调度服务
-mealie/schema/household/webhook.py        # Webhook Schema
-mealie/schema/household/group_events.py   # 通知偏好 Schema
-mealie/db/models/household/webhooks.py    # Webhook 数据库模型
-mealie/db/models/household/events.py      # 通知器数据库模型
-mealie/routes/households/controller_webhooks.py
-mealie/routes/households/controller_group_notifications.py
+mealie/services/event_bus_service/event_types.py          # 事件类型、Event 数据结构
+mealie/services/event_bus_service/event_bus_service.py    # EventBusService 事件分发
+mealie/services/event_bus_service/event_bus_listeners.py  # WebhookEventListener、AppriseEventListener
+mealie/services/event_bus_service/publisher.py            # WebhookPublisher、ApprisePublisher
+mealie/services/scheduler/scheduler_service.py            # SchedulerService 及调度循环
+mealie/services/scheduler/scheduler_registry.py           # 调度任务注册表
+mealie/services/scheduler/tasks/post_webhooks.py          # Webhook 定时任务入口
+mealie/schema/household/webhook.py                        # Webhook Schema
+mealie/schema/household/group_events.py                   # 通知器偏好 Schema
+mealie/db/models/household/webhooks.py                    # GroupWebhooksModel
+mealie/db/models/household/events.py                      # GroupEventNotifierModel / OptionsModel
+mealie/routes/households/controller_webhooks.py           # Webhook REST 接口
+mealie/routes/households/controller_group_notifications.py # Apprise 通知器 REST 接口
+mealie/routes/users/registration.py                       # 用户注册事件触发点示例
+mealie/app.py                                              # 调度任务注册
 ```
 
 ---
 
 ## 二、业务事件类型定义
 
-所有业务事件定义在 [event_types.py](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_types.py#L13-L60) 的 `EventTypes` 枚举类中：
+所有业务事件定义在 `mealie/services/event_bus_service/event_types.py` 的 `EventTypes` 枚举类中。
 
-### 内部事件（不可订阅）
+### 内部事件（不可通过 Apprise 偏好订阅）
 | 事件名 | 说明 |
 |--------|------|
-| `test_message` | 测试消息，用于手动触发测试 |
-| `webhook_task` | Webhook 定时调度任务 |
+| `test_message` | 测试消息，仅用于手动触发测试接口 |
+| `webhook_task` | Webhook 定时调度任务，仅由 `post_group_webhooks` 派发 |
 
 ### 可订阅业务事件
 
@@ -59,30 +66,30 @@ mealie/routes/households/controller_group_notifications.py
 **食谱集相关：**
 - `cookbook_created` / `cookbook_updated` / `cookbook_deleted`
 
-**标签/分类/标记：**
+**标签 / 分类 / 标记：**
 - `tag_created` / `tag_updated` / `tag_deleted`
 - `category_created` / `category_updated` / `category_deleted`
 - `label_created` / `label_updated` / `label_deleted`
 
 ### 事件数据结构
 
-事件消息统一封装为 `Event` 类 ([event_types.py:194-207](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_types.py#L194-L207))：
+事件消息统一封装为 `Event` 类（`event_types.py`），在构造时自动生成 `event_id`（UUID）和 `timestamp`（UTC 时间）：
 
 ```python
 class Event(MealieModel):
-    message: EventBusMessage          # 标题和正文
-    event_type: EventTypes            # 事件类型枚举
-    integration_id: str               # 触发来源标识
+    message: EventBusMessage              # 标题和正文
+    event_type: EventTypes                # 事件类型枚举
+    integration_id: str                   # 触发来源标识（如 "registration"、"mealie_generic_user"）
     document_data: EventDocumentDataBase  # 业务数据（多态）
-    event_id: UUID4 | None = None     # 自动生成的事件唯一ID
-    timestamp: datetime | None = None # 自动生成的时间戳
+    event_id: UUID4 | None = None         # 实例化时自动生成
+    timestamp: datetime | None = None     # 实例化时自动生成
 ```
 
-不同事件类型携带不同的 `document_data`（均继承自 `EventDocumentDataBase`），例如：
+不同事件类型携带不同的 `document_data`（均继承自 `EventDocumentDataBase`，带有 `document_type` 和 `operation` 字段），例如：
 - `EventUserSignupData`：用户名、邮箱
 - `EventRecipeData`：食谱 slug
 - `EventMealplanData`：饮食计划 ID、日期、食谱信息
-- `EventWebhookData`：Webhook 时间窗口和请求体
+- `EventWebhookData`：Webhook 时间窗口 `webhook_start_dt` / `webhook_end_dt` 及待发送的 `webhook_body`
 
 ---
 
@@ -92,9 +99,9 @@ class Event(MealieModel):
 
 ### 3.1 Webhook 订阅过滤
 
-Webhook 订阅存储在 `webhook_urls` 表中，对应 [GroupWebhooksModel](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/db/models/household/webhooks.py#L16-L40)。
+Webhook 订阅存储在 `webhook_urls` 表中，对应 `mealie/db/models/household/webhooks.py` 的 `GroupWebhooksModel`。
 
-过滤逻辑位于 [WebhookEventListener.get_scheduled_webhooks()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L169-L179)：
+过滤逻辑位于 `WebhookEventListener.get_scheduled_webhooks()`（`mealie/services/event_bus_service/event_bus_listeners.py`）：
 
 ```python
 stmt = select(GroupWebhooksModel).where(
@@ -108,17 +115,17 @@ stmt = select(GroupWebhooksModel).where(
 
 过滤维度：
 1. **启用状态**：`enabled` 必须为 `True`
-2. **时间窗口**：`scheduled_time` 必须落在 `(start_dt, end_dt]` 区间内（注意左开右闭）
-3. **组织隔离**：`group_id` 和 `household_id` 必须匹配
-4. **事件类型过滤**：`get_subscribers()` 首先检查 `event.event_type == EventTypes.webhook_task`，非 webhook 任务直接返回空列表
+2. **时间窗口**：`scheduled_time` 必须落在 `(start_dt, end_dt]` 区间内（**左开右闭**）
+3. **组织隔离**：`group_id` 和 `household_id` 必须匹配当前监听器上下文
+4. **事件类型前置过滤**：`WebhookEventListener.get_subscribers()` 首先检查 `event.event_type == EventTypes.webhook_task`，非 webhook 任务事件直接返回空列表
 
 ### 3.2 Apprise 通知订阅过滤
 
 Apprise 通知订阅存储在两张关联表中：
-- `group_events_notifiers`：通知器基本信息（名称、Apprise URL、启用状态）
-- `group_events_notifier_options`：每种事件类型的订阅开关（一对一关联）
+- `group_events_notifiers`：通知器基本信息（名称、`apprise_url`、启用状态、所属 group/household）
+- `group_events_notifier_options`：每种事件类型的订阅开关（与通知器一对一关联）
 
-过滤逻辑位于 [AppriseEventListener.get_subscribers()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L76-L85)：
+过滤逻辑位于 `AppriseEventListener.get_subscribers()`（`event_bus_listeners.py`）：
 
 ```python
 notifiers = repos.group_event_notifier.multi_query(
@@ -129,8 +136,10 @@ urls = [notifier.apprise_url for notifier in notifiers if getattr(notifier.optio
 
 过滤维度：
 1. **启用状态**：通知器本身 `enabled == True`
-2. **事件偏好**：`notifier.options.<event_type_name>` 必须为 `True`（动态反射获取）
-3. **组织隔离**：通过 `repos` 的 `group_id` / `household_id` 作用域隐式过滤
+2. **事件偏好开关**：`notifier.options.<event_type_name>` 必须为 `True`（通过 `getattr` 动态反射读取，与 `EventTypes` 枚举名一一对应）
+3. **组织隔离**：通过 `repos` 构造时传入的 `group_id` / `household_id` 作用域隐式过滤
+
+此外，对于 `form` / `forms` / `json` / `jsons` / `xml` / `xmls` 开头的"自定义 URL"，`AppriseEventListener.update_urls_with_event_data()` 会把事件元数据（`event_type`、`integration_id`、`document_data`、`event_id`、`timestamp`）以 `:<key>=<value>` 的形式追加到 URL query 参数中，注入到 Apprise 的自定义 payload 里。
 
 ---
 
@@ -138,29 +147,28 @@ urls = [notifier.apprise_url for notifier in notifiers if getattr(notifier.optio
 
 ### 4.1 统一发送入口：EventBusService.dispatch()
 
-所有事件的派发入口是 [EventBusService.dispatch()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_service.py#L66-L96)：
+所有事件的派发入口是 `EventBusService.dispatch()`（`mealie/services/event_bus_service/event_bus_service.py`）：
 
 ```python
 def dispatch(self, integration_id, group_id, household_id, event_type, document_data, message=""):
     event = Event(...)  # 自动生成 event_id 和 timestamp
 
-    # 确定目标 household 列表
     if not household_id:
-        # 查询该 group 下所有 household
+        # 查询该 group 下所有 household，广播到每个 household
         household_ids = [...]
     else:
         household_ids = [household_id]
 
     for household_id in household_ids:
         if self.bg:
-            # FastAPI 请求上下文中，放入后台任务异步发送
+            # FastAPI 请求上下文中，放入 BackgroundTasks 异步发送
             self.bg.add_task(self._publish_event, event=event, ...)
         else:
             # 调度任务等无请求上下文场景，同步发送
             self._publish_event(event, group_id, household_id)
 ```
 
-`_publish_event()` 遍历所有监听器：
+`_publish_event()` 遍历所有监听器，按需调用：
 
 ```python
 def _publish_event(self, event, group_id, household_id):
@@ -169,49 +177,53 @@ def _publish_event(self, event, group_id, household_id):
             listener.publish_to_subscribers(event, subscribers)
 ```
 
+监听器列表固定为 `[AppriseEventListener, WebhookEventListener]`。
+
 ### 4.2 Webhook 定时触发流程
 
-Webhook 采用**定时调度**模式，而非事件即时触发：
+Webhook 采用**定时调度**模式，而非业务事件即时触发：
 
-1. **调度注册**：在 [app.py](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/app.py#L134-L136) 中将 `post_group_webhooks` 注册为**每 5 分钟**执行一次：
+1. **调度注册**：在 `mealie/app.py` 的 `start_scheduler()` 中将 `post_group_webhooks` 注册为**每 5 分钟**执行一次：
    ```python
    SchedulerRegistry.register_minutely(tasks.post_group_webhooks)
    ```
 
-2. **调度器执行**：[SchedulerService](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/scheduler/scheduler_service.py) 通过 `repeat_every` 装饰器驱动 `run_minutely()`，每 5 分钟遍历注册表中的回调。
+2. **调度器执行**：`SchedulerService` 通过 `@repeat_every(minutes=5)` 装饰的 `run_minutely()` 每 5 分钟遍历 `SchedulerRegistry._minutely` 中的回调。每个回调由 `_scheduled_task_wrapper` 包裹，确保异常不会中断调度循环。
 
-3. **任务入口**：[post_group_webhooks()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/scheduler/tasks/post_webhooks.py#L24-L79)：
-   - 维护全局变量 `last_ran` 记录上次运行时间
-   - 计算时间窗口 `[start_dt, end_dt]`（即 `[last_ran, now]`）
-   - 遍历所有 group → household，向每个 household 的事件总线派发 `EventTypes.webhook_task` 事件
-   - 事件携带 `EventWebhookData`，包含时间窗口信息
+3. **任务入口**：`post_group_webhooks()`（`mealie/services/scheduler/tasks/post_webhooks.py`）：
+   - 维护模块级全局变量 `last_ran` 记录上次运行时间
+   - 计算本次时间窗口：`start_dt = last_ran`，`end_dt = datetime.now(UTC)`，然后 `last_ran = end_dt`
+   - 遍历所有 group → 遍历该 group 的所有 household，对每个 household 创建 `EventBusService` 并派发一个 `EventTypes.webhook_task` 事件
+   - 事件的 `document_data` 为 `EventWebhookData`，携带 `document_type=mealplan` 和本次时间窗口
 
-4. **监听器处理**：[WebhookEventListener](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L134-L179)：
-   - `get_subscribers()`：根据时间窗口查询符合条件的 webhook
-   - `publish_to_subscribers()`：根据 `document_type` 组装数据（当前仅支持 `mealplan`，即查询时间范围内的饮食计划），然后调用 `WebhookPublisher.publish()`
+4. **监听器处理**：`WebhookEventListener`（`event_bus_listeners.py`）：
+   - `get_subscribers()`：仅处理 `webhook_task` 事件，按时间窗口 + enabled + group/household 查询数据库
+   - `publish_to_subscribers()`：对 `EventDocumentType.mealplan` 查询时间范围内的饮食计划填充到 `webhook_body`；若 `webhook_body` 非空，则调用 `WebhookPublisher.publish(event, [webhook.url, ...])`
 
 ### 4.3 Apprise 即时触发流程
 
-Apprise 通知是**事件即时触发**模式，典型触发点：
+Apprise 通知是**业务事件即时触发**模式，典型触发点：
 
-- **用户注册**：[registration.py:38](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/routes/users/registration.py#L38) 派发 `user_signup` 事件
+- **用户注册**：`mealie/routes/users/registration.py` 注册成功后派发 `user_signup` 事件，附带 `EventUserSignupData`
 - **CRUD 操作**：通过 `BaseUserController.dispatch_event()` 统一派发食谱、标签等实体的创建/更新/删除事件
+- **所有 dispatch 均走 EventBusService.dispatch()**
 
-[AppriseEventListener.publish_to_subscribers()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L87-L88) 直接将 URL 列表交给 `ApprisePublisher`。
+`AppriseEventListener.publish_to_subscribers()` 直接把 URL 列表交给 `ApprisePublisher`。
 
 ### 4.4 手动测试入口
 
-- **Webhook 测试**：`POST /households/webhooks/{item_id}/test` → `post_test_webhook()`，直接构造事件并发布
-- **Apprise 测试**：`POST /households/events/notifications/{item_id}/test` → 直接调用 `AppriseEventListener.publish_to_subscribers()`
+- **Webhook 测试**：`POST /households/webhooks/{item_id}/test` → `post_test_webhook(webhook, message)`，直接构造一个 `test_message` 事件并调用 `WebhookEventListener.publish_to_subscribers()`
+- **Apprise 测试**：`POST /households/events/notifications/{item_id}/test` → 直接构造 `test_message` 事件并调用 `AppriseEventListener.publish_to_subscribers()`
 
 ---
 
-## 五、失败重试与重复发送防护
+## 五、失败处理与重复发送防护
 
 ### 5.1 失败处理
 
-#### Webhook 失败处理
-[WebhookPublisher.publish()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_service/publisher.py#L40-L49)：
+#### WebhookPublisher 的分层失败行为
+
+`WebhookPublisher.publish()` 位于 `mealie/services/event_bus_service/publisher.py`：
 
 ```python
 def publish(self, event: Event, notification_urls: list[str]):
@@ -222,15 +234,23 @@ def publish(self, event: Event, notification_urls: list[str]):
             r.raise_for_status()
 ```
 
-- 默认情况下（`hard_fail=False`），HTTP 请求失败会被**静默忽略**，无任何重试或持久化记录
-- 仅测试场景设置 `hard_fail=True` 抛出异常
-- 请求超时固定为 **15 秒**
+按失败类型区分：
 
-#### Apprise 失败处理
-[ApprisePublisher.publish()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_service/publisher.py#L14-L37) 依赖 Apprise 库自身的错误处理，异步模式下失败不会阻塞。
+| 失败类型 | `hard_fail=False`（默认） | `hard_fail=True`（仅测试） |
+|---------|-------------------------|--------------------------|
+| **HTTP 非 2xx 响应**（4xx / 5xx） | `requests.post()` 默认不会对状态码抛异常；代码未调用 `r.raise_for_status()` → **静默忽略**，继续下一个 URL | 调用 `r.raise_for_status()` → 抛出 `HTTPError` |
+| **网络异常**（DNS 失败、连接拒绝、TLS 错误等） | `requests.post()` 直接抛出 `ConnectionError` 等 → **向上冒泡** | 同样向上冒泡 |
+| **超时**（超过 15 秒） | `requests.post()` 抛出 `Timeout` → **向上冒泡** | 同样向上冒泡 |
+
+默认场景下 `hard_fail=False`，Webhook 只对网络异常和超时抛异常，HTTP 业务错误码会被吞掉。
+
+#### ApprisePublisher 的失败行为
+
+`ApprisePublisher`（`publisher.py`）以 `async_mode=True` 初始化 Apprise，调用 `self.apprise.notify()` 后立即返回；所有异步发送的错误由 Apprise 库内部处理，不冒泡到调用方。仅当 `hard_fail=True` 时，添加 URL 失败才会抛出异常。
 
 #### 调度任务级别的异常捕获
-调度器对每个任务函数有统一的异常包装 ([scheduler_service.py:56-60](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/scheduler/scheduler_service.py#L56-L60))：
+
+调度器对每个回调有统一包装（`mealie/services/scheduler/scheduler_service.py`）：
 
 ```python
 def _scheduled_task_wrapper(callable):
@@ -240,27 +260,37 @@ def _scheduled_task_wrapper(callable):
         logger.error("Error in scheduled task func='%s': exception='%s'", callable.__name__, e)
 ```
 
-任务异常仅记录日志，不会中断调度器，也不会重试当前批次。
+因此 Webhook 中冒泡的网络异常/超时最终只会记录一条 ERROR 日志，**不会中断后续调度**。
+
+#### 关于自动重试
+
+**整个通知链路没有任何自动重试机制**：
+- `WebhookPublisher` 和 `ApprisePublisher` 内部均无 retry 逻辑
+- 调度器不会对失败的批次进行回滚或重放（`post_group_webhooks` 的 `last_ran` 在执行开始即被推进到 `now`）
+- 没有持久化的"待发送 / 失败"事件表
+- Webhook 可以通过 `POST /households/webhooks/rerun` 手动重跑当日（从 00:00 起）的调度，但这不是自动行为
 
 ### 5.2 重复发送防护
 
 #### Apprise 侧：基于 event_id 的 tag 去重
-[ApprisePublisher.publish()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_service/publisher.py#L26-L37)：
+
+`ApprisePublisher.publish()` 中：
 
 ```python
 tags = []
 for dest in notification_urls:
-    tag = str(event.event_id)  # 使用事件唯一ID作为tag
+    tag = str(event.event_id)   # 使用事件唯一 UUID 作 tag
     tags.append(tag)
     self.apprise.add(dest, tag=tag)
 
 self.apprise.notify(title=..., body=..., tag=tags)
 ```
 
-每个 URL 在添加时绑定当前事件的 `event_id` 作为 tag，通知时按 tag 匹配，确保**同一个事件对同一个 URL 只触发一次**。
+每个 URL 在添加时绑定当前事件的 `event_id` 作为 tag，`notify()` 按 tag 匹配目标，确保**同一个 `Event` 对象对同一个 URL 只触发一次**（在 Apprise 内部不去重的前提下）。
 
 #### Webhook 侧：基于时间窗口的调度去重
-[post_group_webhooks()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/scheduler/tasks/post_webhooks.py#L21-L35) 维护全局 `last_ran` 变量：
+
+`post_group_webhooks()` 通过模块级 `last_ran` 维护相邻两次执行的窗口：
 
 ```python
 last_ran = datetime.now(UTC)
@@ -269,51 +299,47 @@ def post_group_webhooks(start_dt=None, ...):
     global last_ran
     start_dt = start_dt or last_ran
     last_ran = end_dt = datetime.now(UTC)
-    # 查询 scheduled_time > start_dt.time() AND <= end_dt.time()
+    # SQL: scheduled_time > start_dt.time() AND scheduled_time <= end_dt.time()
 ```
 
-机制分析：
-- 正常调度时，相邻两次执行的时间窗口 `(start_dt, end_dt]` 是**连续且不重叠**的
-- 配合数据库查询条件 `scheduled_time > start_dt AND scheduled_time <= end_dt`，理论上每个 `scheduled_time` 只会命中一次
-- **注意**：如果服务重启导致 `last_ran` 重置为启动时间，距离上次执行期间的 webhook 将被跳过（但提供了 `/households/webhooks/rerun` 接口手动重跑当日所有 webhook）
-- Webhook 请求层面**没有幂等性保护**，如需去重需接收方自行使用 `event_id` 字段判断
+- 正常运行时，相邻窗口 `(start_dt, end_dt]` 是**连续且不重叠**的，配合左开右闭查询，理论上每个 `scheduled_time` 在服务不重启的前提下**只会命中一次**
+- 如果服务重启，`last_ran` 被重置为启动时间，重启期间错过的窗口将被跳过（可调用 `/households/webhooks/rerun` 手动补跑当日）
+- **HTTP 请求层面没有幂等性保护**：同一个 Webhook URL 如果因并发或手动重跑而被多次命中，会收到多个请求。接收方如需去重，可使用 `event.event_id` 字段自行判断
 
 ---
 
 ## 六、签名校验实现
 
-### 当前实现状态
+### 核准结论：当前版本没有实现签名校验
 
-经过代码审查，**当前版本的 Webhook 发送不包含任何签名校验机制**。
+经过对以下文件的逐行审查：
+- `mealie/services/event_bus_service/publisher.py` — `WebhookPublisher` 和 `ApprisePublisher` 的完整实现
+- `mealie/db/models/household/webhooks.py` — `GroupWebhooksModel` 的全部字段
+- `mealie/schema/household/webhook.py` — Webhook 入参 / 出参 Schema
 
-[WebhookPublisher.publish()](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_service/publisher.py#L40-L49) 的完整实现：
+最终确认：**当前代码中不存在任何 Webhook 或 Apprise 通知的签名 / HMAC 校验机制。**
 
-```python
-class WebhookPublisher:
-    def __init__(self, hard_fail=False) -> None:
-        self.hard_fail = hard_fail
+#### 证据摘要
 
-    def publish(self, event: Event, notification_urls: list[str]):
-        event_payload = jsonable_encoder(event)
-        for url in notification_urls:
-            r = requests.post(url, json=event_payload, timeout=15)
-            if self.hard_fail:
-                r.raise_for_status()
-```
+1. `WebhookPublisher.publish()` 只做一件事：
+   ```python
+   r = requests.post(url, json=event_payload, timeout=15)
+   ```
+   没有构造 `X-Signature`、`X-Mealie-Signature` 等请求头，也没有对 body 做哈希。请求头仅包含 `requests` 默认的 `Content-Type: application/json` 等标准头。
 
-相关观察：
-- `GroupWebhooksModel` 数据模型中**没有 `secret` 或类似密钥字段**
-- HTTP 请求头中**没有添加 `X-Signature`、`X-Mealie-Signature` 等认证头**
-- 整个请求仅使用标准的 `Content-Type: application/json`，无额外安全头
-- 虽然 [event_bus_service.py](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/services/event_bus_service/event_bus_service.py#L18) 中定义了 `ALGORITHM = "HS256"` 常量，但该文件中并无实际使用，可能是为未来签名功能预留
+2. `GroupWebhooksModel` 中没有 `secret`、`api_key`、`signing_key` 或任何类似字段；Schema `CreateWebhook` / `SaveWebhook` 也无对应字段，意味着用户无法在创建 Webhook 时配置签名密钥。
 
-### 接收方可利用的字段
+3. `event_bus_service.py` 中虽然定义了 `ALGORITHM = "HS256"` 常量，但该常量在整个文件及其他文件中均未被引用，属于未使用的死代码，不代表签名功能已经落地。
 
-尽管没有官方签名，接收方仍可利用以下字段进行基础校验：
-- `event.event_id`：UUID，可用于幂等判断
-- `event.timestamp`：事件创建时间，可用于判断时效性
+4. Apprise 通知同样不做签名，其认证信息完全由用户在 `apprise_url` 里自行配置（例如 `json://token@host/path`）。
+
+### 接收方可利用的替代校验字段
+
+尽管没有官方签名，Webhook 接收方仍可利用以下字段做基础校验：
+- `event.event_id`：每个事件唯一的 UUID，可用于幂等判断
+- `event.timestamp`：事件创建时间，可用于判断请求时效性（防重放）
 - `event.integration_id`：事件来源标识
-- Webhook URL 本身可包含 Secret Query 参数（由用户自行配置）
+- 在 Webhook URL 中自行携带 secret query 参数（例如 `https://example.com/hook?secret=xxx`），由接收方校验
 
 ---
 
@@ -321,78 +347,102 @@ class WebhookPublisher:
 
 ### 7.1 Webhook 用户偏好
 
-Webhook 配置项 ([CreateWebhook](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/schema/household/webhook.py#L16-L48))：
+Webhook 的 Schema 定义在 `mealie/schema/household/webhook.py`，对通知发送的影响如下：
 
-| 字段 | 类型 | 说明 | 对发送的影响 |
-|------|------|------|-------------|
-| `enabled` | bool | 是否启用 | `False` 时该 webhook 被完全过滤 |
-| `name` | str | 显示名称 | 不影响发送 |
-| `url` | str | 目标地址 | 直接决定 POST 目标 |
-| `webhook_type` | WebhookType | webhook 类型 | 当前仅支持 `mealplan`，决定请求体内容类型 |
-| `scheduled_time` | time | 触发时间（UTC） | 决定该 webhook 被哪一次调度窗口命中 |
+| 字段 | 类型 | 对发送的影响 |
+|------|------|-------------|
+| `enabled` | bool | 是否启用；`False` 时在 SQL 查询层面被完全过滤，永不触发 |
+| `name` | str | 仅作显示名，不参与发送逻辑 |
+| `url` | str | 直接作为 `requests.post()` 的目标 URL |
+| `webhook_type` | WebhookType (StrEnum) | 当前仅定义了 `mealplan` 一个值；实际决定请求体内容的是 `EventWebhookData.document_type`，`WebhookEventListener.publish_to_subscribers()` 用 match 语句匹配该字段来决定是否查询饮食计划 |
+| `scheduled_time` | time (UTC) | 核心调度参数；必须落在某次 `post_group_webhooks()` 执行窗口 `(start_dt, end_dt]` 内才会被选中；精度为时间（不含日期），即每天在该 UTC 时间触发一次 |
 
-Webhook 偏好配置的 REST 接口在 [controller_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/routes/households/controller_webhooks.py)。
+Webhook 偏好的 REST 接口位于 `mealie/routes/households/controller_webhooks.py`：
+- `GET/POST /households/webhooks`
+- `GET/PUT/DELETE /households/webhooks/{item_id}`
+- `POST /households/webhooks/rerun` — 重跑当日全部窗口
+- `POST /households/webhooks/{item_id}/test` — 发送测试请求
 
 ### 7.2 Apprise 通知用户偏好
 
-Apprise 通知配置 ([GroupEventNotifierSave](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/schema/household/group_events.py#L75-L79))：
+Apprise 通知偏好定义在 `mealie/schema/household/group_events.py`，分为**通知器级**和**选项级**两层。
 
 | 层级 | 字段 | 对发送的影响 |
 |------|------|-------------|
-| 通知器级 | `enabled` | `False` 时该通知器所有事件均不发送 |
-| 通知器级 | `apprise_url` | 决定通知渠道（邮件、Slack、Telegram 等） |
-| 选项级（`options`） | `<event_type_name>: bool` | 每种事件类型独立开关，`True` 才会发送对应事件 |
+| 通知器级 | `enabled` | 是否启用；`False` 时在查询层被过滤，该通知器下所有事件永不发送 |
+| 通知器级 | `apprise_url` | Apprise 协议 URL，直接决定通知渠道（邮件、Slack、Telegram、Webhook 等）和认证凭据；该字段在对外 API 响应中始终被隐藏（`GroupEventNotifierOut` 不含，仅 `GroupEventNotifierPrivate` 含） |
+| 选项级 `options` | `<event_type_name>: bool` | 与 `EventTypes` 枚举名一一对应的布尔字段，默认全部 `False`；通过 `getattr(notifier.options, event.event_type.name)` 动态读取，只有对应开关为 `True` 的事件才会推送到该通知器 |
+| 选项级 `options` | `test_message` / `webhook_task` | 同样存在于 Options 中，但默认 `False`；主要用于手动测试接口，一般不会在真实通知中触发 |
 
-`options` 是 [GroupEventNotifierOptions](file:///d:/fz/0601/solo-dogfeeding/code/82-mealie/mealie/schema/household/group_events.py#L13-L54)，包含与 `EventTypes` 一一对应的布尔字段，默认全部 `False`。
-
-**核心过滤逻辑**（动态反射）：
+核心过滤逻辑（`AppriseEventListener.get_subscribers()`）：
 ```python
-urls = [notifier.apprise_url for notifier in notifiers 
+urls = [notifier.apprise_url for notifier in notifiers
         if getattr(notifier.options, event.event_type.name)]
 ```
 
-即：当且仅当 `notifier.options[event.event_type.name] == True` 时，该通知器才会收到该事件的通知。
+Apprise 通知偏好的 REST 接口位于 `mealie/routes/households/controller_group_notifications.py`：
+- `GET/POST /households/events/notifications`
+- `GET/PUT/DELETE /households/events/notifications/{item_id}`
+- `POST /households/events/notifications/{item_id}/test`
 
-### 7.3 两种通知方式的对比
+### 7.3 两种通知方式的偏好对比
 
-| 特性 | Webhook | Apprise 通知 |
-|------|---------|-------------|
-| 触发时机 | 定时（每 5 分钟检查一次） | 即时（业务事件发生时） |
-| 过滤粒度 | 按时间窗口 + 启用状态 | 按事件类型逐个开关 |
-| 数据内容 | 批量数据（时间范围内的饮食计划） | 单事件数据 |
-| 支持事件类型 | 仅 mealplan（当前） | 所有业务事件类型 |
-| 配置入口 | `/households/webhooks` | `/households/events/notifications` |
+| 偏好维度 | Webhook | Apprise 通知 |
+|---------|---------|-------------|
+| 总开关 | `enabled`（Webhook 级） | `enabled`（通知器级） |
+| 事件粒度过滤 | 无（只受时间窗口控制，只支持 mealplan） | 每种 `EventTypes` 独立开关（默认全关） |
+| 目标地址 | 单一 `url` 字段 | `apprise_url`，由 Apprise 协议解析 |
+| 触发时机偏好 | `scheduled_time`（每天某 UTC 时间） | 无（即时触发） |
+| 请求内容偏好 | 由 `webhook_type` / `document_type` 隐式决定 | 自定义 URL 会自动注入事件元数据 query 参数 |
+| 凭据/安全 | 无内置签名，依赖 URL 本身携带 | 依赖 `apprise_url` 内的凭据 |
 
 ---
 
 ## 八、完整调用流程图
 
 ```
-业务代码 (e.g. 用户注册、CRUD)
-    │
-    ▼
-EventBusService.dispatch(event_type, document_data, ...)
-    │
-    ├─► 在 HTTP 请求上下文?
-    │      ├─ 是 → FastAPI BackgroundTasks.add_task (异步)
-    │      └─ 否 → 直接调用 (同步，如调度任务)
-    │
-    ▼
-EventBusService._publish_event(event, group_id, household_id)
-    │
-    ├─► AppriseEventListener
-    │       ├─ get_subscribers(event)
-    │       │     └─ 查询 enabled=True 的通知器，过滤 options.<event_type>==True
-    │       └─ publish_to_subscribers(event, urls)
-    │             └─ ApprisePublisher.publish()
-    │                    └─ 按 event_id tag 去重，调用 Apprise 库发送
-    │
-    └─► WebhookEventListener
-            ├─ get_subscribers(event)
-            │     └─ 仅处理 webhook_task 事件
-            │           └─ 按时间窗口 + group/household + enabled 查询
-            └─ publish_to_subscribers(event, webhooks)
-                  ├─ 根据 document_type 组装 body (mealplan → 查询饮食计划)
-                  └─ WebhookPublisher.publish()
-                        └─ requests.post(url, json=event, timeout=15)
+                         业务代码 (用户注册 / CRUD / 定时任务)
+                                       │
+                                       ▼
+                    EventBusService.dispatch(integration_id, group_id,
+                         household_id, event_type, document_data)
+                                       │
+             ┌─────────────────────────┴─────────────────────────┐
+             │                                                   │
+  HTTP 请求上下文 (bg != None)                        其他上下文 (调度任务等)
+             │                                                   │
+  FastAPI BackgroundTasks.add_task (异步)          直接同步调用 _publish_event
+             │                                                   │
+             └─────────────────────┬─────────────────────────────┘
+                                   ▼
+          EventBusService._publish_event(event, group_id, household_id)
+                                   │
+              ┌────────────────────┴────────────────────┐
+              ▼                                         ▼
+   AppriseEventListener                       WebhookEventListener
+              │                                         │
+  get_subscribers(event)                    get_subscribers(event)
+     │                                           │
+     │  enabled=True AND                         │  event_type == webhook_task ?
+     │  options.<event_type>=True                │      ├─ 否 → 返回 []
+     │                                           │      └─ 是 → 查询 webhook_urls:
+     ▼                                           │             enabled=True,
+  publish_to_subscribers(event, urls)            │             scheduled_time in (start,end],
+     │                                           │             group/household match
+     ▼                                           │
+  ApprisePublisher.publish()                     ▼
+     │                                  publish_to_subscribers(event, webhooks)
+     │  对每个 URL 添加 tag=event_id                   │
+     │  apprise.notify(tag=tags)                       │  match document_type:
+     │                                                 │    mealplan → 查询饮食计划 → webhook_body
+     │                                                 ▼
+     │                                     WebhookPublisher.publish()
+     │                                                 │
+     │                                                 │  requests.post(url, json=event, timeout=15)
+     │                                                 │  - HTTP 非 2xx: 静默忽略 (默认)
+     │                                                 │  - 网络异常/超时: 抛出 → 调度 wrapper 记日志
+     │                                                 │  - 无重试
+     │                                                 │  - 无签名
+     ▼                                                 ▼
+                       发送完成 (无持久化记录 / 无自动重试)
 ```
