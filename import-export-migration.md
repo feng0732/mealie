@@ -450,14 +450,17 @@ tiny_dest = image_path.parent.joinpath("tiny-original.webp")
 1. **图片不是"读不到"，而是"读太多且拿哪张不确定"**：批量导出的所有 webp 文件都会匹配 `.endswith(".webp")`，但具体哪一张被 `recipe_image` 变量最终持有，取决于 ZIP 写入时的 `Path.iterdir()` 顺序——代码层面不提供任何保证。
 
 2. **🔴 RecipeAsset 孤儿 DB 记录（确定存在的风险）**：
-   - JSON 中 `recipe_asset: [{...}, {...}]` 列表随 Recipe 一起通过 `Recipe(**cleaned_dict)` 写入数据库（`recipe_assets` 表有记录）
+   - JSON 中 `assets: [{name, icon, file_name}, ...]` 列表（[mealie/schema/recipe/recipe.py#L189](mealie/schema/recipe/recipe.py#L189)）随 Recipe 一起通过 `Recipe(**cleaned_dict)` → `RecipeModel.__init__` 写入数据库（[mealie/db/models/recipe/recipe.py#L197, L213-L214](mealie/db/models/recipe/recipe.py#L197, L213-L214)：`self.assets = [RecipeAsset(**a) for a in assets]`），`recipe_assets` 表确实有记录
+   - RecipeAsset schema 仅含 3 字段：`name`、`icon`、`file_name`（[mealie/schema/recipe/recipe_asset.py#L6-L10](mealie/schema/recipe/recipe_asset.py#L6-L10)）
    - 但 `assets/` 下的实际文件（PDF/MD 等）在 create_from_zip 中**完全不处理**，不会写入新 recipe 的 `assets/` 目录
    - 结果：DB 里有 RecipeAsset 行，磁盘上文件不存在 → 前端点击下载 404
 
-3. **🔴 Timeline 事件孤儿图片（确定存在的风险）**：
-   - JSON 中 `recipe_timeline: [{... image: true ...}, ...]` 随 Recipe 写入 `recipe_timeline_events` 表
-   - 但 `images/timeline/{event_id}/` 下的 webp 文件完全不拷贝
-   - 结果：时间线事件引用图片路径，但文件不存在 → `/api/recipes/{id}/images/timeline/...` 返回 404
+3. **🟡 Timeline 事件 DB 记录（代码层面确定：完全不导出也不导入）**：
+   - **Recipe Pydantic schema 不含 `timeline_events` 字段**：对比 `assets` 在 [mealie/schema/recipe/recipe.py#L182-L193](mealie/schema/recipe/recipe.py#L182-L193) 有明确定义，但 `timeline_events` 完全不在 `Recipe` 类的字段列表中
+   - **Recipe.loader_options() 不加载 timeline_events**：[mealie/schema/recipe/recipe.py#L300-L320](mealie/schema/recipe/recipe.py#L300-L320) 列出了 `assets`、`comments`、`extras`、`recipe_category`、`tags`、`tools`、`recipe_ingredient`、`recipe_instructions`、`nutrition`、`settings`、`notes`，**没有** `timeline_events`
+   - **RecipeModel.__init__() 不处理 timeline_events**：[mealie/db/models/recipe/recipe.py#L190-L219](mealie/db/models/recipe/recipe.py#L190-L219) 参数列表中只有 `assets`、`notes`、`nutrition`、`recipe_ingredient`、`recipe_instructions`、`settings`，额外 kwargs 被 `**_` 静默吞掉
+   - 结论：timeline event DB 记录**既不会出现在导出 JSON 中，也不会在导入时被创建**
+   - ⚠️ 但请注意：`images/timeline/{event_id}/` 下的 webp **文件**仍可能随批量导出的目录拷贝进入 ZIP，被 `create_from_zip` 的 `.endswith(".webp")` 命中并参与主图"最后覆盖"竞争——这是**图片文件被误读**，而非 timeline 事件记录入库
 
 4. **🟡 Recipe.image 缓存 key 不匹配（确定存在的风险）**：
    - `recipes.image` 列（[mealie/db/models/recipe/recipe.py](mealie/db/models/recipe/recipe.py#L84)）存储的是源 Recipe 的缓存 key 字符串
@@ -623,10 +626,10 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | **共享 ZIP 的 `original.webp`** | `write_image(bytes, "webp")` → 写入 + minify 生成 3 尺寸 | ✅ 正常 | 仅共享 ZIP 可靠（代码层面确定性：2 个文件，顺序固定） |
 | **批量 ZIP 的 `images/original.webp`** | namelist 中若排在最后则被选中，否则被其他 webp 覆盖 | 🟠 中高 | 有可能被用到，但在典型字母序场景下，`original.webp`（'o' 开头）排在 `min-original.webp`（'m'）之后、`tiny-original.webp`（'t'）之前，被覆盖的**可能性较高** |
 | **批量 ZIP 的 `images/tiny-original.webp`** | namelist 中若排在最后则被选中，当作 "original" 写入 → 再次 minify 生成 min+tiny | 🔴 严重 | 在典型字母序场景下，`tiny-original.webp`（'t' 开头）有可能排在最后 → 300×300 center-crop 成为最高清版本，所有尺寸都模糊 |
-| **批量 ZIP 的 timeline `tiny-original.webp`** | 同上，但可能是**非食谱主图**的时间线事件图 | 🔴 严重 | 在典型字母序场景下 timeline 目录排在 `tiny-original.webp` 之后，其内的 tiny 文件更可能排在最后 → 食物成品照片被替换成操作步骤截图 / 空盘照等（可能性较高，但非必然） |
+| **批量 ZIP 的 timeline 目录下 webp** | 被 `.endswith(".webp")` 命中，若排在 namelist 最后则被当作主图写入 | 🔴 严重 | 这些是**时间线事件配图**（操作步骤/空盘等）而非食谱主图。在典型字母序场景下 timeline 目录排在 `tiny-original.webp` 之后，其内的 webp 更可能排在最后 → 食物成品照片被替换成非主图（可能性较高，但非必然）；**注意：timeline 事件 DB 记录本身不会被创建** |
 | **非 webp 格式图片（jpg/png/gif...）** | `elif file.endswith(".webp")` 不匹配 → **静默丢弃** | 🔴 严重 | 代码层面**确定性**：非 webp 后缀的图片完全丢失，无任何报错或日志 |
-| **RecipeAsset 文件（PDF/MD/TXT...）** | 完全不读取不拷贝 | 🔴 严重 | 代码层面**确定性**：**DB 已创建 RecipeAsset 记录**（随 JSON 写入），磁盘上无文件 → 404 孤儿行 |
-| **Timeline 事件图片** | 完全不读取不拷贝 | 🟠 中高 | 代码层面**确定性**：DB 已创建 `recipe_timeline_events` 记录，磁盘上无图片 → 时间线图片 404 |
+| **RecipeAsset 文件（PDF/MD/TXT...）** | 完全不读取不拷贝 | 🔴 严重 | 代码层面**确定性**：**DB 已创建 RecipeAsset 记录**（JSON 中 `assets` 字段随 Recipe 入库，[mealie/db/models/recipe/recipe.py#L213-L214](mealie/db/models/recipe/recipe.py#L213-L214)），磁盘上无文件 → 404 孤儿行 |
+| **Timeline 事件 DB 记录** | Recipe schema 不含此字段，完全不入 JSON、不入库 | 🟢 无 | 代码层面**确定性**：`timeline_events` 不存在于 Recipe Pydantic schema，不在 `loader_options()`，`RecipeModel.__init__` 也不处理 → **既不导出也不导入**。仅 timeline 图片文件可能参与 webp 最后覆盖竞争 |
 | **Recipe.image 缓存 key** | JSON 中源 recipe 的缓存 key 直接落库 | 🟡 中 | 代码层面**确定性**：缓存 key 与新 recipe 的图片路径/UUID 不匹配，首次前端加载可能 404 |
 | **多食谱 ZIP 中除最后一个外的所有食谱** | JSON 和图片被循环覆盖 | 🔴 严重 | 代码层面**确定性**：N-1 个食谱完全静默丢失，具体哪一个被保留取决于 namelist 顺序 |
 
@@ -684,8 +687,8 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | Tag/Category 冲突处理 | — | 🟡 复用（丢属性） | 🟠 复用（丢属性） |
 | Group/Household 归属 | 备份原样保留 | 🔴 归为当前 | 🔴 归为当前 |
 | 字段缺失校验 | 🟡 Alembic 自动迁移 | 🟡 cleaner 清洗 | 🔴 纯 Pydantic 校验，无兼容层 |
-| RecipeAsset 处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **DB 孤儿记录，文件丢失** |
-| Timeline 图片处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **DB 孤儿记录，图片丢失** |
+| RecipeAsset 处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **JSON `assets` 字段入库但文件不拷贝** → DB 孤儿记录，404 |
+| Timeline 事件处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🟢 **DB 记录完全不导入不导出**（`timeline_events` 不在 Recipe schema，不在 loader_options，`__init__` 不处理）；但 timeline 目录下 webp 文件可能被误当食谱主图（参与最后覆盖竞争） |
 | 主图分辨率正确性 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 **仅共享 ZIP 代码层面保证正确；批量 ZIP 存在图片错拿（典型场景下 tiny 缩略图被选中可能性较高）** |
 | 非 webp 图片 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 代码层面确定：静默丢弃 |
 | 多食谱 ZIP 处理 | — | — | 🔴 **代码层面确定：仅导入 namelist 最后一个，其余丢失** |
