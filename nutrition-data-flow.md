@@ -752,6 +752,164 @@ class GroupStorage(MealieModel):
 
 **结论：Mealie 目前没有任何对 Nutrition 数据做聚合统计（计算平均、求和、分类统计等）的接口。所有统计端点只做 recipe 行数计数或磁盘大小统计，与 Nutrition 数据的录入、缩放、缺失字段处理、公开展示均无任何交集。**
 
+### 7.6 Household Statistics 前端展示链路
+
+Household Statistics 在**用户资料页**展示为 5 张统计卡片，完整链路如下：
+
+**展示页面**：`frontend/app/pages/user/profile/index.vue`
+
+**数据获取**：
+```typescript
+const { data: stats } = useAsyncData(useAsyncKey(), async () => {
+  const { data } = await api.households.statistics();
+  if (data) {
+    return data;
+  }
+});
+```
+调用 `HouseholdAPI.statistics()`（`frontend/app/lib/api/user/households.ts`），发送 `GET /api/households/statistics`，返回 `HouseholdStatistics` 类型（5 个整数字段，无 Nutrition）。
+
+**渲染组件**：`frontend/app/components/global/StatsCards.vue` —— 通用卡片组件，仅接受 `icon`、`to`、`minWidth` 三个 props，通过 slots 渲染 `title` 和 `value`。组件本身不涉及任何 Nutrition 逻辑。
+
+**字段标题映射**（`statsText` 对象，i18n key → 前端显示）：
+
+| 字段 Key | i18n key | 前端显示（中文） |
+|----------|----------|----------------|
+| totalRecipes | `general.recipes` | 食谱 |
+| totalUsers | `user.users` | 用户 |
+| totalCategories | `sidebar.categories` | 分类 |
+| totalTags | `sidebar.tags` | 标签 |
+| totalTools | `tool.tools` | 工具 |
+
+**图标映射**（`iconText` 对象）：
+
+| 字段 Key | 图标 |
+|----------|------|
+| totalRecipes | `$globals.icons.primary`（默认主图标） |
+| totalUsers | `$globals.icons.user` |
+| totalCategories | `$globals.icons.categories` |
+| totalTags | `$globals.icons.tags` |
+| totalTools | `$globals.icons.potSteam` |
+
+**跳转目标映射**（`statsTo` computed）：
+
+| 字段 Key | 跳转路由 | 说明 |
+|----------|----------|------|
+| totalRecipes | `/g/${groupSlug}/` | 食谱列表页（RecipeExplorerPage） |
+| totalUsers | `/household/members` | 家庭成员列表 |
+| totalCategories | `/g/${groupSlug}/recipes/categories` | 食谱分类管理页 |
+| totalTags | `/g/${groupSlug}/recipes/tags` | 食谱标签管理页 |
+| totalTools | `/g/${groupSlug}/recipes/tools` | 食谱工具管理页 |
+
+### 7.7 从统计卡片跳转到 Recipe 列表页后的数据流
+
+点击 totalRecipes 卡片后跳转至 `/g/${groupSlug}/`，由 `frontend/app/pages/g/[groupSlug]/index.vue` 渲染，内部使用 `RecipeExplorerPage` 组件。
+
+**RecipeExplorerPage 数据流**：
+```
+RecipeExplorerPage
+  └─ useLazyRecipes(publicGroupSlug)  ← frontend/app/composables/recipes/use-recipes.ts
+       └─ api.recipes.getAll(page, perPage, params)
+            │  GET /api/recipes?page=1&perPage=30
+            ▼
+       RepositoryRecipes.page_all()  ← mealie/repos/repository_recipes.py
+            │  q = q.options(*RecipeSummary.loader_options())
+            │  items = [RecipeSummary.model_validate(item) for item in data]
+            │  return RecipePagination(items=items, ...)
+            ▼
+       RecipePagination { items: list[RecipeSummary] }
+```
+
+**关键证据 —— RecipeSummary 不含 Nutrition**：
+- `mealie/schema/recipe/recipe.py` 中类继承关系：
+  ```python
+  class RecipeSummary(MealieModel):
+      # ... 基础字段（name, slug, servings, tags, category, tools 等）
+      # ❌ 无 nutrition, settings, ingredients, instructions, assets 等详细字段
+  class RecipePagination(PaginationBase):
+      items: list[RecipeSummary]   # ← 明确是 RecipeSummary 列表
+  class Recipe(RecipeSummary):
+      nutrition: Nutrition | None = None  # ← Nutrition 只在完整 Recipe 中定义
+  ```
+- `RecipeSummary.loader_options()`（`mealie/schema/recipe/recipe.py#L168-L175`）只配置了：
+  ```python
+  return [
+      joinedload(RecipeModel.recipe_category),
+      joinedload(RecipeModel.tags),
+      joinedload(RecipeModel.tools),
+      joinedload(RecipeModel.user).load_only(User.household_id),
+  ]
+  ```
+  **没有 `joinedload(RecipeModel.nutrition)`**，分页查询不会 Eager Load nutrition 表。
+
+- `RepositoryRecipes.page_all()`（`mealie/repos/repository_recipes.py#L277`）明确使用：
+  ```python
+  q = q.options(*RecipeSummary.loader_options())
+  items = [RecipeSummary.model_validate(item) for item in data]
+  ```
+
+**前端类型声明注记**：前端 `useLazyRecipes` 中将 `recipes` 声明为 `ref<Recipe[]>` 而非 `RecipeSummary[]`（`frontend/app/composables/recipes/use-recipes.ts#L45`），但实际上分页接口返回的数据不含 nutrition 字段。这是一个**类型与实际数据不一致**的地方，但对 Nutrition 边界的结论不影响：列表页不加载也不展示 Nutrition 数据。
+
+### 7.8 Admin Statistics 前端状态
+
+Admin Statistics 的后端接口（`GET /api/admin/about/statistics`）和 TypeScript 类型均已实现，但**前端没有任何页面调用此接口**。
+
+**已实现部分（未被调用）**：
+
+1. **类型定义**：`frontend/app/lib/api/types/admin.ts`
+   ```typescript
+   export interface AppStatistics {
+     totalRecipes: number;
+     totalUsers: number;
+     totalHouseholds: number;
+     totalGroups: number;
+     uncategorizedRecipes: number;
+     untaggedRecipes: number;
+   }
+   ```
+   6 个字段均为整数计数，无 Nutrition 字段。
+
+2. **API 客户端**：`frontend/app/lib/api/admin/admin-about.ts`
+   ```typescript
+   async statistics() {
+     return await this.requests.get(routes.aboutStatistics);  // 注意：未指定返回类型泛型 <AppStatistics>
+   }
+   ```
+   方法实现存在，但未指定返回类型泛型（`this.requests.get()` 而非 `this.requests.get<AppStatistics>()`），进一步表明其未在实际页面中使用。
+
+3. **Admin API 聚合类**：`frontend/app/lib/api/client-admin.ts`
+   ```typescript
+   export class AdminAPI {
+     public about: AdminAboutAPI;  // ← 已挂载
+     // ...
+   }
+   ```
+
+**证据 —— 无页面调用**：
+- 在 `frontend/app/pages/admin/` 目录下所有页面（site-settings.vue、backups.vue、maintenance/index.vue、manage/users、manage/households、manage/groups、debug/*、setup.vue）中，全局搜索 `statistics`、`AppStatistics`、`about.statistics`，仅 `site-settings.vue` 命中 "statistics" 关键词，但其实际调用的是：
+  ```typescript
+  const { data } = await adminApi.about.about();      // AdminAboutInfo，版本、数据库等配置信息
+  const { data } = await adminApi.about.checkApp();   // CheckAppConfig，SMTP/LDAP/OIDC 健康检查
+  ```
+  **未调用 `adminApi.about.statistics()`**。
+- 其他 admin 页面均不涉及任何 statistics 相关调用。
+
+结论：Admin Statistics 在前端目前只完成了**客户端 API 和类型定义**，没有对应的 UI 页面展示。
+
+### 7.9 统计前端展示链路与 Nutrition 的边界总结
+
+| 维度 | Household Statistics（用户资料页） | 跳转 Recipe 列表页后 | Admin Statistics（前端） |
+|------|------|------|------|
+| **数据类型** | `HouseholdStatistics`（5 个整数） | `RecipePagination { items: RecipeSummary[] }` | `AppStatistics` 类型定义（6 个整数），未被调用 |
+| **是否涉及 Nutrition** | ❌ 无任何 Nutrition 字段 | ❌ `RecipeSummary` 无 nutrition，分页查询不 joinedload | ❌ 无任何 Nutrition 字段 |
+| **与录入关系** | 无关联（只统计行数，不读取内容） | 无关联（列表卡片不展示 Nutrition） | N/A（无页面调用） |
+| **与缩放关系** | 无关联 | 无关联（列表页无缩放功能） | N/A |
+| **与缺失字段关系** | 无关联（nutrition 全空仍被计数） | 无关联（RecipeSummary 不校验 nutrition） | N/A |
+| **与公开展示关系** | 无关联（不读取 recipe.settings.showNutrition） | 无关联（列表页不输出 Schema.org JSON-LD） | N/A |
+| **与 Schema.org 关系** | 无关联 | 无关联（列表页无单食谱详情，SPA Meta 注入只在详情页生效） | N/A |
+
+**最终结论**：所有统计相关的前端展示链路（用户资料页统计卡片、食谱列表页、admin 统计类型）均与 Nutrition 数据的录入、缩放、缺失字段处理、公开展示（Schema.org）完全无交集。
+
 ---
 
 ## 八、Schema.org 公开输出（JSON-LD）
