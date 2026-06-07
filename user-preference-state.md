@@ -163,7 +163,7 @@ async setPreferences(payload: UpdateHouseholdPreferences) {
 - [HouseholdPreferencesEditor.vue](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/components/Domain/Household/HouseholdPreferencesEditor.vue)
 - [household/index.vue](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/pages/household/index.vue)（管理页面，需 `can-manage-household-only` 中间件）
 
-#### 缓存处理（修正版）：
+#### 缓存处理（校准版）：
 
 家庭当前用户家庭数据通过 `useHouseholdSelf()` 进行**模块级单例缓存**：
 
@@ -173,9 +173,13 @@ const householdSelfRef = ref<HouseholdInDB | null>(null);
 ```
 
 - **首次调用**时懒加载（`refreshHouseholdSelf()`）
-- **清理时机**：⚠️ `clearAllStores()` **不包含** `householdSelfRef` 的清理。它仅在以下情况被清空：
-  1. `refreshHouseholdSelf()` 被调用且检测到 `!auth.user.value`（见 [use-households.ts#L11-L14](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-households.ts#L11-L14)）
-  2. 下次调用 `useHouseholdSelf()` 时触发懒加载前的检查
+- **关键缓存逻辑**：`get()` 方法条件为 `if (!(householdSelfRef.value || loading.value))`，即**只有当 ref 为 null 且不在加载中时才触发 refresh**。一旦 ref 被赋过一次非 null 值，后续所有 `get()` 调用都会**短路返回旧值**，不会重新请求 API。
+- **清理时机**：⚠️ `clearAllStores()` **不包含** `householdSelfRef` 的清理。它仅在以下情况被清空或刷新：
+  1. `refreshHouseholdSelf()` 被显式调用：
+     - 若检测到 `!auth.user.value`（无登录用户）→ 置 `householdSelfRef.value = null`
+     - 若检测到有登录用户 → 调用 API 获取最新数据并覆盖 ref
+  2. 页面刷新（F5）→ JS 运行时重建，ref 重置为 `null`，下次调用 `useHouseholdSelf()` 时触发懒加载
+- ⚠️ **重要**：用户登出或切换用户后，如果没有显式调用 `refreshHouseholdSelf()` 且没有刷新页面，ref 中保留的旧用户数据不会被清除。即使后续新用户调用 `useHouseholdSelf()`，`get()` 也会因 ref 已有值而**短路返回旧值**。
 
 > **重要区分**：`useHouseholdStore()`（[use-household-store.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/store/use-household-store.ts)）是家庭**列表**缓存，属于 `clearAllStores()` 管理范畴；而 `useHouseholdSelf()` 返回的是**当前登录用户所属家庭**的单例数据，与前者是两套独立缓存。
 
@@ -203,7 +207,7 @@ else:
 
 **前端状态管理**：[use-groups.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-groups.ts#L7-L69)
 
-> ⚠️ 与 `householdSelfRef` 相同的缓存结构：`groupSelfRef` 是模块级单例，**不在 `clearAllStores()` 清理范围内**。
+> ⚠️ 与 `householdSelfRef` 相同的缓存结构：`groupSelfRef` 是模块级单例，**不在 `clearAllStores()` 清理范围内**。`get()` 方法同样采用短路逻辑（`if (!(ref.value || loading.value))`），一旦 ref 被赋过值，后续调用直接返回旧值。登出/切换用户后不会自动刷新，需页面刷新或显式调用 `actions.refresh()` 才能更新（虽暴露 refresh 方法但无调用点）。
 
 > ⚠️ **注意**：除 `private_group` 和 `show_announcements` 外，其余字段（食谱相关默认值）已标注 **Deprecated**，代码注释明确指出「see household preferences」。这些字段目前仅作为创建新家庭时的默认值来源（见上一节）。
 
@@ -549,15 +553,15 @@ async function signOut(callbackUrl: string = ""): Promise<void> {
 | **authUser / authStatus** | ❌ 清理 | 直接赋值 null / unauthenticated |
 | **9 个列表 store** | ❌ 清理 | `clearAllStores()` 逐个重置 |
 | **Nuxt useAsyncData 缓存** | ❌ 清理 | `clearNuxtData()` 清空 |
-| **`householdSelfRef`** | ⚠️ **可能残留** | 仅当 `refreshHouseholdSelf()` 被调用且检测到 `!auth.user.value` 时才会设为 null。若登出后不再触发该函数，则保留上一个用户的家庭数据（含 preferences）。 |
-| **`groupSelfRef`** | ⚠️ **可能残留** | 同上，仅在 `refreshGroupSelf()` 调用时清理。 |
+| **`householdSelfRef`** | ⚠️ **可能残留** | `signOut()` 不调用 `refreshHouseholdSelf()`，且 `clearAllStores()` 不包含此 ref。若登出前 ref 已有值（非 null），则登出后数据保留在内存中。**即使后续新用户调用 `useHouseholdSelf()`，`get()` 也会因 ref 已有值而短路返回旧值，不会触发 refresh**。仅在页面刷新或显式调用 `refreshHouseholdSelf()` 时才会清除或更新。 |
+| **`groupSelfRef`** | ⚠️ **可能残留** | 同上。额外差异：`useGroupSelf` 的 actions 中暴露了 `refresh()` 方法（`useHouseholdSelf` 未暴露），但当前代码中无任何调用点。 |
 | **LocalStorage 用户偏好（12 个 composable）** | ⚠️ **永久残留** | 存储于浏览器 LocalStorage，登出流程**不清理**任何 LocalStorage 数据。切换用户后，新用户将继承前一用户的排序、视图、打印等偏好。 |
 | **主题色缓存 `__cachedTheme`** | ⚠️ 残留 | 插件生命周期内不清理，但属于全局配置，无敏感数据风险。 |
 | **暗模式设置 `vueuse-color-scheme`** | ⚠️ 永久残留 | 存储于 LocalStorage，登出不清理。 |
 | **i18n Cookie（语言偏好）** | ⚠️ 永久残留 | `@nuxtjs/i18n` 管理的 Cookie，登出不清理。 |
 | **`useGlobalI18n()` 单例** | ⚠️ 残留 | 模块级缓存，登出不清理，但为只读配置对象，无风险。 |
 
-> **潜在数据泄露场景**：A 用户登出后，若 B 用户在同一浏览器标签页（未刷新）登录，在 B 用户的 `useHouseholdSelf()` / `useGroupSelf()` 首次懒加载触发之前，代码中任何对 `householdSelfRef.value` / `groupSelfRef.value` 的直接访问仍会读到 A 用户的数据。
+> **数据泄露场景（实际 Bug）**：用户 A 登出 → 用户 B 在同一浏览器标签页（未刷新）登录 → B 的页面组件调用 `useHouseholdSelf()` → `get()` 检测到 `householdSelfRef.value` 非空（仍为 A 的数据）→ **短路返回，不触发 refresh** → 组件读取到 A 的家庭偏好（preferences、privateHousehold 等敏感设置）。`groupSelfRef` 存在相同问题。直到页面刷新或显式调用 refresh 才能恢复正常。
 
 ---
 
@@ -744,8 +748,8 @@ const { household } = useHouseholdSelf();
 | 数据 | 缓存方式 | 失效触发 |
 |------|----------|----------|
 | 用户数据 (UserOut) | 内存级 `authUser` ref | 登出、`auth.refresh()`、401 响应 |
-| 当前用户家庭数据 (含 preferences) | 模块级 `householdSelfRef` ref | `refreshHouseholdSelf()` 调用且无登录用户时、页面刷新 |
-| 当前用户组数据 (含 preferences) | 模块级 `groupSelfRef` ref | `refreshGroupSelf()` 调用且无登录用户时、页面刷新 |
+| 当前用户家庭数据 (含 preferences) | 模块级 `householdSelfRef` ref，`get()` 条件：`if (!(ref.value \|\| loading.value))`（ref 非空即短路不刷新） | ① 显式调用 `refreshHouseholdSelf()`（仅在 `useHouseholdSelf` 内部可用，actions 未暴露）<br>② 页面刷新（JS 运行时重建，ref 重置为 null → 下次 get() 触发懒加载）<br>⚠️ **登出/切换用户不自动触发**：`signOut()` 不调用此函数，`clearAllStores()` 不包含此 ref。若登出前 ref 已有值，新用户调用 `get()` 会短路返回旧值。 |
+| 当前用户组数据 (含 preferences) | 模块级 `groupSelfRef` ref，`get()` 短路逻辑同上 | ① 显式调用 `refreshGroupSelf()`（`useGroupSelf` 的 `actions.refresh()` 已暴露，但当前代码无调用点）<br>② 页面刷新<br>⚠️ 登出/切换用户的行为缺陷同上。 |
 | 家庭/组/分类/食材等**列表**缓存 | 9 个 store 模块 ref | `clearAllStores()`（登出时调用）、各 store 自有的 `flushStore()` |
 | 用户 UI 偏好（排序、视图、打印等） | `localStorage`（12 个 key） | 用户手动修改（自动同步）、浏览器手动清除、**登出不清理** |
 | 主题色配置 | ① 模块级 `__cachedTheme` 变量（前端内存缓存）<br>② HTTP `Cache-Control: public, max-age=604800`（浏览器 7 天缓存）<br>③ theme.ts 内联硬编码 fallback（未使用 nuxt.config.ts 中的 `public.themes`） | 页面刷新（JS 变量重置）、7 天后 HTTP 缓存失效、API 失败时自动回退到硬编码色值 |
@@ -765,7 +769,7 @@ const { household } = useHouseholdSelf();
 | `localStorage` 中无用户偏好 | `useLocalStorage(..., defaults, { mergeDefaults: true })` 自动填充默认值 | [preferences.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-users/preferences.ts) |
 | API `/api/app/about/theme` 获取失败 | 回退到 theme.ts 内联硬编码颜色值（如 `"#E58325"`）。注：`nuxt.config.ts` 的 `runtimeConfig.public.themes` 虽定义了环境变量 fallback 链，但 theme 插件并未读取它，属于死代码。 | [theme.ts#L20-L31](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L20-L31)、[theme.ts#L51-L69](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L51-L69) |
 | 浏览器语言不在支持列表 | 前后端均回退到 `en-US` | [providers.py#L49-L53](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/lang/providers.py#L49-L53)、[i18n.config.ts#L97](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/i18n.config.ts#L97) |
-| 未登录访问 | `useHouseholdSelf()` / `useGroupSelf()` 的 `refreshXxxSelf()` 检测 `!auth.user.value` 时立即返回 null，不发起请求 | [use-households.ts#L11-L15](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-households.ts#L11-L15) |
+| 未登录访问调用 `useHouseholdSelf()` / `useGroupSelf()` | `get()` 检测到 ref 为 null 时触发 `refreshXxxSelf()`，该函数内检测 `!auth.user.value` → 立即置 ref 为 null 并返回，不发起 API 请求。⚠️ 但如登出前 ref 已有值（未刷新页面），`get()` 会短路返回旧值。 | [use-households.ts#L11-L15](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-households.ts#L11-L15)、[use-groups.ts#L11-L14](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-groups.ts#L11-L14) |
 | `recipe.settings` 为 undefined | 详情页中使用可选链 `recipe.value.settings?.landscapeView`，undefined 视为 false | [RecipePage.vue#L397](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/components/Domain/Recipe/RecipePage/RecipePage.vue#L397) |
 
 ---
