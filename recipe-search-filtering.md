@@ -178,7 +178,7 @@ def receive_ingredient_original_text(target, value, oldvalue, initiator):
         target.original_text_normalized = None
 ```
 
-此外在 `__init__` 构造函数中也会直接赋值，因为代码注释明确说明 "SQLAlchemy events do not seem to register things that are set during auto_init"。
+`__init__` 构造函数中对 `note` 会直接写入 `note_normalized`，因为代码注释说明 auto_init 期间的赋值不一定触发事件；`original_text` 的稳定更新路径仍以 `original_text` set 事件为准，源码中另有 `orginal_text` 拼写分支，阅读时需要区分。
 
 除食材外，其他 recipe 相关模型也具备规范化字段及 set 事件：
 - `IngredientUnitModel`：name_normalized, plural_name_normalized, abbreviation_normalized, plural_abbreviation_normalized
@@ -235,7 +235,7 @@ ORDER BY LEAST(name_normalized <->> search)
 
 ##### PostgreSQL trigram 索引覆盖范围
 
-PostgreSQL 下所有规范化搜索字段都创建了 GIN 索引（`gin_trgm_ops` 操作符类）以加速 trigram 搜索：
+PostgreSQL 下列规范化搜索相关字段创建了 GIN 索引（`gin_trgm_ops` 操作符类）以加速 trigram 搜索：
 
 | 模型 | 字段 | 索引名 |
 |------|------|--------|
