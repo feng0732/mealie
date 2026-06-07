@@ -175,41 +175,87 @@ POST /api/recipes/create/url  {url: "https://example.com/recipe"}
 | RecipeScraperOpenAITranscription | yt-dlp 返回的 `thumbnail_url` |
 | RecipeScraperOpenGraph | `<meta property="og:image">` 标签 |
 
-### 2.3 列表图片 URL 的选择规则（两种不同策略）
+### 2.3 列表图片 URL 的选择规则（四层架构逐层说明）
 
-图片字段可能是 `str`、`list[str]` 或 `dict` 三种类型。**根据调用入口不同，列表的处理策略完全不同**：
+schema.org 的 `image` 字段在数据源中可能是 `str`、`list[str]`、`dict` 三种形式，但这些类型在流经不同层次时被逐步收敛。整个链路分为四层，每层的类型处理方式不同：
 
-#### 路径 1：URL 创建导入（create_from_html）→ 取第一张
+#### 第 1 层：请求 Schema —— ScrapeRecipe 只接受 `str`
 
-在 `scrape_image` 被调用之前，[scraper.py#L64-L66](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L64-L66) 会先对列表做截断：
+**定义**：[recipe_scraper.py#L16-L26](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/schema/recipe/recipe_scraper.py#L16-L26)
 ```python
-if isinstance(new_recipe.image, list):
-    new_recipe.image = new_recipe.image[0]   # ★ 直接取索引 0，不比较大小
+class ScrapeRecipe(ScrapeRecipeBase):
+    url: str   # ★ 仅支持单个字符串 URL，不支持数组
 ```
-多分辨率信息被丢弃，`scrape_image` 收到的只是单个字符串 URL。
 
-#### 路径 2：直接抓图接口（POST /{slug}/image）→ 按 Content-Length 选最大
+前端 API 对应：[recipe.ts#L141-L142](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/frontend/app/lib/api/user/recipes/recipe.ts#L141-L142)
+```ts
+updateImagebyURL(slug: string, url: string) {
+    return this.requests.post(routes.recipesRecipeSlugImage(slug), { url });
+}
+```
 
-`scrape_image` 函数内部（[recipe_data_service.py#L124-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L124-L139)）的完整分支逻辑：
-| 输入类型 | 处理方式 |
-|---------|---------|
-| `str` | 直接赋值 `image_url_str` |
-| `list[str]` | 调用 `largest_content_len(urls)`，并发 HEAD 请求各 URL，选 `Content-Length` 响应头最大的那个 |
-| `dict` | 取 `dict["url"]` 字段 |
-| 其他 / 解析后为空 | `raise ValueError("image url could not be parsed from input...")` |
+**结论**：HTTP 抓图接口 `POST /{slug}/image` **在协议层面就不支持数组传输**，调用方只能传单个字符串 URL。
 
-**largest_content_len 实现细节**（[recipe_data_service.py#L28-L46](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)）：
-- 并发上限 Semaphore(10)
-- `gather_with_concurrency(..., ignore_exceptions=True)` 过滤掉抛异常的响应（超时、DNS、TLS 失败等）
-- 若所有 HEAD 均失败，`responses` 为空 → `largest_url = ""`，`largest_len = 0`
-- 回到 scrape_image 第 138 行 `if not image_url_str: raise ValueError(...)` —— 这是**抛异常**，会进入 except 分支
+#### 第 2 层：HTTP 路由 —— scrape_image_url 接收单值并透传
 
-#### 两种入口汇总
+**路由实现**：[recipe_crud_routes.py#L614-L633](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/routes/recipe/recipe_crud_routes.py#L614-L633)
+```python
+@router.post("/{slug}/image")
+async def scrape_image_url(self, slug: str, url: ScrapeRecipe):   # url: ScrapeRecipe → url.url: str
+    recipe = self.mixins.get_one(slug)
+    data_service = RecipeDataService(recipe.id)
+    ...
+    await data_service.scrape_image(url.url)   # ★ 传入的是单个字符串
+```
 
-| 调用入口 | list 处理策略 | 最大分辨率是否被利用 |
-|---------|--------------|-------------------|
-| URL 创建导入（`create_from_html`） | 取 `[0]`（通常是最小的） | ❌ 否 |
-| 手动 POST `/{slug}/image` 传数组 | 选 Content-Length 最大 | ✅ 是 |
+**结论**：HTTP 路由层透传单个字符串给内部函数，`scrape_image` 的 `list[str]` 分支在这条路径上**永远不会被触发**。
+
+#### 第 3 层：URL 导入内部流程 —— 列表取第一张
+
+在 `create_from_html`（URL 创建 Recipe）路径中，在调用 `scrape_image` 之前有一段预处理：
+
+[scraper.py#L64-L66](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L64-L66)
+```python
+if new_recipe.image:
+    if isinstance(new_recipe.image, list):
+        new_recipe.image = new_recipe.image[0]   # ★ 直接取索引 0，不比较大小
+    await recipe_data_service.scrape_image(new_recipe.image)
+```
+
+**结论**：
+- scraper 策略从 schema.org 解析出的多分辨率 URL 列表，在导入时被**直接取第一张**（schema.org 通常按「小 → 大」排序，因此实际被选中的往往是**分辨率最低**的那张）
+- 多分辨率信息在此被丢弃，`scrape_image` 收到的只是单个字符串 URL
+
+#### 第 4 层：内部函数 scrape_image —— list 分支按 Content-Length 选最大
+
+虽然 HTTP 层无法触发，但 `RecipeDataService.scrape_image` 的函数签名**理论上**支持 `list[str]`：
+
+[recipe_data_service.py#L119-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L119-L139)
+```python
+async def scrape_image(self, image_url: str | dict[str, str] | list[str]) -> None:
+    if isinstance(image_url, str):
+        image_url_str = image_url
+    elif isinstance(image_url, list):                          # ★ 内部 list 分支
+        image_url_str, _ = await largest_content_len(image_url) # 并发 HEAD 选 Content-Length 最大
+    elif isinstance(image_url, dict):
+        image_url_str = image_url.get("url", "")
+```
+
+`largest_content_len` 实现（[recipe_data_service.py#L28-L46](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)）：
+- Semaphore(10) 并发 HEAD 各 URL
+- `ignore_exceptions=True` 过滤掉抛异常的响应（超时、DNS、TLS 失败等）
+- 取 `Content-Length` 响应头数值最大的那个 URL
+- 若所有 HEAD 均失败 → `largest_url = ""` → 回到 scrape_image 抛 `ValueError`（进入 except 分支，DB 写入 `"no image"`）
+
+**结论**：按 Content-Length 选最大图片是**内部函数接到 list 时的兜底行为**，在当前代码中**没有任何外部调用路径能触发它**——HTTP 层只传 str，导入层在传参前已把 list 截断为 str。
+
+#### 四层汇总
+
+| 层级 | 接受类型 | list 处理策略 | 最大分辨率是否被利用 |
+|------|---------|--------------|-------------------|
+| ScrapeRecipe Schema / HTTP 接口 | 仅 `str` | N/A（协议层不支持数组） | N/A |
+| URL 创建导入（`create_from_html`） | `str \| list \| dict` → 预处理后只传 `str` | 取 `[0]`（通常最小） | ❌ 否 |
+| 内部函数 `scrape_image` | `str \| list[str] \| dict` | 选 Content-Length 最大 | ✅ 是（但无调用方） |
 
 ---
 
@@ -241,7 +287,7 @@ except Exception as e:
 | **C** | 远程返回非 200 状态码（403、404、500、429 等） | [recipe_data_service.py#L156-L159](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L156-L159)：`if r.status_code != 200: return None` **（不抛异常）** | `cache.new_key(4)`（4 位随机串） | ✅ 合法缓存键 | 仅空目录（状态码不对，不写文件） | ❌ 同上 |
 | **D** | 200 但 Content-Type 不含 `"image"`（如 text/html、application/pdf 等） | [recipe_data_service.py#L161-L165](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L161-L165)：`raise NotAnImageError` **（抛异常）** | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 仅空目录（异常在 write_image 之前抛出） | ❌ 同上 |
 | **E** | 图片下载成功但 PIL 解码失败（损坏文件、HEIC 缺少依赖、截断的 JPEG、零字节等） | [recipe_data_service.py#L168](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L168)：`self.write_image(...)` 内部 minify 抛异常 → [write_image#L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L102-L107)：`image_path.unlink()` 后 re-raise **（抛异常）** | `"no image"`（硬编码字符串） | ❌ 非缓存键 | write_image 已 `unlink(missing_ok=True)` 删除了临时 `original.{ext}`；若 minify 生成了部分 webp 后才失败（如生成 original.webp 成功但生成 tiny 时磁盘满），已生成的 webp 会**残留在磁盘上** | ❌ 残留 webp 无法自动清理 |
-| **F** | image URL 解析失败（list 所有 HEAD 均失败、dict 无 url 键等） | [recipe_data_service.py#L138-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L138-L139)：`raise ValueError` **（抛异常）** | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 仅空目录（异常在 write_image 之前抛出） | ❌ 同上 |
+| **F** | image URL 解析失败（dict 无 `url` 键、dict 的 `url` 值为空串等） | [recipe_data_service.py#L133-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L133-L139)：`image_url_str = image_url.get("url", "")` 为空 → `raise ValueError` **（抛异常）**。**注**：在 URL 导入路径中，list 已被提前取 `[0]`，因此 list 分支的 HEAD 全失败不会在此触发；仅内部函数直接接 list 时才会走那条路径（当前无调用方） | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 仅空目录（异常在 write_image 之前抛出） | ❌ 同上 |
 | **G** | 图片下载 + minify 全部成功，但后续 slugify 或其他逻辑抛异常（极少） | scrape_image 正常返回；异常在 try 块后续逻辑触发 | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 三尺寸 webp 完整存在于 `{uuid}/images/` | ❌ 永久孤儿 webp，无自动清理 |
 | **H** | ✅ 全流程成功 | scrape_image 正常返回 | `cache.new_key(4)`（4 位随机串） | ✅ 合法缓存键 | `{uuid}/images/` 下三尺寸 webp 齐全 | N/A |
 
@@ -280,7 +326,7 @@ except Exception as e:
 
 ### 3.3 数据库 image 字段作为缓存版本号
 
-数据库 `recipes.image` 列**不存图片数据**，仅存一个随机字符串作为缓存 bust 键，共 5 种可能取值：
+数据库 `recipes.image` 列**不存图片数据**，仅存一个随机字符串作为缓存 bust 键，共 4 种可能取值：
 
 | 取值 | 来源 | 含义 |
 |------|------|------|
