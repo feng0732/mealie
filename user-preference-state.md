@@ -561,6 +561,184 @@ async function signOut(callbackUrl: string = ""): Promise<void> {
 
 ---
 
+### 4.3.1 householdSelfRef / groupSelfRef 缓存失效路径详解
+
+#### 一、核心代码结构
+
+两个模块的实现逻辑完全对称（[use-households.ts#L4-L51](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-households.ts#L4-L51)、[use-groups.ts#L4-L69](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-groups.ts#L4-L69)）：
+
+```typescript
+// 模块级单例 ref
+const householdSelfRef = ref<HouseholdInDB | null>(null);
+const loading = ref(false);
+
+export const useHouseholdSelf = function () {
+  const auth = useMealieAuth();
+
+  async function refreshHouseholdSelf() {
+    if (!auth.user.value) {           // [短路分支] 无登录用户 → 清空 ref 并返回
+      householdSelfRef.value = null;
+      return;
+    }
+    loading.value = true;
+    const { data } = await api.households.getCurrentUserHousehold();
+    householdSelfRef.value = data;    // 写入新数据
+    loading.value = false;
+  }
+
+  const actions = {
+    get() {
+      // [关键逻辑] 只有当 ref 为空且不在加载中时，才触发 refresh
+      if (!(householdSelfRef.value || loading.value)) {
+        refreshHouseholdSelf();
+      }
+      return householdSelfRef;        // 同步返回 ref（可能是旧值）
+    },
+    async updatePreferences() { /* ... */ },
+    // ❌ 注意：useHouseholdSelf 未暴露 refresh() 方法
+  };
+
+  const household = actions.get();    // 组件调用 useHouseholdSelf() 时立即触发 get()
+  return { actions, household };
+};
+```
+
+> **不对称点**：`useGroupSelf` 在 [use-groups.ts#L61-L63](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-groups.ts#L61-L63) 暴露了 `actions.refresh()`，但 `useHouseholdSelf` 的 actions 中**没有暴露** refresh 方法。
+
+#### 二、get() 短路返回真值表
+
+`get()` 的判断条件：`if (!(householdSelfRef.value || loading.value))`
+
+| `householdSelfRef.value` | `loading.value` | 条件求值 | 是否触发 `refreshHouseholdSelf()` |
+|--------------------------|-----------------|----------|-----------------------------------|
+| `null`                   | `false`         | `!false` → `true` | ✅ **是**（首次调用、页面刷新后） |
+| `null`                   | `true`          | `!true` → `false` | ❌ 否（加载中，避免重复请求） |
+| `{data}`（非 null）      | `false`         | `!true` → `false` | ❌ **否**（已有数据，短路返回旧值） |
+| `{data}`（非 null）      | `true`          | `!true` → `false` | ❌ 否 |
+
+> **关键结论**：一旦 ref 被赋过一次非 null 值，后续所有 `get()` 调用都会**短路返回旧值**，永远不会主动重新请求 API，除非外部显式调用 `refreshHouseholdSelf()`（但 `useHouseholdSelf` 并未暴露此方法）。
+
+---
+
+#### 三、各场景下的失效行为
+
+##### 场景 1：用户登出（signOut）
+
+**调用链**：
+1. [use-auth-backend.ts#L94-L115](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-auth-backend.ts#L94-L115) → `signOut()`
+2. 执行：`setToken(null)` → `authUser.value = null` → `authStatus.value = "unauthenticated"` → `clearAllStores()` → `clearNuxtData()` → `router.push("/login")`
+
+**对 householdSelfRef / groupSelfRef 的影响**：
+
+| 步骤 | 影响 |
+|------|------|
+| `authUser.value = null` | 通过 [use-mealie-auth.ts#L13-L24](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-mealie-auth.ts#L13-L24) 的 watcher → `auth.user.value` 变为 null |
+| `clearAllStores()` | 清理 9 个列表 store，**不包含** householdSelfRef / groupSelfRef |
+| `signOut()` 中 | ❌ **不调用** `refreshHouseholdSelf()` 或 `refreshGroupSelf()` |
+
+**结果**：
+- 如果登出前 `householdSelfRef.value` 已有值（非 null）
+- 登出后没有任何代码触发 `refreshHouseholdSelf()`
+- `get()` 的条件 `!(householdSelfRef.value || loading.value)` 为 false（因为 ref 有值）
+- **旧数据保留在内存中**，不会被自动清空
+- 只有当某个组件后续再次调用 `useHouseholdSelf()` → `get()`，且在此之前 ref 被其他路径置为 null，才会触发 refresh
+
+---
+
+##### 场景 2：切换用户（A 登出 → B 登录，同标签页未刷新）
+
+**完整时序**：
+
+| 步骤 | 操作 | `auth.user.value` | `householdSelfRef.value` | `get()` 是否触发 refresh |
+|------|------|-------------------|--------------------------|--------------------------|
+| T0 | 用户 A 正常使用，已调用过 `useHouseholdSelf()` | A 用户对象 | **A 家庭数据**（非 null） | — |
+| T1 | 用户 A 点击登出，执行 `signOut()` | `null` | **仍为 A 家庭数据**（未被清空） | ❌ 不触发（ref 仍有值） |
+| T2 | 跳转到 `/login` 页，页面未刷新 | `null` | **仍为 A 家庭数据** | — |
+| T3 | 用户 B 输入凭据登录，`signIn()` → `getSession()` | **B 用户对象** | **仍为 A 家庭数据** | — |
+| T4 | 跳转到主页，某个组件挂载时调用 `useHouseholdSelf()` → `actions.get()` | B 用户对象 | **仍为 A 家庭数据** | ❌ **不触发**（因为 `householdSelfRef.value` 非 null，条件短路） |
+| T5 | 组件渲染时访问 `household.value.preferences` | B 用户对象 | **返回 A 的家庭偏好数据** | — |
+
+> **实际 Bug 场景**：T4-T5 之间，新登录的用户 B 会读取到用户 A 的家庭数据（含 preferences、privateHousehold 等敏感设置），直到页面刷新或有人显式调用 `refreshHouseholdSelf()`。
+
+**风险加重因素**：
+- `useHouseholdSelf` 的 actions **未暴露 refresh() 方法**，外部无法主动刷新
+- `get()` 是同步返回的，组件不会等待异步 refresh 完成
+
+---
+
+##### 场景 3：get() 短路返回（已有缓存值）
+
+一旦 `householdSelfRef.value` 被赋过一次值：
+
+```typescript
+// 组件 A 首次调用
+const { household } = useHouseholdSelf();
+// → get() → ref=null → 触发 refresh → 写入 A 的家庭数据
+
+// 组件 B 在同生命周期内调用
+const { household } = useHouseholdSelf();
+// → get() → ref=A家庭数据 → 条件不满足 → 短路返回旧值
+// → ✅ 正常，避免重复请求
+
+// 用户登出 → B 登录后，组件 C 调用
+const { household } = useHouseholdSelf();
+// → get() → ref=A家庭数据 → 条件不满足 → 短路返回旧值
+// → ❌ Bug：返回 A 的家庭数据给 B 用户
+```
+
+---
+
+##### 场景 4：手动刷新（UI 层面）
+
+| 缓存类型 | 是否提供手动刷新方法 | 能否主动清除/刷新 |
+|-----------|---------------------|-------------------|
+| householdSelfRef | ❌ actions 中无 refresh() | ❌ 无法手动刷新，除非刷新页面 |
+| groupSelfRef | ✅ `actions.refresh()`（[use-groups.ts#L61-L63](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-groups.ts#L61-L63)） | ✅ 可调用，但当前代码中无任何调用点 |
+| 9 个列表 store | ✅ 各 store 自有的 `flushStore()` | ✅ 可通过 `clearAllStores()` 统一清空 |
+| LocalStorage 用户偏好 | 无需（用户修改时自动写入） | 需浏览器手动清除 |
+
+---
+
+##### 场景 5：页面刷新（F5 / Ctrl+R）
+
+**行为**：
+1. 浏览器重新加载，整个 JS 运行时销毁重建
+2. 所有模块级 ref 重新初始化为 `null`：
+   - `householdSelfRef = ref(null)`
+   - `groupSelfRef = ref(null)`
+   - `authUser = ref(null)`
+   - `__cachedTheme = undefined`
+   - `i18n = null`
+3. 组件重新挂载 → 调用 `useHouseholdSelf()` → `actions.get()`：
+   - `householdSelfRef.value` 为 `null`
+   - `loading.value` 为 `false`
+   - 条件满足 → 触发 `refreshHouseholdSelf()`
+   - 检查 `auth.user.value`：
+     - 若有有效 cookie：调用 API 获取当前用户家庭数据
+     - 若无有效 cookie：`!auth.user.value` → 置 `householdSelfRef.value = null` 并返回
+
+> ✅ **页面刷新是唯一可靠的缓存失效方式**，能确保 householdSelfRef / groupSelfRef 与当前登录用户完全同步。
+
+---
+
+#### 四、各缓存风险关系校准
+
+| 缓存类型 | 存储介质 | 登出后是否残留 | 切换用户（同标签页）风险 | 泄露数据敏感度 |
+|----------|----------|----------------|-------------------------|---------------|
+| **householdSelfRef** | 模块级 ref（JS 内存） | ⚠️ **可能残留** | 🔴 **高**：返回 A 用户家庭数据给 B 用户（实际 Bug） | 高（preferences、私有设置） |
+| **groupSelfRef** | 模块级 ref（JS 内存） | ⚠️ 可能残留 | 🔴 高：同上 | 中（preferences、AI Provider 设置） |
+| LocalStorage 用户偏好（12 类） | 浏览器 LocalStorage | ⚠️ **永久残留** | 🟡 中：B 用户继承 A 用户的 UI 偏好（排序、视图、打印等） | 低（仅 UI 偏好） |
+| 主题色 `__cachedTheme` | 模块级变量（JS 内存） | ⚠️ 残留 | 🟢 低：全局配置，无用户区分 | 无 |
+| 主题色 HTTP 缓存 | 浏览器 HTTP Cache（`Cache-Control: max-age=604800`） | ⚠️ 永久残留（7 天） | 🟢 低：全局配置 | 无 |
+| 暗模式 `vueuse-color-scheme` | 浏览器 LocalStorage | ⚠️ 永久残留 | 🟡 低：B 用户继承 A 的亮/暗主题选择 | 无 |
+| i18n Cookie | 浏览器 Cookie（`@nuxtjs/i18n` 管理） | ⚠️ 永久残留 | 🟡 低：B 用户继承 A 的语言选择 | 无 |
+| `$axios.defaults.headers.common["Accept-Language"]` | axios 全局实例（JS 内存） | ⚠️ 残留上次设置 | 🟢 低：下次调用 `useXxxApi()` 时自动更新为当前 locale | 无 |
+| Auth Token Cookie | 浏览器 Cookie | ❌ 清理（`setToken(null)`） | ✅ 无 | — |
+| authUser / authStatus | 模块级 ref（JS 内存） | ❌ 清理（直接赋值 null） | ✅ 无（`getSession()` 重新获取） | — |
+| 9 个列表 store | 模块级 ref（JS 内存） | ❌ 清理（`clearAllStores()`） | ✅ 无（首次访问时重新请求） | — |
+
+---
+
 ### 4.4 各类数据的缓存方式与失效触发汇总
 
 | 数据 | 缓存方式 | 失效触发 |
