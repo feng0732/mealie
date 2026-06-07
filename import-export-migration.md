@@ -68,46 +68,116 @@ mealie_{APP_VERSION}_{YYYY.MM.DD.HH.MM.SS}.zip
 
 **生成入口**：[mealie/services/recipe/recipe_bulk_service.py](mealie/services/recipe/recipe_bulk_service.py#L24-L28) → `RecipeBulkActionsService.export_recipes()`
 
-**ZIP 包内结构**：
+**Recipe 数据目录实际磁盘结构**（[mealie/schema/recipe/recipe.py](mealie/schema/recipe/recipe.py#L202-L237)）：
+
+```
+RECIPE_DATA_DIR/{recipe_id}/       ← recipe.directory
+├── images/                        ← recipe.image_dir
+│   ├── original.webp              ← max 2048×2048, quality 80
+│   ├── min-original.webp          ← max 1024×1024, quality 80
+│   ├── tiny-original.webp         ← 300×300 center-cropped, quality 80
+│   └── timeline/
+│       └── {timeline_event_id}/
+│           ├── original.webp
+│           ├── min-original.webp
+│           └── tiny-original.webp
+└── assets/                        ← recipe.asset_dir
+    ├── {filename1}.pdf
+    ├── {filename2}.md
+    └── ...
+```
+
+图片文件名枚举定义见 [mealie/schema/recipe/recipe_image_types.py](mealie/schema/recipe/recipe_image_types.py#L4-L7)，实际生成逻辑见 [mealie/pkgs/img/minify.py](mealie/pkgs/img/minify.py#L156-L206) → `PillowMinifier.minify()`。
+
+**批量导出 ZIP 内实际结构**（由 [mealie/services/exporter/_abc_exporter.py](mealie/services/exporter/_abc_exporter.py#L48-L88) 和 [mealie/services/exporter/recipe_exporter.py](mealie/services/exporter/recipe_exporter.py#L36-L41) 产生）：
 
 ```
 {export_id}.zip
 └── recipes/
     └── {recipe_slug}/
-        ├── {recipe_slug}.json   # Recipe Pydantic 模型序列化（model_dump_json）
-        ├── images/
-        │   ├── original.webp    # 原图
-        │   ├── image.webp       # 主图
-        │   ├── mini.webp        # 缩略图
-        │   └── timeline/        # 时间线图片
-        └── assets/              # RecipeAsset 文件（PDF/文档等）
+        ├── {recipe_slug}.json                        # ① zip.writestr() 最先写入
+        ├── images/                                    # ② _post_export_hook 递归拷贝 recipe 目录
+        │   ├── original.webp
+        │   ├── min-original.webp
+        │   ├── tiny-original.webp
+        │   └── timeline/
+        │       └── {timeline_event_uuid}/
+        │           ├── original.webp
+        │           ├── min-original.webp
+        │           └── tiny-original.webp
+        └── assets/                                    # 非 .json 文件全量拷贝
+            ├── {file1}.pdf
+            └── ...
 ```
 
-导出实现：
-- 基类遍历逻辑：[mealie/services/exporter/_abc_exporter.py](mealie/services/exporter/_abc_exporter.py#L48-L88) → `ABCExporter.export()`
-  - JSON 写入：`zip.writestr(f"recipes/{slug}/{slug}.json", item.model.model_dump_json())`
-  - 资源目录复制：`_post_export_hook()` 递归拷贝 recipe 目录，排除 `.json`
-- Recipe 级导出器：[mealie/services/exporter/recipe_exporter.py](mealie/services/exporter/recipe_exporter.py)
+**写入顺序**：
+1. 先调用 `zip.writestr(f"recipes/{slug}/{slug}.json", ...)` 写入 JSON
+2. 再调用 `write_dir_to_zip(recipe_dir, f"recipes/{slug}", {".json"})` 递归遍历 `recipe.directory` 下所有非 `.json` 文件
+
+`Path.iterdir()` 的顺序取决于 OS/文件系统，典型（字母序）下目录内容为：
+```
+assets/          # 目录
+images/          # 目录
+```
+
+在 `images/` 内按字母序：
+```
+min-original.webp    # 'm' < 'o' < 't'
+original.webp
+tiny-original.webp
+timeline/            # 目录
+```
+
+**因此，单食谱批量导出 ZIP 的 namelist() 典型顺序为**：
+```
+recipes/slug/slug.json
+recipes/slug/assets/file1.pdf
+recipes/slug/images/min-original.webp
+recipes/slug/images/original.webp
+recipes/slug/images/tiny-original.webp
+recipes/slug/images/timeline/{uuid}/min-original.webp
+recipes/slug/images/timeline/{uuid}/original.webp
+recipes/slug/images/timeline/{uuid}/tiny-original.webp
+```
+
+**多食谱批量导出 ZIP（2 个食谱 A→B）namelist() 典型顺序**：
+```
+recipes/A/A.json
+recipes/A/assets/...
+recipes/A/images/min-original.webp
+recipes/A/images/original.webp
+recipes/A/images/tiny-original.webp
+recipes/A/images/timeline/{uuid}/.../tiny-original.webp
+recipes/B/B.json
+recipes/B/assets/...
+recipes/B/images/min-original.webp
+recipes/B/images/original.webp
+recipes/B/images/tiny-original.webp
+recipes/B/images/timeline/{uuid}/.../tiny-original.webp   ← 最后一个 .webp
+```
 
 ### 2.3 共享食谱单条 ZIP 导出
 
 **生成入口**：[mealie/routes/recipe/shared_routes.py](mealie/routes/recipe/shared_routes.py#L42-L58) → `get_shared_recipe_as_zip()`
 
-**ZIP 包内结构（扁平，无子目录）**：
+**ZIP 包内结构（扁平，无子目录，仅 2 个文件）**：
 
 ```
 {recipe_slug}.zip
-├── {recipe_slug}.json   # Recipe Pydantic 模型序列化
-└── original.webp        # 仅原图（如存在）
+├── {recipe_slug}.json           # Recipe Pydantic 模型序列化
+└── original.webp                # 仅 images/original.webp，无缩略图、无 timeline、无 assets
 ```
 
 实现：
 ```python
+image_asset = recipe.image_dir.joinpath(RecipeImageTypes.original.value)  # "original.webp"
 with ZipFile(temp_path, "w") as myzip:
     myzip.writestr(f"{recipe.slug}.json", recipe.model_dump_json())
     if image_asset.is_file():
-        myzip.write(image_asset, arcname=image_asset.name)
+        myzip.write(image_asset, arcname=image_asset.name)   # arcname = "original.webp"
 ```
+
+namelist() 顺序固定：`["{slug}.json", "original.webp"]`。
 
 ---
 
@@ -231,8 +301,9 @@ HTTP UploadFile
 ⑥ 图片写入
     │  RecipeDataService(recipe.id)
     │    └─ write_image(recipe_image_bytes, "webp")
-    │         ├─ images/original.webp 写入
-    │         ├─ PillowMinifier.minify() 生成 image.webp + mini.webp
+    │         ├─ images/original.webp 写入（无论源是什么分辨率，都以 original 名义保存）
+    │         ├─ PillowMinifier.minify() 生成 min-original.webp + tiny-original.webp
+    │         │  （如果 source 本身就是 tiny，此处会再次压缩 tiny→tiny，画质严重损失）
     │         └─ 异常时删除 partial 文件并 re-raise
     ▼
 返回 Recipe slug
@@ -240,7 +311,8 @@ HTTP UploadFile
 
 #### 3.3.2 关键代码细节
 
-**ZIP 内文件识别逻辑**（仅后缀匹配，无目录结构约束）：
+**ZIP 内文件识别逻辑（仅后缀匹配，无目录结构约束）**：
+
 ```python
 with ZipFile(temp_path) as myzip:
     for file in myzip.namelist():
@@ -251,22 +323,43 @@ with ZipFile(temp_path) as myzip:
             with myzip.open(file) as myfile:
                 recipe_image = myfile.read()
 ```
-- 不关心目录层级：`recipes/foo/foo.json`、`foo.json`、`nested/deep/foo.json` 均可
-- 多个 `.json` / `.webp` 时，**最后一次循环赋值生效**（非确定性，取决于 ZIP 内 namelist 顺序）
-- 仅支持 `.webp` 格式图片，`.jpg`、`.png` 等会被**静默忽略**
+
+代码见 [mealie/services/recipe/recipe_service.py](mealie/services/recipe/recipe_service.py#L313-L320)。
+
+**嵌套 webp 匹配规则（代码核实结论）**：
+- `file.endswith(".webp")` 对路径中的 `/` 完全不敏感，**任意深度子目录中的 webp 都会匹配**
+  - `recipes/slug/images/original.webp` ✅ 匹配
+  - `recipes/slug/images/timeline/{uuid}/tiny-original.webp` ✅ 匹配
+  - `original.webp` ✅ 匹配
+- 多个 `.json` / `.webp` 时，**最后一次循环赋值生效**（非确定性，完全取决于 ZIP 内 `namelist()` 顺序）
+- 仅支持 `.webp` 后缀，`.jpg`、`.png`、`.jpeg` 等会被**静默忽略**，无任何警告
+
+**多张 webp "最后覆盖" 实际选中哪类图片（按典型 namelist 字母序推导）**：
+
+| ZIP 来源 | namelist() 中最后一个 .webp | 实际选中图片 | 分辨率 | 后果 |
+|---------|--------------------------|------------|-------|------|
+| **共享食谱单条导出** | `original.webp` | `images/original.webp` | max 2048×2048 | ✅ 正确 |
+| **单食谱批量导出（无 timeline）** | `images/tiny-original.webp` | **tiny 缩略图** | 300×300 center-crop | 🔴 严重画质下降 |
+| **单食谱批量导出（有 timeline）** | `images/timeline/{uuid}/tiny-original.webp` | **时间线事件的 tiny 缩略图** | 300×300 center-crop | 🔴 严重画质下降 + 可能不是食谱主图 |
+| **多食谱批量导出（N 个食谱）** | 最后一个食谱的 `.../tiny-original.webp` | **最后一个食谱**的 tiny 缩略图 | 300×300 | 🔴 最后一个食谱的 tiny 被当作"原图"，且 JSON 也是最后一个食谱的（JSON 和图片恰好同食谱，但图片分辨率错了） |
+| **手工构造 ZIP** | 取决于 namelist 顺序 | 不确定 | 不确定 | 🟠 非确定性 |
 
 **Group/Household 强制重绑定**：[mealie/services/recipe/recipe_service.py](mealie/services/recipe/recipe_service.py#L283-L297)
+
 ```python
 def _process_recipe_data(self, key, data):
     if isinstance(data, dict):
         data["group_id"] = str(self.user.group_id)
         data["household_id"] = str(self.user.household_id)
 ```
+
 递归应用到所有嵌套 dict，意味着：
 - Recipe JSON 中自带的 `group_id`、`household_id`、`user_id` 全部被**静默丢弃**
-- 嵌套的 Tag / Category 对象的 `group_id` 也被强制替换
+- 嵌套的 Tag / Category / RecipeIngredient 对象的 `group_id` 也被强制替换
+- **注意**：RecipeAsset 对象（列表中的字典）同样会被递归替换 group_id/household_id
 
 **Tag/Category Get-or-Create**：[mealie/services/recipe/recipe_service.py](mealie/services/recipe/recipe_service.py#L255-L267)
+
 ```python
 def _transform_category_or_tag(self, data, repo):
     slug = data.get("slug")
@@ -277,6 +370,7 @@ def _transform_category_or_tag(self, data, repo):
 ```
 
 **Recipe 创建工厂**：[mealie/services/recipe/recipe_service.py](mealie/services/recipe/recipe_service.py#L163-L187)
+
 ```python
 def _recipe_creation_factory(self, name, additional_attrs=None):
     additional_attrs["user_id"] = self.user.id
@@ -286,28 +380,64 @@ def _recipe_creation_factory(self, name, additional_attrs=None):
         additional_attrs["tags"][i]["group_id"] = self.user.group_id
 ```
 
-**图片写入**：[mealie/services/recipe/recipe_data_service.py](mealie/services/recipe/recipe_data_service.py#L85-L109)
+**图片写入（核实文件名）**：[mealie/services/recipe/recipe_data_service.py](mealie/services/recipe/recipe_data_service.py#L85-L109) 和 [mealie/pkgs/img/minify.py](mealie/pkgs/img/minify.py#L156-L206)
+
 ```python
 def write_image(self, file_data, extension, image_dir=None):
     image_path = image_dir.joinpath(f"original.{extension}")
-    image_path.unlink(missing_ok=True)   # ← 若存在先删除（覆盖语义）
-    # 写 original.webp
-    self.minifier.minify(image_path)     # ← 生成 image.webp + mini.webp
+    image_path.unlink(missing_ok=True)   # 若存在先删除（覆盖语义）
+    with image_path.open("wb") as f:
+        f.write(file_data)
+    self.minifier.minify(image_path)     # 生成 min-original.webp + tiny-original.webp
 ```
 
-#### 3.3.3 导入 ZIP 与导出 ZIP 结构对应关系
+minify 的实际输出文件名：
+```python
+org_dest = image_path.parent.joinpath("original.webp")     # ← 输入本身就叫 original.webp
+min_dest = image_path.parent.joinpath("min-original.webp")
+tiny_dest = image_path.parent.joinpath("tiny-original.webp")
+```
 
-| 导出类型 | ZIP 结构 | create_from_zip 能否读取 | 备注 |
-|---------|---------|------------------------|------|
-| **共享食谱单条导出** (`shared/{token}/zip`) | 扁平：`{slug}.json` + `original.webp` | ✅ 完全兼容 | 最匹配的导入来源 |
-| **批量导出** (`bulk-actions/export`) | 嵌套：`recipes/{slug}/{slug}.json` + `images/original.webp` + `assets/` | ⚠ JSON 能读，图片 **读不到** | 图片在 `images/` 子目录但命名匹配（都是 `.webp`），但 **assets/ 下所有资源完全丢失** |
-| **MealieAlpha 迁移包** (`mealie_alpha.py`) | `recipes/{slug}/{slug}.json` + 同级图片目录 | ⚠ 取决于具体子目录 | 同上 |
-| **手工构造 ZIP** | 任意目录 + `.json`/`.webp` | ✅ 只要后缀匹配即可 | 但多个 JSON/图片时结果不确定 |
+**严重隐患**：如果输入的 bytes 本身是一张 300×300 的 `tiny-original.webp`，它会被当作 `original.webp` 写入磁盘，然后 minify 会再次从它生成：
+- `min-original.webp`：300×300 thumbnail → 被缩到 1024×1024 canvas（实际无放大，等于原图）
+- `tiny-original.webp`：300×300 → 再次 center-crop 到 300×300（重编码，画质进一步下降）
+- 最终新 recipe 的所有图片都来自时间线的 tiny 缩略图，最大分辨率仅 300×300。
 
-**关键不匹配点**：
-- 批量导出的图片路径是 `recipes/{slug}/images/original.webp`，create_from_zip 不检查 `images/` 前缀，但 `.endswith(".webp")` 仍能命中——前提是 ZIP 内没有其他 webp 文件
-- 批量导出的 `assets/` 目录（PDF、TXT 等 RecipeAsset 文件）在导入链路中**完全没有处理**，不会重建 RecipeAsset 记录，也不会写入磁盘
-- 批量导出的 `timeline/` 图片、`mini.webp`、`image.webp` 在导入时会被 minifier 重新生成，不影响结果
+#### 3.3.3 导入 ZIP 与导出 ZIP 结构对应关系（代码核实版）
+
+| 导出类型 | ZIP 结构 | create_from_zip 匹配行为 | 兼容性结论 |
+|---------|---------|------------------------|----------|
+| **共享食谱单条导出** (`shared/{token}/zip`) | 扁平：`{slug}.json` + `original.webp`，共 2 个文件 | ✅ JSON 和 webp 都唯一匹配，namelist 顺序确定 | **完全兼容**（最匹配的导入来源） |
+| **单食谱批量导出（无 timeline 事件）** | `recipes/{slug}/{slug}.json` + `images/` 下 3 个 webp + `assets/` | `namelist()` 最后一个 webp 是 `images/tiny-original.webp`（300×300） | ⚠ **JSON 能读，图片错拿 tiny 缩略图当原图**；assets 文件和 DB 记录不匹配 |
+| **单食谱批量导出（有 timeline 事件）** | 同上 + `images/timeline/{uuid}/` 下 3 个 webp | 最后一个 webp 是 timeline 的 `tiny-original.webp` | 🔴 **JSON 能读，但图片拿了时间线事件的 300×300 缩略图**；可能不是食谱主图 |
+| **多食谱批量导出（N 个食谱）** | N 份 `recipes/{slug}/...` 叠加 | 最后 JSON 和最后 webp 都来自**最后一个食谱** | 🟠 **仅导入最后一个食谱**，其余 N-1 个完全丢失；且仍拿的是 tiny 缩略图 |
+| **MealieAlpha 迁移包** | `recipes/{slug}/{slug}.json` + 同级图片目录 | 取决于具体子目录结构 | ⚠ 不确定 |
+| **手工构造 ZIP** | 任意目录 + `.json`/`.webp` | 只要后缀匹配即可，但多文件结果不确定 | 🟡 需保证仅 1 JSON + 1 webp |
+
+**代码核实的关键不匹配点**：
+
+1. **🔴 图片错配是确定性问题，不是"可能读不到"**：批量导出的 3+ 张 webp 全部匹配 `.endswith(".webp")`，不是之前认为的"图片读不到"；实际是**读多了且拿错了**。字母序下 `tiny-original.webp`（'t' 开头）几乎总是最后一个。
+
+2. **🔴 RecipeAsset 孤儿 DB 记录**：
+   - JSON 中 `recipe_asset: [{...}, {...}]` 列表随 Recipe 一起通过 `Recipe(**cleaned_dict)` 写入数据库（`recipe_assets` 表有记录）
+   - 但 `assets/` 下的实际文件（PDF/MD 等）在 create_from_zip 中**完全不处理**，不会写入新 recipe 的 `assets/` 目录
+   - 结果：DB 里有 RecipeAsset 行，磁盘上文件不存在 → 前端点击下载 404
+
+3. **🔴 Timeline 事件孤儿图片**：
+   - JSON 中 `recipe_timeline: [{... image: true ...}, ...]` 随 Recipe 写入 `recipe_timeline_events` 表
+   - 但 `images/timeline/{event_id}/` 下的 3 个 webp 文件完全不拷贝
+   - 结果：时间线事件引用图片路径，但文件不存在 → `/api/recipes/{id}/images/timeline/...` 返回 404
+
+4. **🟡 Recipe.image 缓存 key 不匹配**：
+   - `recipes.image` 列（[mealie/db/models/recipe/recipe.py](mealie/db/models/recipe/recipe.py#L84)）存储的是源 Recipe 的缓存 key 字符串
+   - 新 Recipe 落库时沿用了 JSON 中的旧值
+   - 但实际图片存放在 `RECIPE_DATA_DIR/{new_recipe_id}/images/`（按新 recipe id 生成路径）
+   - 前端首次渲染可能尝试用旧缓存 key 取图 → 404；刷新后从新路径读取正常
+
+5. **🟡 多食谱批量导出 ZIP 仅导入最后一个**：
+   - `ABCExporter.export()` 按 `items()` 顺序逐个写入 A→B→C→...
+   - 最后 JSON 和最后 webp 都来自最后一个食谱
+   - 前面 N-1 个食谱的 JSON 和图片被完全静默丢弃，无报错、无日志
 
 ---
 
@@ -319,9 +449,9 @@ def write_image(self, file_data, extension, image_dir=None):
 Group (组)
   ├── 1:N → Household (家庭)
   │        └── 1:N → User (用户)
-  │                 └── 1:N → Recipe (食谱，通过 user 关联)
-  │                 └── 1:N → GroupMealPlan (用餐计划)
-  │                 └── 1:N → ShoppingList (购物清单)
+  │                 └─ 1:N → Recipe (食谱，通过 user 关联)
+  │                 └─ 1:N → GroupMealPlan (用餐计划)
+  │                 └─ 1:N → ShoppingList (购物清单)
   │
   ├── 1:N → Tag (标签)
   ├── 1:N → Category (分类)
@@ -433,11 +563,11 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 |-------|---------|------|
 | **Recipe schema 新增必填字段** | 新版本 Recipe Pydantic 模型新增无默认值的字段，旧版导出的 JSON 缺失该字段 | `Recipe(**data)` 抛 `ValidationError`，整条导入失败，HTTP 500 |
 | **字段类型变更** | 字段从 `str` 改为 `int` / `list` 等 | Pydantic 校验失败，同上 |
-| **嵌套子对象 schema 演进** | RecipeIngredient / RecipeStep / Nutrition 等新增必填字段 | 同上 |
+| **嵌套子对象 schema 演进** | RecipeIngredient / RecipeStep / Nutrition / RecipeAsset 等新增必填字段 | 同上 |
 | **Tag/Category schema 变更** | Tag 模型新增必填列（如 color 字段），旧 JSON 没有 | `_transform_category_or_tag` 在 `repo.create(data)` 时抛 IntegrityError |
 | **废弃字段被删除** | 导出的 JSON 含已删除字段名 | Pydantic 默认 `extra="ignore"`，通常可容忍；但若 `extra="forbid"` 则失败 |
 
-**关键缺失**：create_from_zip 链路**没有**调用 `cleaner.clean()` 做 schema 兼容层处理，完全依赖 Pydantic 的 `model_validate`，也**没有**版本号/迁移策略机制。
+**关键缺失**：create_from_zip 链路**没有**调用 `cleaner.clean()` 做 schema 兼容层处理（第三方迁移链路有），完全依赖 Pydantic 的 `model_validate`，也**没有**版本号/迁移策略机制。
 
 ### 5.2 文件资源迁移风险
 
@@ -453,22 +583,33 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 **风险点**：
 1. **DATA_DIR 整体覆盖**：恢复时删除目标目录再复制，若 DATA_DIR 中有备份未包含的新文件会被**静默删除**。
 2. **食谱图片与 database.json 不同步**：全量备份的 database.json 是时间点快照，但图片是遍历文件系统收集。若备份期间有 recipe 删除，可能残留 orphan 图片。
-3. **绝对路径依赖**：Recipe 模型的 `image` 字段存储的是文件名（不含路径），但 `directory` 属性依赖 `group_id` 生成路径。若 group_id 在恢复后发生变化，图片路径会失效。
-4. **PostgreSQL 序列重置不完整**：[mealie/services/backups_v2/alchemy_exporter.py](mealie/services/backups_v2/alchemy_exporter.py#L217-L240) 的序列重置列表是**硬编码**的，新增加 ID 自增序列的表如果忘记加进列表，会导致后续 INSERT 主键冲突。
+3. **PostgreSQL 序列重置不完整**：[mealie/services/backups_v2/alchemy_exporter.py](mealie/services/backups_v2/alchemy_exporter.py#L217-L240) 的序列重置列表是**硬编码**的，新增加 ID 自增序列的表如果忘记加进列表，会导致后续 INSERT 主键冲突。
 
-#### 5.2.2 Recipe ZIP 导入
+#### 5.2.2 Recipe ZIP 导入（代码核实版）
 
-| 资源类型 | 处理方式 | 风险 |
-|---------|---------|------|
-| **original.webp** | `write_image(bytes, "webp")` → 写入 + minify | ✅ 覆盖写入，minify 失败自动清理 partial 文件 |
-| **其他格式图片（jpg/png/gif...）** | `elif file.endswith(".webp")` 不匹配 → **静默丢弃** | 🔴 导出为非 webp 格式（如第三方工具）的图片全部丢失，无报错 |
-| **assets/ 目录（PDF/TXT/MD/CSV 等）** | 完全不处理 | 🔴 RecipeAsset 记录不创建，文件不写入磁盘，静默丢失 |
-| **images/mini.webp, image.webp** | 不读取，由 minify 重新生成 | 🟡 无功能损失，但浪费导出时的压缩算力 |
-| **timeline/ 时间线图片** | 完全不处理 | 🟠 RecipeTimelineEvent 记录里可能引用不存在的图片路径 |
-| **多个 webp 文件** | 循环最后赋值生效，前面的被丢弃 | 🟠 取决于 namelist 顺序，可能出现非原图被误当 original |
-| **JSON 引用的 image 字段缓存 key** | JSON 中 `image` 字段（cache key）落库，但 minify 后产生新 cache key，两者不一致 | 🟡 `create_one` 后 recipe.image 仍是旧值，前端首次加载可能 404，刷新后正常 |
+| 资源类型 | 处理方式 | 风险等级 | 详细后果 |
+|---------|---------|---------|---------|
+| **共享 ZIP 的 `original.webp`** | `write_image(bytes, "webp")` → 写入 + minify 生成 3 尺寸 | ✅ 正常 | 仅共享 ZIP 可靠 |
+| **批量 ZIP 的 `images/original.webp`** | 被 `min-original.webp` 和 `tiny-original.webp` 覆盖，实际不会被选中 | 🔴 严重 | 原图永远不会被用到 |
+| **批量 ZIP 的 `images/tiny-original.webp`** | 被当作 "original" 写入 → 再次 minify 生成 min+tiny | 🔴 严重 | 300×300 center-crop 成为最高清版本，所有尺寸都模糊 |
+| **批量 ZIP 的 timeline `tiny-original.webp`** | 同上，但可能是**非食谱主图**的时间线事件图 | 🔴 严重 | 食物成品照片被替换成操作步骤截图 / 空盘照等 |
+| **非 webp 格式图片（jpg/png/gif...）** | `elif file.endswith(".webp")` 不匹配 → **静默丢弃** | 🔴 严重 | 图片完全丢失，无任何报错或日志 |
+| **RecipeAsset 文件（PDF/MD/TXT...）** | 完全不读取不拷贝 | 🔴 严重 | **DB 已创建 RecipeAsset 记录**（随 JSON 写入），磁盘上无文件 → 404 孤儿行 |
+| **Timeline 事件图片** | 完全不读取不拷贝 | 🟠 中高 | DB 已创建 `recipe_timeline_events` 记录，磁盘上无图片 → 时间线图片 404 |
+| **Recipe.image 缓存 key** | JSON 中源 recipe 的缓存 key 直接落库 | 🟡 中 | 缓存 key 与新 recipe 的图片路径/UUID 不匹配，首次前端加载可能 404 |
+| **多食谱 ZIP 中除最后一个外的所有食谱** | JSON 和图片被循环覆盖 | 🔴 严重 | N-1 个食谱完全静默丢失，无提示 |
 
-**路径穿越防护**：create_from_zip 直接使用 `myzip.open(file)` 读取 bytes，不写入磁盘（无路径拼接），因此不存在 `../../` 目录穿越风险，这一点优于第三方迁移链路。
+**路径穿越防护**：create_from_zip 直接使用 `myzip.open(file)` 读取 bytes 到内存，不写入磁盘（无路径拼接），因此不存在 `../../` 目录穿越风险，这一点优于第三方迁移链路。
+
+**图片被误用的连锁损失（代码核实）**：
+
+假设源食谱有一张 4000×3000 的原图，导出到批量 ZIP 后再导入：
+1. 源 `tiny-original.webp`：300×300 center-crop（丢弃了边缘内容），~15KB
+2. 该 bytes 被写入新 recipe 的 `original.webp`
+3. minify 从这张 300×300 再次生成：
+   - 新 `min-original.webp`：300×300 → thumbnail 到 1024 canvas（实际还是 300×300，被重新编码）
+   - 新 `tiny-original.webp`：300×300 → 再次 center-crop 到 300×300（二次重编码，进一步损失）
+4. 最终新 recipe 的最高清图片就是那张 300×300 center-crop，原图细节永久丢失
 
 ### 5.3 冲突合并风险
 
@@ -488,9 +629,11 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | 冲突场景 | 处理策略 | 风险等级 | 详细说明 |
 |---------|---------|---------|---------|
 | **Slug 冲突（同 Group 已存在同名食谱）** | DB IntegrityError → HTTP 400 "Recipe already exists" | 🟡 中 | 前端能感知到失败，但没有"覆盖/跳过/改名"选项，用户只能手动改名后重导 |
-| **Tag slug 冲突（同 Group 已有同名 Tag）** | `get_one(slug)` 命中 → 返回已有记录的 `model_dump()` | 🟠 中高 | 导入 JSON 中 tag 的自定义属性（如 id、创建时间、color）被静默丢弃，直接复用目标实例已有 tag |
+| **Tag slug 冲突（同 Group 已有同名 Tag）** | `get_one(slug)` 命中 → 返回已有记录的 `model_dump()` | 🟠 中高 | 导入 JSON 中 tag 的自定义属性（如 id、创建时间）被静默丢弃，直接复用目标实例已有 tag |
 | **Category slug 冲突** | 同上 | 🟠 中高 | 同上 |
 | **User ID 冲突（JSON 中 user_id 指向不存在/跨 Group 用户）** | `_transform_user_id` 回退到当前用户 | 🟡 中 | 原作者信息丢失，全部归为导入者 |
+| **多 webp 互相覆盖** | 循环最后赋值生效 | 🔴 高 | 字母序下最后是 tiny 缩略图，高概率拿错图片 |
+| **多 JSON 互相覆盖（多食谱 ZIP）** | 循环最后赋值生效 | 🔴 高 | 仅最后一个食谱被导入，其余静默丢失 |
 | **图片文件名冲突** | `write_image` 内部 `image_path.unlink(missing_ok=True)` 先删再写 | 🟢 低 | 新 recipe 有独立 id 目录，不会冲突；同一 recipe 重试会覆盖自己，正常 |
 | **ID 冲突** | JSON 中 `id` 被 `_recipe_creation_factory` 忽略，由 ORM 重新生成 | 🟢 低 | UUID 冲突概率可忽略 |
 | **Group 交叉（从 A Group 导出导入到 B Group）** | `_process_recipe_data` 强制重写 `group_id` / `household_id` | 🔴 高 | **所有嵌套对象的 group_id 被 B Group 覆盖**；但 Tag/Category 按 slug 复用，如果 B Group 没有该 slug 会新建归属于 B，数据归属整体正确 |
@@ -508,8 +651,11 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | Tag/Category 冲突处理 | — | 🟡 复用（丢属性） | 🟠 复用（丢属性） |
 | Group/Household 归属 | 备份原样保留 | 🔴 归为当前 | 🔴 归为当前 |
 | 字段缺失校验 | 🟡 Alembic 自动迁移 | 🟡 cleaner 清洗 | 🔴 纯 Pydantic 校验，无兼容层 |
-| RecipeAsset 处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 完全丢失 |
+| RecipeAsset 处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **DB 孤儿记录，文件丢失** |
+| Timeline 图片处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **DB 孤儿记录，图片丢失** |
+| 主图分辨率正确性 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 **仅共享 ZIP 正确，批量 ZIP 拿 tiny 缩略图** |
 | 非 webp 图片 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 静默丢弃 |
+| 多食谱 ZIP 处理 | — | — | 🔴 **仅导入最后一个** |
 | 路径穿越风险 | 🟢 无 | 🟡 safe_local_path 防护 | 🟢 无（直接读 bytes） |
 
 ---
@@ -527,15 +673,19 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | Recipe ZIP 导入核心 | [mealie/services/recipe/recipe_service.py](mealie/services/recipe/recipe_service.py)（`create_from_zip`） |
 | Recipe 数据清洗（scraper 兼容层） | [mealie/services/scraper/cleaner.py](mealie/services/scraper/cleaner.py) |
 | 图片/资源读写服务 | [mealie/services/recipe/recipe_data_service.py](mealie/services/recipe/recipe_data_service.py) |
+| 图片压缩/尺寸生成 | [mealie/pkgs/img/minify.py](mealie/pkgs/img/minify.py) |
+| 图片文件名枚举 | [mealie/schema/recipe/recipe_image_types.py](mealie/schema/recipe/recipe_image_types.py) |
 | 食谱批量导出服务 | [mealie/services/recipe/recipe_bulk_service.py](mealie/services/recipe/recipe_bulk_service.py) |
 | 食谱批量导出执行器 | [mealie/services/exporter/recipe_exporter.py](mealie/services/exporter/recipe_exporter.py) |
 | 食谱批量导出基类 | [mealie/services/exporter/_abc_exporter.py](mealie/services/exporter/_abc_exporter.py) |
 | 共享食谱 ZIP 导出 | [mealie/routes/recipe/shared_routes.py](mealie/routes/recipe/shared_routes.py)（`GET /shared/{token}/zip`） |
 | 数据修复（迁移后） | [mealie/db/fixes/fix_migration_data.py](mealie/db/fixes/fix_migration_data.py) |
+| Recipe Schema（含 directory/image_dir/asset_dir 定义） | [mealie/schema/recipe/recipe.py](mealie/schema/recipe/recipe.py) |
 | Group 模型 | [mealie/db/models/group/group.py](mealie/db/models/group/group.py) |
 | Household 模型 | [mealie/db/models/household/household.py](mealie/db/models/household/household.py) |
 | Recipe 模型 | [mealie/db/models/recipe/recipe.py](mealie/db/models/recipe/recipe.py) |
 | Meal Plan 模型 | [mealie/db/models/household/mealplan.py](mealie/db/models/household/mealplan.py) |
 | Tag/Category 模型 | [mealie/db/models/recipe/tag.py](mealie/db/models/recipe/tag.py), [mealie/db/models/recipe/category.py](mealie/db/models/recipe/category.py) |
+| 静态图片路由（含 timeline） | [mealie/routes/media/media_recipe.py](mealie/routes/media/media_recipe.py) |
 | 恢复测试用例 | [tests/unit_tests/services_tests/backup_v2_tests/test_backup_v2.py](tests/unit_tests/services_tests/backup_v2_tests/test_backup_v2.py) |
 | Recipe ZIP 导入集成测试 | [tests/integration_tests/user_recipe_tests/test_recipe_bulk_import.py](tests/integration_tests/user_recipe_tests/test_recipe_bulk_import.py) |
