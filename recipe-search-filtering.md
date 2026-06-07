@@ -530,7 +530,7 @@ else:
     q.query_filter = public_filter
 ```
 
-然后调用 `self.cross_household_repos.find_suggested_recipes(q, foods, tools)`。
+然后调用 `self.cross_household_recipes.find_suggested_recipes(q, foods, tools)`。
 
 ### 11.2 RecipeSuggestionQuery 参数结构
 
