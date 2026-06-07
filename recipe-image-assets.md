@@ -66,15 +66,21 @@
 ```
 ① self.mixins.get_one(slug)             # 读取 Recipe（仅 household 过滤，无权限校验）
 ② RecipeDataService(recipe.id)           # ★ 创建 {recipe_id}/images/ 等目录（磁盘已变化）
-③ await data_service.scrape_image(url)   # ★ 下载、写入三种 webp 到磁盘（磁盘已变化）
-   → 可能失败点：网络异常、非 200、非图片 Content-Type、PIL 解码失败
-   → NotAnImageError → 400；InvalidDomainError → 400；其他异常未显式捕获 → 500
-④ recipe.image = cache.new_key(4)        # 修改内存对象
+③ await data_service.scrape_image(url)   # ★ 内部分两条路径：
+   ├─ 网络异常 / 非 200 → return None（静默，不抛异常）→ 继续执行 ④⑤
+   │     → 磁盘上只有空目录，无 webp 文件
+   ├─ Content-Type 非 image → raise NotAnImageError → 路由捕获 → 400，终止于 ③
+   ├─ URL 解析失败 → raise ValueError → 路由未捕获 → 通常 500，终止于 ③
+   ├─ PIL 解码失败 → raise → 通常 500，终止于 ③（但临时 original.{ext} 已被 unlink）
+   └─ 成功 → 写入三种 webp → 继续执行 ④⑤
+④ recipe.image = cache.new_key(4)        # 修改内存对象（return None 时也会执行，缓存键被无意义地刷新）
 ⑤ self.service.update_one(slug, recipe)  # ★ 权限校验在此处（写之后）
    → 内部调用 _pre_update_check → can_update([slug])
    → 失败：抛 PermissionDenied → handle_exceptions → 403
-   → 但磁盘上图片已经写入！
+   → 但磁盘上图片/目录已经写入！
 ```
+
+**静默失败的副作用**：当 scrape_image 因网络故障或非 200 返回 None 时，步骤 ④⑤ 仍会执行，`recipes.image` 被赋予新的缓存键，但磁盘上的图片根本没更新。前端拿到新的 version 参数会绕过浏览器缓存去请求图片，结果发现和旧图没有区别（或根本没有图），产生一次无意义的缓存失效。
 
 **未授权遗留状态分析**：
 - 若 can_update 在步骤 ⑤ 失败（PermissionDenied），步骤 ②③ 已在磁盘写入了：
@@ -169,42 +175,82 @@ POST /api/recipes/create/url  {url: "https://example.com/recipe"}
 | RecipeScraperOpenAITranscription | yt-dlp 返回的 `thumbnail_url` |
 | RecipeScraperOpenGraph | `<meta property="og:image">` 标签 |
 
-### 2.3 列表图片 URL 的选择逻辑
+### 2.3 列表图片 URL 的选择规则（两种不同策略）
 
-图片字段三种类型，scrape_image 中处理逻辑不同：
+图片字段可能是 `str`、`list[str]` 或 `dict` 三种类型。**根据调用入口不同，列表的处理策略完全不同**：
 
-**在 create_from_html 调用之前**（[scraper.py#L64-L66](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L64-L66)）：
+#### 路径 1：URL 创建导入（create_from_html）→ 取第一张
+
+在 `scrape_image` 被调用之前，[scraper.py#L64-L66](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L64-L66) 会先对列表做截断：
 ```python
 if isinstance(new_recipe.image, list):
-    new_recipe.image = new_recipe.image[0]   # ★ 列表直接取第一个元素（非最大）
+    new_recipe.image = new_recipe.image[0]   # ★ 直接取索引 0，不比较大小
 ```
-**create_from_html 对列表只取索引 0**，多分辨率信息被丢弃。
+多分辨率信息被丢弃，`scrape_image` 收到的只是单个字符串 URL。
 
-**在 scrape_image 函数内部**（[recipe_data_service.py#L124-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L124-L139)）—— 此分支仅当 scrape_image 被直接调用（例如手动 POST /{slug}/image 传数组）时触发：
-- `str`：直接作为 image_url_str
-- `list[str]`：调用 `largest_content_len(urls)`，并发 HEAD 请求各 URL，选 Content-Length 最大的
-- `dict`：取 `dict["url"]` 字段
+#### 路径 2：直接抓图接口（POST /{slug}/image）→ 按 Content-Length 选最大
 
-**largest_content_len 失败行为**（[recipe_data_service.py#L28-L46](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)）：
-- 并发上限 10，`gather_with_concurrency(..., ignore_exceptions=True)` 过滤掉抛异常的响应
-- 若所有 HEAD 均失败（超时、DNS 错误、连接被拒等），`responses` 为空 → `largest_url = ""` → 回到 scrape_image 第 138 行 `if not image_url_str: raise ValueError("image url could not be parsed...")`
+`scrape_image` 函数内部（[recipe_data_service.py#L124-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L124-L139)）的完整分支逻辑：
+| 输入类型 | 处理方式 |
+|---------|---------|
+| `str` | 直接赋值 `image_url_str` |
+| `list[str]` | 调用 `largest_content_len(urls)`，并发 HEAD 请求各 URL，选 `Content-Length` 响应头最大的那个 |
+| `dict` | 取 `dict["url"]` 字段 |
+| 其他 / 解析后为空 | `raise ValueError("image url could not be parsed from input...")` |
+
+**largest_content_len 实现细节**（[recipe_data_service.py#L28-L46](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L28-L46)）：
+- 并发上限 Semaphore(10)
+- `gather_with_concurrency(..., ignore_exceptions=True)` 过滤掉抛异常的响应（超时、DNS、TLS 失败等）
+- 若所有 HEAD 均失败，`responses` 为空 → `largest_url = ""`，`largest_len = 0`
+- 回到 scrape_image 第 138 行 `if not image_url_str: raise ValueError(...)` —— 这是**抛异常**，会进入 except 分支
+
+#### 两种入口汇总
+
+| 调用入口 | list 处理策略 | 最大分辨率是否被利用 |
+|---------|--------------|-------------------|
+| URL 创建导入（`create_from_html`） | 取 `[0]`（通常是最小的） | ❌ 否 |
+| 手动 POST `/{slug}/image` 传数组 | 选 Content-Length 最大 | ✅ 是 |
 
 ---
 
 ### 2.4 URL 导入中各失败场景的精确状态
 
-以下全部发生在 `create_from_html` 的 try/except 块（[scraper.py#L63-L79](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L63-L79)）内部，异常被统一捕获并降级为 `new_recipe.image = "no image"`：
+`create_from_html` 的控制流（[scraper.py#L63-L79](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/scraper/scraper.py#L63-L79)）中存在**两条截然不同的失败路径**：
 
-| 失败场景 | 代码位置 | `new_recipe.image` 最终值 | 磁盘状态 | 是否后续可清理 |
-|---------|---------|-------------------------|---------|--------------|
-| **A. 新 recipe 本身没有 image 字段**（`new_recipe.image` 为 None/空） | scraper.py#L64 | `"no image"` | 仅空目录 `{uuid}/images/`、`{uuid}/assets/`（RecipeDataService __init__ 创建） | 无自动；`clean/recipe-folders` 不删（名字是合法 UUID） |
-| **B. 网络层故障**（DNS 解析失败、连接超时、TLS 握手失败、连接被重置等） | recipe_data_service.py#L151-L154：`except Exception: return None` | `"no image"` | 仅空目录 | 同上 |
-| **C. 远程返回非 200 状态码**（403、404、500、429 等） | recipe_data_service.py#L156-L159：`if r.status_code != 200: return None` | `"no image"` | 仅空目录 | 同上 |
-| **D. 200 但 Content-Type 不含 "image"**（如 text/html、application/pdf 等） | recipe_data_service.py#L161-L165：`raise NotAnImageError` | `"no image"` | 仅空目录（异常在 write_image 之前抛出） | 同上 |
-| **E. 图片下载成功但 PIL 解码失败**（损坏文件、HEIC 缺少依赖、截断的 JPEG、零字节等） | recipe_data_service.py#L168：`self.write_image(...)` → minify.py 内部 PIL 抛异常 → write_image #L106：`image_path.unlink()` 后 re-raise | `"no image"` | write_image 内部已 `unlink(missing_ok=True)` 删除了临时 original.{ext}，仅空目录；若 minify 生成部分 webp 后失败，已生成的 webp 会残留 | **部分残留 webp 无法自动清理** |
-| **F. 图片下载 + minify 全部成功，但后续 slugify 或其他逻辑抛异常**（极少） | scraper.py#L77-L79：统一捕获 | `"no image"` | 三尺寸 webp 完整存在于 `{uuid}/images/` | 永久孤儿 webp，无自动清理 |
+```python
+try:
+    if new_recipe.image:                          # 空值跳过
+        if isinstance(new_recipe.image, list):    # 列表取第一张
+            new_recipe.image = new_recipe.image[0]
+        await recipe_data_service.scrape_image(new_recipe.image)
+                                                      # ↑ scrape_image 内部有两种行为：
+                                                      #   1. return None    → 静默失败，不抛异常
+                                                      #   2. raise XxxError → 跳入 except 分支
+    new_recipe.slug = slugify(new_recipe.name)
+    new_recipe.image = cache.new_key(4)             # ★ 只有不抛异常才走到这里
+except Exception as e:
+    new_recipe.image = "no image"                   # ★ 只有抛异常才走到这里
+```
 
-所有 A–F 场景下，`create_from_html` 不会中断，仍然返回 Recipe 对象（`image="no image"`）给调用方继续写入 DB。
+因此**只有抛异常的场景才得到 `"no image"`；静默 `return None` 的场景反而得到合法的 `cache.new_key(4)` 缓存键**。以下按场景逐一精确说明：
+
+| # | 失败场景 | scrape_image 行为 | 最终 `recipes.image` 值 | 缓存键 | 磁盘状态 | 后续是否可自动清理 |
+|---|---------|------------------|----------------------|--------|---------|-----------------|
+| **A** | 新 recipe 本身无 image 字段（`new_recipe.image` 为 None/空/False） | `if new_recipe.image:` 为 False，**scrape_image 根本不被调用** | `cache.new_key(4)`（4 位随机串） | ✅ 合法缓存键 | 仅空目录 `{uuid}/images/`、`{uuid}/assets/`（RecipeDataService `__init__` 创建） | ❌ 无自动；`clean/recipe-folders` 不删（合法 UUID）；`clean/images` 也不删（无非 webp 文件） |
+| **B** | 网络层故障（DNS 解析失败、连接超时、TLS 握手失败、连接被重置等） | [recipe_data_service.py#L151-L154](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L151-L154)：`except Exception: return None` **（不抛异常）** | `cache.new_key(4)`（4 位随机串） | ✅ 合法缓存键 | 仅空目录（GET 请求失败，不写文件） | ❌ 同上 |
+| **C** | 远程返回非 200 状态码（403、404、500、429 等） | [recipe_data_service.py#L156-L159](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L156-L159)：`if r.status_code != 200: return None` **（不抛异常）** | `cache.new_key(4)`（4 位随机串） | ✅ 合法缓存键 | 仅空目录（状态码不对，不写文件） | ❌ 同上 |
+| **D** | 200 但 Content-Type 不含 `"image"`（如 text/html、application/pdf 等） | [recipe_data_service.py#L161-L165](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L161-L165)：`raise NotAnImageError` **（抛异常）** | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 仅空目录（异常在 write_image 之前抛出） | ❌ 同上 |
+| **E** | 图片下载成功但 PIL 解码失败（损坏文件、HEIC 缺少依赖、截断的 JPEG、零字节等） | [recipe_data_service.py#L168](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L168)：`self.write_image(...)` 内部 minify 抛异常 → [write_image#L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L102-L107)：`image_path.unlink()` 后 re-raise **（抛异常）** | `"no image"`（硬编码字符串） | ❌ 非缓存键 | write_image 已 `unlink(missing_ok=True)` 删除了临时 `original.{ext}`；若 minify 生成了部分 webp 后才失败（如生成 original.webp 成功但生成 tiny 时磁盘满），已生成的 webp 会**残留在磁盘上** | ❌ 残留 webp 无法自动清理 |
+| **F** | image URL 解析失败（list 所有 HEAD 均失败、dict 无 url 键等） | [recipe_data_service.py#L138-L139](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/services/recipe/recipe_data_service.py#L138-L139)：`raise ValueError` **（抛异常）** | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 仅空目录（异常在 write_image 之前抛出） | ❌ 同上 |
+| **G** | 图片下载 + minify 全部成功，但后续 slugify 或其他逻辑抛异常（极少） | scrape_image 正常返回；异常在 try 块后续逻辑触发 | `"no image"`（硬编码字符串） | ❌ 非缓存键 | 三尺寸 webp 完整存在于 `{uuid}/images/` | ❌ 永久孤儿 webp，无自动清理 |
+| **H** | ✅ 全流程成功 | scrape_image 正常返回 | `cache.new_key(4)`（4 位随机串） | ✅ 合法缓存键 | `{uuid}/images/` 下三尺寸 webp 齐全 | N/A |
+
+**前端表现差异**：
+- **A/B/C 场景**（有合法缓存键）：前端请求 `/api/media/recipes/{id}/images/tiny-original.webp?version={4位随机串}` → 文件不存在 → 404 → 前端 fallback 占位图
+- **D/E/F/G 场景**（`"no image"`）：前端请求 `...?version=no+image` → 同样 404 → 同样 fallback 占位图
+- 两种路径在用户视觉上无差异，但 DB 中存储的字段值不同
+
+**关键结论**：所有场景下 `create_from_html` 都不会中断，仍然返回 Recipe 对象给调用方继续写入 DB。Recipe 一定会被创建，只是图片可能缺失。
 
 ---
 
@@ -234,19 +280,21 @@ if isinstance(new_recipe.image, list):
 
 ### 3.3 数据库 image 字段作为缓存版本号
 
-数据库 `recipes.image` 列**不存图片数据**，仅存一个随机字符串作为缓存 bust 键：
+数据库 `recipes.image` 列**不存图片数据**，仅存一个随机字符串作为缓存 bust 键，共 5 种可能取值：
 
-- 上传/URL 抓取成功时：`cache.new_key(4)` → 4 位随机字母数字（[cache_key.py](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/mealie/pkgs/cache/cache_key.py)）
-- 老代码路径：`randint(0, 255)` → 整数
-- 删除图片时：`entry.image = None`
-- 导入图片失败时：硬编码字符串 `"no image"`
+| 取值 | 来源 | 含义 |
+|------|------|------|
+| `cache.new_key(4)`（4 位随机字母数字，如 `"a7f2"`） | 上传/URL 抓取**成功**；或导入中无 image 字段/网络失败/非 200（scrape_image `return None`，不抛异常） | ✅ 合法缓存键，前端据此拼 URL |
+| `randint(0, 255)`（整数） | 老代码路径（如 RepositoryRecipes.update_image） | ✅ 合法缓存键 |
+| `None` | DELETE /{slug}/image 显式删除 | ❌ 无图 |
+| `"no image"`（硬编码字符串） | 导入中 Content-Type 非 image / PIL 失败 / URL 解析失败（scrape_image 抛异常） | ❌ 非缓存键，仅作标记 |
 
-前端构造 URL 时将此值作为 query param：
+前端构造 URL 时将此值作为 query param（[static-routes.ts](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/frontend/app/composables/api/static-routes.ts#L10-L24)）：
 ```
 /api/media/recipes/{recipe_id}/images/original.webp?rnd={key}&version={image}
 ```
 
-前端实现：[static-routes.ts](file:///d:/fz/0601/solo-dogfeeding/code/76-mealie/frontend/app/composables/api/static-routes.ts#L10-L24)
+**注意**：`cache.new_key(4)` **不等于**图片真实存在——A/B/C 三种失败场景（无图字段/网络故障/非 200）也会写入合法缓存键，但磁盘上实际没有 webp 文件，返回 404 由前端 fallback。
 
 ### 3.4 purge 机制清理源文件
 
@@ -422,13 +470,20 @@ Media 路由（`/api/media/recipes/*`）**没有任何认证/授权**。原因�
 
 ### 7.1 单 URL 导入（create_from_html）
 
-详见 **2.4 节表格**。汇总：
+详见 **2.4 节 A–H 表格**。汇总：
 
-- **所有图片相关异常都被吞掉**（`try/except Exception` 包裹 scrape_image + slugify 整块），降级为 `new_recipe.image = "no image"`
-- Recipe **仍会创建**并写入 DB
-- 磁盘上至少存在空目录 `{uuid}/images/` 和 `{uuid}/assets/`
-- 若 PIL 处理在生成部分 webp 后失败，已生成的 webp 无法被自动清理
-- `"no image"` 是普通字符串存于 DB，前端会因版本号变化请求 `/api/media/recipes/{id}/images/tiny-original.webp?version=no+image`，该文件不存在 → 404 → 前端 fallback 显示占位图
+- 分两类失败路径：
+
+| 路径 | 触发场景 | `recipes.image` 值 | 占比（估计） |
+|------|---------|------------------|-----------|
+| **静默 `return None`（不进 except）** | 无 image 字段、网络故障、非 200 状态码 | `cache.new_key(4)`（合法缓存键） | 大多数图片抓取失败 |
+| **抛异常（进 except）** | Content-Type 非 image、PIL 解码失败、URL 解析失败、后续逻辑异常 | `"no image"` | 少数情况（目标站点返回 200 但内容不对） |
+
+- 无论哪条路径，Recipe **仍会创建**并写入 DB，磁盘上至少存在空目录 `{uuid}/images/` 和 `{uuid}/assets/`
+
+- PIL 处理在生成部分 webp 后失败（如 original.webp 生成成功但 tiny-original.webp 因磁盘满失败），已生成的 webp 无法被自动清理
+
+- 两种路径在前端表现一致：图片 URL 均返回 404，由 fallback 占位图兜底
 
 ### 7.2 write_image / minify 失败回滚
 
