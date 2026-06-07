@@ -38,7 +38,9 @@ mealie/app.py                                              # 调度任务注册
 
 ## 二、业务事件类型定义
 
-所有业务事件定义在 `mealie/services/event_bus_service/event_types.py` 的 `EventTypes` 枚举类中。
+所有事件定义在 `mealie/services/event_bus_service/event_types.py` 的 `EventTypes` 枚举类中，**共计 27 个枚举值**，按用途分为两类：
+- **内部事件**：`test_message`、`webhook_task` — 共 **2 个**，由系统内部或测试接口使用
+- **可订阅业务事件**：其余 `recipe_created` 等 — 共 **25 个**，面向普通用户，可通过 Apprise 通知器偏好配置订阅
 
 ### 内部事件（Schema/数据库中有对应 options 字段，但不作为普通用户可订阅的业务事件）
 
@@ -163,7 +165,7 @@ urls = [notifier.apprise_url for notifier in notifiers if getattr(notifier.optio
 |---------|---------|---------|-------------------------------------|------------------------------------------|-----------|
 | **手动测试入口** | 用户点击 Web/API 的 Test 按钮 | `test_message` | **否**（直接构造 Event 并调用 `publish_to_subscribers`） | **否**（由调用方直接传入目标 webhook / apprise_url） | 仅当前被测试的单个 Webhook 或通知器 |
 | **定时任务入口** | 调度器每 5 分钟自动执行 | `webhook_task` | 是 | 是（WebhookEventListener 按时间窗口+enabled 过滤） | 所有命中调度窗口的 Webhook；Apprise 端几乎不会收到（UI 不暴露该选项） |
-| **业务事件入口** | 正常业务操作（CRUD、用户注册等） | 其余 27 种业务事件（`recipe_created` 等） | 是 | 是（AppriseEventListener 按 options 开关过滤） | 所有开启了对应事件偏好的 Apprise 通知器；Webhook 端**不会**收到 |
+| **业务事件入口** | 正常业务操作（CRUD、用户注册等） | 其余 25 种业务事件（`recipe_created` 等） | 是 | 是（AppriseEventListener 按 options 开关过滤） | 所有开启了对应事件偏好的 Apprise 通知器；Webhook 端**不会**收到 |
 
 下文分别详述每条路径。
 
