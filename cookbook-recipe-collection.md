@@ -461,7 +461,7 @@ if not recipe.settings.public or recipe.household.preferences.private_household:
 
 分享令牌分为**管理端**和**读取端**两套独立的 API：
 
-#### 7.4.1 管理端（需要认证）
+#### 7.4.1 管理端（需要认证）—— group_id 唯一生效的环节
 
 路由：[shared/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/shared/__init__.py#L13-L50)
 - 前缀：`/api/shared/recipes`
@@ -475,9 +475,29 @@ if not recipe.settings.public or recipe.household.preferences.private_household:
 | 获取令牌详情 | `GET /api/shared/recipes/{item_id}` | 返回 token + recipe 对象 |
 | 撤销令牌 | `DELETE /api/shared/recipes/{item_id}` | 删除令牌使其失效 |
 
-令牌创建时会附加当前用户的 `group_id`（通过 `RecipeShareTokenSave`），确保只能分享同 group 的 recipe。
+**创建时的 group 校验**（[shared/__init__.py#L33-L42](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/shared/__init__.py#L33-L42)）：
 
-#### 7.4.2 读取端（无需认证）
+```python
+@router.post("", response_model=RecipeShareToken, status_code=201)
+def create_one(self, data: RecipeShareTokenCreate) -> RecipeShareToken:
+    # 校验 recipe 属于用户所在的 group
+    group_repos = get_repositories(self.repos.session, group_id=self.group_id, household_id=None)
+    recipe = group_repos.recipes.get_one(data.recipe_id, "id")
+    if recipe is None or recipe.group_id != self.group_id:
+        raise HTTPException(status_code=404, detail="Recipe not found in your group")
+
+    # 将当前用户的 group_id 写入 token
+    save_data = RecipeShareTokenSave(**data.model_dump(), group_id=self.group_id)
+    return self.mixins.create_one(save_data)
+```
+
+**token.group_id 字段说明**：
+- Schema 定义在 [recipe_share_token.py#L26-L28](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/schema/recipe/recipe_share_token.py#L26-L28)
+- 仅在创建时由后端写入（`group_id=self.group_id`）
+- 前端创建请求 [RecipeShareTokenCreate](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/schema/recipe/recipe_share_token.py#L17-L23) **不包含** group_id 字段
+- **仅在创建环节生效，后续读取完全不校验**
+
+#### 7.4.2 读取端（无需认证）—— 完全不校验 group
 
 路由定义：[recipe/shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py#L17)
 路由挂载：[recipe/__init__.py#L13](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L13)（以 `prefix="/recipes"` 挂载）
@@ -490,40 +510,107 @@ if not recipe.settings.public or recipe.household.preferences.private_household:
 | 获取 recipe | `GET /api/recipes/shared/{token_id}` | 无需认证，自动清理过期令牌 |
 | 下载 zip | `GET /api/recipes/shared/{token_id}/zip` | 返回 recipe.json + 原始图片 |
 
-读取逻辑：
+**读取逻辑（核心：完全不校验 group）**：
+
 ```python
-# shared_routes.py#L22-L39
-token_summary = db.recipe_share_tokens.get_one(token_id)
-if token_summary and token_summary.is_expired:
-    db.recipe_share_tokens.delete(token_id)  # 自动清理过期令牌
-    token_summary = None
+# recipe/shared_routes.py#L22-L39
+@router.get("/shared/{token_id}", response_model=Recipe)
+def get_shared_recipe(token_id: UUID4, session: Session = Depends(generate_session)) -> Recipe:
+    # 关键：group_id=None，不按 group 隔离
+    db = get_repositories(session, group_id=None, household_id=None)
 
-if token_summary is None:
-    raise HTTPException(status_code=404, detail="Token Not Found")
+    # 只校验 token 是否存在和是否过期
+    token_summary = db.recipe_share_tokens.get_one(token_id)
+    if token_summary and token_summary.is_expired:
+        # 自动清理过期令牌
+        ...
+        token_summary = None
 
-return token_summary.recipe  # 直接返回绑定的 recipe，忽略 settings.public
+    if token_summary is None:
+        raise HTTPException(status_code=404, detail=ErrorResponse.respond("Token Not Found"))
+
+    # 直接返回绑定的 recipe
+    return token_summary.recipe
 ```
 
 **关键边界**：
+- ✅ 校验 token **是否存在**
+- ✅ 校验 token **是否过期**
+- ❌ **完全不校验** `token.group_id`
+- ❌ **完全不校验** URL 中的 `groupSlug`（后端接口根本不接收这个参数）
 - 分享令牌**绕过** `recipe.settings.public` 和 `household.preferences.private_household` 限制
 - 令牌与 Cookbook **完全无关**，仅绑定单个 recipe_id
-- 令牌有过期时间（默认 30 天，可自定义），过期自动清理
-- 令牌仅在创建者的 group 内有效
 
-### 7.5 前端分享页面入口
+### 7.5 前端分享链接与 SPA 路由
 
-前端分享页面：[pages/g/[groupSlug]/shared/r/[id].vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue#L1-L47)
+#### 7.5.1 分享链接生成
 
-分享链接格式（由 [RecipeDialogShare.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeDialogShare.vue#L169-L171) 生成）：
+由 [RecipeDialogShare.vue#L169-L171](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeDialogShare.vue#L169-L171) 生成：
+
+```typescript
+function getTokenLink(token: string) {
+  return `${window.location.origin}/g/${groupSlug.value}/shared/r/${token}`;
+}
 ```
-/g/{groupSlug}/shared/r/{tokenId}
+
+groupSlug 的来源（[L125](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeDialogShare.vue#L125)）：
+```typescript
+const groupSlug = computed(() => route.params.groupSlug as string || auth.user.value?.groupSlug || "");
 ```
 
-页面流程：
-1. 通过 `usePublicApi()` 调用 `api.shared.getShared(tokenId)`
-2. 后端请求 `GET /api/recipes/shared/{tokenId}`（公开 API，无需认证）
-3. 成功则用 [RecipePage.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipePage/RecipePage.vue) 渲染 recipe
-4. 失败（令牌过期/不存在）则跳转到 group 首页
+**分享链接格式**：
+```
+https://{domain}/g/{groupSlug}/shared/r/{tokenId}
+```
+
+#### 7.5.2 SPA 路由匹配
+
+前端页面路由：[pages/g/[groupSlug]/shared/r/[id].vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue#L1-L47)
+
+URL 中的 `groupSlug` 仅在前端有两个用途，**完全不传递给后端 API**：
+
+1. **路由匹配**：让 Nuxt 知道渲染分享页面（`/g/xxx/shared/r/yyy` 匹配该 `.vue` 文件）
+2. **错误跳转**：加载失败时跳回 group 首页（[L38](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue#L38)）：
+   ```typescript
+   if (error) {
+     router.push(`/g/${groupSlug.value}`);
+   }
+   ```
+
+#### 7.5.3 页面加载流程
+
+```
+用户访问 https://domain/g/{groupSlug}/shared/r/{tokenId}
+    ↓
+[pages/g/[groupSlug]/shared/r/[id].vue]
+    ├─ 从 URL 取 groupSlug（仅用于路由和错误跳转）
+    ├─ 从 URL 取 tokenId（传给 API）
+    ↓
+调用 api.shared.getShared(tokenId)
+    └─ [public/shared.ts#L11-L12]
+       └─ GET /api/recipes/shared/${tokenId}   ★ 不传 groupSlug
+    ↓
+后端 [recipe/shared_routes.py#L22]
+    ├─ group_id=None（不按 group 隔离）
+    ├─ 只校验 token 存在性 + 过期时间
+    ├─ 不校验 token.group_id
+    └─ 直接返回 recipe
+    ↓
+成功 → RecipePage 渲染 recipe
+失败 → 跳转到 /g/{groupSlug}
+```
+
+#### 7.5.4 groupSlug 与 token.group_id 的关系总结
+
+| 环节 | groupSlug（URL 路径段） | token.group_id（数据库字段） |
+|------|------------------------|------------------------------|
+| **令牌创建** | 不参与 | ✅ 写入并校验 `recipe.group_id == self.group_id` |
+| **令牌读取（后端）** | ❌ 完全不接收该参数 | ❌ 完全不校验 |
+| **前端路由匹配** | ✅ Nuxt 按路径渲染页面 | 不参与 |
+| **前端 API 调用** | ❌ 不传递给后端 | 不参与 |
+| **前端错误跳转** | ✅ 用作跳转目标路径 | 不参与 |
+
+**本质**：URL 中的 `groupSlug` 只是一个**美观的路径占位符**，用于前端 SPA 路由匹配和用户认知，不参与任何后端安全校验。真正的安全保障来自 token 本身的**唯一性（UUID）**和**过期时间**。
 
 ### 7.6 前端 API 路由选择
 
