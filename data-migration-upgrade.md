@@ -264,11 +264,56 @@ if is_postgres():
 - **执行 `alembic downgrade` 后再 upgrade**：downgrade 会从 `alembic_version` 移除记录，再次 upgrade 时重新执行
 - **SQLite `batch_alter_table` 内部表重建失败**：表重建阶段如果进程崩溃，可能留下临时表但 revision 未记录，属于数据库损坏级别的故障
 
-**边界失效时的后果：**
-- 纯 DDL 操作（`op.create_table` / `op.add_column` 等）：Alembic 内部会判断对象是否存在，一般不会出错
-- 纯 `UPDATE` 操作（规范化字段重算）：结果正确但产生重复计算开销
-- 纯 `INSERT` 操作（household 创建、last_made 关联表插入等）：**会产生重复数据**。例如 `feecc8ffb956` 的 `create_household()` 重复执行会给同一个 group 创建多个同名 household；`b9e516e2d3b3` 重复执行会插入重复的 `HouseholdToRecipe` 行（若没有唯一约束则数据冗余，若有唯一约束则抛出 IntegrityError 导致迁移失败）
-- 评分与收藏迁移（`d7c6efd2de42`）：由于使用了 `ON CONFLICT DO NOTHING`，即使重复执行也不会产生重复数据
+### 6.2.1 DDL 无任何 if_not_exists / checkfirst 保护
+
+对全量迁移脚本的代码搜索确认：**整个 `mealie/alembic/versions/` 目录中没有任何一个 DDL 调用使用了 `if_not_exists=True` 或 `checkfirst=True` 参数。** 典型无保护调用示例：
+
+- 建表：`mealie/alembic/versions/2024-07-12-16.16.29_feecc8ffb956_add_households.py:202`
+  ```python
+  op.create_table(
+      "households",
+      sa.Column("id", mealie.db.migration_types.GUID(), nullable=False),
+      ...  # 无 if_not_exists 参数
+  )
+  ```
+- 加列：`mealie/alembic/versions/2023-02-14-20.45.41_5ab195a474eb_add_normalized_search_properties.py:93`
+  ```python
+  op.add_column("recipes", sa.Column("name_normalized", sa.String(), nullable=False, server_default=""))
+  # 无 checkfirst 参数
+  ```
+- 建索引：`mealie/alembic/versions/2024-07-12-16.16.29_feecc8ffb956_add_households.py:218`
+  ```python
+  op.create_index(op.f("ix_households_created_at"), "households", ["created_at"], unique=False)
+  # 无 if_not_exists 参数
+  ```
+- 加外键：`mealie/alembic/versions/2024-07-12-16.16.29_feecc8ffb956_add_households.py:250`
+  ```python
+  batch_op.create_foreign_key("fk_cookbooks_household_id", "households", ["household_id"], ["id"])
+  # 无 checkfirst 参数
+  ```
+
+`mealie/alembic/env.py` 中也未配置任何全局默认保护参数。
+
+### 6.2.2 边界失效时的 DDL 报错情况
+
+**结论：`alembic_version` 被破坏后迁移被重复执行时，几乎所有 DDL 都会抛出数据库层错误，导致迁移中断。** 典型报错：
+
+| DDL 操作 | 重复执行时 PostgreSQL 报错 | 重复执行时 SQLite 报错 |
+|---------|------------------------|---------------------|
+| `op.create_table("households")` | `relation "households" already exists` | `table households already exists` |
+| `op.add_column("recipes", "name_normalized")` | `column "name_normalized" of relation "recipes" already exists` | `duplicate column name: name_normalized` |
+| `op.create_index("ix_households_created_at")` | `relation "ix_households_created_at" already exists` | `index ix_households_created_at already exists` |
+| `batch_op.create_foreign_key("fk_...")` | `constraint "fk_..." already exists` | 部分场景下会静默重复执行 |
+| `op.drop_index("ix_recipes_name")` | `index "ix_recipes_name" does not exist` | `no such index: ix_recipes_name` |
+
+这些错误均由数据库引擎抛出，**不在 Alembic 或迁移脚本层被捕获**，会直接触发外层 `command.upgrade()` 异常，最终导致**应用启动中断（致命）**。
+
+### 6.2.3 边界失效时的完整后果总览
+
+- **DDL 操作（建表/加列/建索引/加外键等）**：**数据库层报错，迁移中断，应用无法启动**。唯一例外是部分 `drop_*` 操作在 SQLite 上行为不一致。
+- **纯 `UPDATE` 操作（规范化字段重算）**：结果正确但产生重复计算开销（幂等，因为按主键覆盖写入相同值）。
+- **纯 `INSERT` 操作（household 创建、last_made 关联表插入等）**：**会产生重复数据或抛错**。例如 `feecc8ffb956` 的 `create_household()` 重复执行会给同一个 group 创建多个同名 household；`b9e516e2d3b3` 重复执行会插入重复的 `HouseholdToRecipe` 关联行（若无唯一约束则数据冗余，若有唯一约束则抛 IntegrityError 中断迁移）。
+- **评分与收藏迁移（`d7c6efd2de42`）**：由于使用了 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`，即使重复执行也不会产生重复数据，是全库唯一具备数据库级幂等保护的迁移脚本。
 
 ### 6.3 普通 UPDATE / INSERT / session.commit 的事务边界
 
@@ -573,10 +618,11 @@ WHERE EXISTS (
 
 1. **迁移 ≠ 修复**：Alembic 负责 schema 演进，`db/fixes/` 负责数据质量修复。两者分离，修复可独立重跑。
 2. **先建结构再填数据最后卸磨杀驴**：新 NOT NULL 列先给 `server_default`，数据填充后移除 server_default。
-3. **幂等性并非普遍原则**：**只有评分与收藏迁移（`d7c6efd2de42`）** 这一个脚本使用了 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`；其余所有数据迁移均依赖 Alembic revision 的单次执行特性（`alembic_version` 表追踪），使用普通 `UPDATE` / `INSERT` / `session.commit()`。若 revision 单次执行前提被破坏（手动改表、downgrade 再 upgrade），纯 INSERT 类迁移会产生重复数据。
-4. **中间模型自包含**：迁移脚本内部定义临时 ORM 模型，不依赖外部模型文件，避免未来模型变更破坏历史迁移。
-5. **跨方言兼容**：GUID、数量类型、唯一约束都按 dialect 分支处理；SQLite 用 batch_alter_table 模拟 DDL。
-6. **规范化字段是搜索的真相来源**：算法三次演进，每次全量重算，fix 层兜底补填。
-7. **去重是加唯一约束的前置动作**：M2M 表靠数据库内部行号，实体表靠外键重定向+删除。
-8. **事务边界分层清晰**：Alembic 外层事务包裹整个 revision，迁移内 Session 共享连接但可独立 commit/rollback 子任务；fixes 层使用独立 Session，不参与 Alembic 事务，失败由 `safe_try` 吞异常。
-9. **失败的致命性分层明确**：连接失败和 Alembic schema 迁移失败是**致命的**（应用无法启动，数据库可能停留在中间 revision 版本）；迁移脚本内部个别数据子任务失败（不 raise 类型）可能静默遗留数据不完整；fixes 层数据修复失败**非致命**但会遗留脏数据风险，需人工排查日志处理。
+3. **DDL 完全无保护**：所有 `op.create_table` / `op.add_column` / `op.create_index` / `batch_op.create_foreign_key` 调用均**未使用 `if_not_exists` 或 `checkfirst` 参数**，`alembic/env.py` 也未配置全局默认保护。一旦 `alembic_version` 被破坏导致迁移重复执行，DDL 会直接抛出数据库层错误（如 "relation already exists" / "duplicate column name"），**迁移中断，应用无法启动**。
+4. **幂等性并非普遍原则**：**只有评分与收藏迁移（`d7c6efd2de42`）** 这一个脚本使用了 `ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`；其余所有数据迁移均依赖 Alembic revision 的单次执行特性（`alembic_version` 表追踪），使用普通 `UPDATE` / `INSERT` / `session.commit()`。若 revision 单次执行前提被破坏（手动删 `alembic_version` 记录、downgrade 再 upgrade），纯 INSERT 类迁移会产生重复数据或抛 IntegrityError。
+5. **中间模型自包含**：迁移脚本内部定义临时 ORM 模型，不依赖外部模型文件，避免未来模型变更破坏历史迁移。
+6. **跨方言兼容**：GUID、数量类型、唯一约束都按 dialect 分支处理；SQLite 用 batch_alter_table 模拟 DDL。
+7. **规范化字段是搜索的真相来源**：算法三次演进，每次全量重算，fix 层兜底补填。
+8. **去重是加唯一约束的前置动作**：M2M 表靠数据库内部行号，实体表靠外键重定向+删除。
+9. **事务边界分层清晰**：Alembic 外层事务包裹整个 revision，迁移内 Session 共享连接但可独立 commit/rollback 子任务；fixes 层使用独立 Session，不参与 Alembic 事务，失败由 `safe_try` 吞异常。
+10. **失败的致命性分层明确**：连接失败和 Alembic schema 迁移失败是**致命的**（应用无法启动，数据库可能停留在中间 revision 版本）；迁移脚本内部个别数据子任务失败（不 raise 类型）可能静默遗留数据不完整；fixes 层数据修复失败**非致命**但会遗留脏数据风险，需人工排查日志处理。
