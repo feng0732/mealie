@@ -247,64 +247,145 @@ User 模型上存在少量直接存储的偏好字段（非独立 preference 表
 
 ### 3.1 主题 (Theme / Dark Mode)
 
-#### 亮暗模式切换
+#### 亮暗模式与主题色的关系
 
-**存储位置**：浏览器 `localStorage`，key = `vueuse-color-scheme`（由 `@vueuse/core` 的 `useDark()` 管理）
+亮暗模式（dark/light）与主题色（primary/accent 等具体色值）是**两套独立机制**：
 
-**实现插件**：[dark-mode.client.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/dark-mode.client.ts)
+| 维度 | 亮暗模式切换 | 主题色配置 |
+|------|-------------|-----------|
+| 控制内容 | Vuetify 的 `theme.global.name`（`"dark"` 或 `"light"`） | 每个主题（dark/light）下的 `colors.primary` 等具体色值 |
+| 存储位置 | `localStorage['vueuse-color-scheme']` | 后端 API + 前端 `__cachedTheme` 内存缓存 + HTTP 7 天缓存 |
+| 实现插件 | [dark-mode.client.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/dark-mode.client.ts) | [theme.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts) |
+| 切换方式 | `useDark()` 自动管理，`onChanged` 时调用 `vuetify.theme.toggle()` | 页面加载时一次性读取（需刷新页面生效） |
+| 登出行为 | **不清理** localStorage | **不清理** `__cachedTheme` 与 HTTP 缓存 |
 
 **亮暗模式优先级**：
 ```
 localStorage['vueuse-color-scheme'] ('dark' | 'light' | 'auto')
     ↓  (当 localStorage 非 'dark' 且非 'light' 时)
 系统偏好 (prefers-color-scheme: dark)
-    ↓  (Vuetify 默认主题在 theme.ts 中初始化)
-nuxt.config.ts runtimeConfig.public.useDark (默认 false，即 light)
+    ↓  (Vuetify 初始化时的默认主题)
+nuxt.config.ts runtimeConfig.public.useDark
+    (来源: Boolean(process.env.THEME_USE_DARK) || false，见 [nuxt.config.ts#L86](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/nuxt.config.ts#L86))
 ```
 
-**初始化**：
-- 插件加载时读取 `useDark()` 返回值，调用 `vuetify.theme.change()` 设置初始主题
-- 切换时通过 `onChanged` 回调同步到 Vuetify
+**亮暗模式初始化流程**：
+1. [theme.ts#L41](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L41)：`vuetify:before-create` 钩子中根据 `$config.public.useDark` 设置 `defaultTheme`
+2. [dark-mode.client.ts#L13-L15](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/dark-mode.client.ts#L13-L15)：`vuetify:ready` 钩子中根据 `useDark()` 当前值调用 `vuetify.theme.change()` 覆盖默认值
+3. [dark-mode.client.ts#L5-L10](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/dark-mode.client.ts#L5-L10)：用户切换时 `onChanged` 回调调用 `vuetify.theme.toggle()`
 
 **页面加载时的防闪烁**：
-在 [nuxt.config.ts#L53-L57](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/nuxt.config.ts#L53-L57)，通过注入内联脚本在渲染前读取 `vueuse-color-scheme` 并设置背景色。
+在 [nuxt.config.ts#L53-L57](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/nuxt.config.ts#L53-L57)，通过注入内联脚本在渲染前读取 `vueuse-color-scheme` 并设置 `document.documentElement.style.backgroundColor`（`#1E1E1E` 或 `#FFFFFF`）。
 
-#### 主题颜色的完整取值链（修正版）
+---
 
-**后端配置**：
-见 [themes.py](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/core/settings/themes.py)
+#### 主题颜色的完整取值链（校准版）
+
+##### 第一层：`nuxt.config.ts` 的 runtimeConfig.public.themes（存在但未被使用）
+
+**确认存在**：[nuxt.config.ts#L87-L107](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/nuxt.config.ts#L87-L107) 中确实定义了完整的颜色对象：
+
+```typescript
+// nuxt.config.ts — runtimeConfig.public
+themes: {
+  dark: {
+    primary: process.env.THEME_DARK_PRIMARY || "#E58325",
+    accent: process.env.THEME_DARK_ACCENT || "#007A99",
+    secondary: process.env.THEME_DARK_SECONDARY || "#973542",
+    success: process.env.THEME_DARK_SUCCESS || "#43A047",
+    info: process.env.THEME_DARK_INFO || "#1976d2",
+    warning: process.env.THEME_DARK_WARNING || "#FF6D00",
+    error: process.env.THEME_DARK_ERROR || "#EF5350",
+    background: "#1E1E1E",
+  },
+  light: {
+    primary: process.env.THEME_LIGHT_PRIMARY || "#E58325",
+    accent: process.env.THEME_LIGHT_ACCENT || "#007A99",
+    // ... 其他颜色
+  },
+},
+```
+
+> ⚠️ **关键事实**：经全局搜索（`config.public.themes`、`runtimeConfig.public.themes`、`themes.dark.`、`themes.light.`）确认，**整个 frontend 目录没有任何代码读取该对象**。它是**死代码**——定义了环境变量 fallback 链，但 theme 插件完全未使用。
+
+##### 第二层：后端配置与 API（实际被读取）
+
+**后端 Theme 类**：[themes.py](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/core/settings/themes.py)
 ```python
 class Theme(BaseSettings):
     light_primary: str = "#E58325"
-    # ... 14 个颜色字段
+    light_accent: str = "#007A99"
+    # ... 共 14 个字段（light_* × 7 + dark_* × 7）
     model_config = SettingsConfigDict(env_prefix="theme_", extra="allow")
 ```
 
-取值优先级（后端）：
+后端取值优先级：
 ```
-环境变量 (THEME_LIGHT_PRIMARY, THEME_DARK_PRIMARY, ...) — 通过 SettingsConfigDict env_prefix="theme_" 读取
-    ↓
+环境变量 (THEME_LIGHT_PRIMARY, THEME_DARK_PRIMARY, ...)
+    ↓  (通过 pydantic SettingsConfigDict env_prefix="theme_" 自动读取)
 Theme 类硬编码默认值（如 light_primary="#E58325"）
 ```
 
-**API 暴露**：
-见 [app_about.py#L66-L72](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/routes/app/app_about.py#L66-L72)
-- `GET /api/app/about/theme` — 返回 `AppTheme(**settings.theme.model_dump())`
-- 设置了 HTTP 响应头：`Cache-Control: public, max-age=604800`（7 天浏览器/CDN 缓存）
+**API 暴露**：[app_about.py#L66-L72](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/routes/app/app_about.py#L66-L72)
+- 路由：`GET /api/app/about/theme`
+- 返回值：`AppTheme(**settings.theme.model_dump())`
+- HTTP 响应头：`Cache-Control: public, max-age=604800`（7 天浏览器/CDN 缓存）
 
-**前端加载逻辑**：
-见 [theme.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L20-L75)
+##### 第三层：前端 theme.ts 插件的读取与回退（实际生效链路）
 
-取值优先级（前端）：
+[theme.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts)
+
+取值优先级（前端实际生效链路）：
 ```
-模块级变量 __cachedTheme (前端插件生命周期内的内存缓存)
+模块级变量 __cachedTheme (前端插件生命周期内的内存缓存，[theme.ts#L18](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L18))
     ↓  (首次加载或缓存失效时)
-fetch("/api/app/about/theme") + HTTP 7天缓存
-    ↓  (fetch 失败时)
-前端硬编码默认值（如 primary: "#E58325", accent: "#007A99" 等）
+fetch("/api/app/about/theme") + HTTP 7 天缓存 ([theme.ts#L20-L31](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L20-L31))
+    ↓  (fetch 失败 / 返回 undefined 时)
+theme.ts 内联硬编码十六进制颜色值（如 "#E58325"、"#007A99" 等，[theme.ts#L51-L69](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L51-L69)）
 ```
 
-> ⚠️ **之前的描述偏差**：前端并不存在「回退到 `nuxt.config.ts` 的 `runtimeConfig.public.themes`」这一层。`nuxt.config.ts` 中仅有 `runtimeConfig.public.useDark`（来源：`Boolean(process.env.THEME_USE_DARK) || false`，见 [nuxt.config.ts#L86](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/nuxt.config.ts#L86)），用于控制 Vuetify 默认亮/暗主题，不包含颜色配置。
+**theme.ts 回退代码片段**：
+```typescript
+// theme.ts 第 51-57 行 — light 主题颜色
+colors: {
+  primary:   theme?.lightPrimary   ?? "#E58325",   // 硬编码 fallback
+  accent:    theme?.lightAccent    ?? "#007A99",   // 硬编码 fallback
+  secondary: theme?.lightSecondary ?? "#973542",   // 硬编码 fallback
+  // ...
+}
+```
+
+> ⚠️ **再次确认**：theme.ts 仅读取了 `nuxtApp.$config.public.useDark`（用于设置默认亮暗主题），**完全没有读取** `nuxtApp.$config.public.themes` 颜色对象。
+
+---
+
+#### 亮暗模式、主题色缓存、语言请求头三者的关系校准
+
+| 特性 | 亮暗模式 (Dark Mode) | 主题色 (Theme Colors) | 语言请求头 (Accept-Language) |
+|------|---------------------|----------------------|------------------------------|
+| **核心功能** | 切换 light/dark 主题 | 设置每个主题下的色板 | 告知后端用户偏好语言 |
+| **存储介质** | localStorage (`vueuse-color-scheme`) | ① 模块级变量 `__cachedTheme` <br> ② HTTP `Cache-Control: max-age=604800` | ① i18n Cookie (由 `@nuxtjs/i18n` 管理) <br> ② `$axios.defaults.headers.common` |
+| **写入时机** | 用户切换时自动写入 | 页面首次加载时 fetch 并缓存 | ① 用户切换 locale 时 i18n 自动写 Cookie <br> ② **每次**调用 `useUserApi()`/`usePublicApi()` 等时更新 axios 默认头 |
+| **设置机制** | `@vueuse/core` 的 `useDark()` + Vuetify `theme.change()`/`toggle()` | Nuxt 插件 `vuetify:before-create` 钩子一次性注入 | `useRequests()` 中修改 `$axios.defaults.headers.common`（非拦截器） |
+| **与后端 API 关系** | 纯前端，无 API | 依赖 `/api/app/about/theme`（GET，公开） | 依赖每个请求的 `Accept-Language` 头，后端中间件读取 |
+| **登出行为** | ❌ **不清理** localStorage | ❌ **不清理** `__cachedTheme` 与 HTTP 缓存 | ❌ **不清理** i18n Cookie 与 axios 默认头 |
+| **互相依赖** | — | 依赖亮暗模式决定最终使用 light 还是 dark 色板 | 独立，与主题系统无耦合 |
+
+**语言请求头的完整传递链路**：
+```
+用户切换语言 (useLocales().locale.value = "zh-CN")
+    → i18n.setLocale("zh-CN")
+    → @nuxtjs/i18n 自动写入 i18n Cookie (detectBrowserLanguage.useCookie=true)
+    → 后续任意组件调用 useUserApi() / usePublicApi() / useAdminApi() / usePublicExploreApi()
+        → useRequests() 执行:
+            $axios.defaults.headers.common["Accept-Language"] = i18n.locale.value
+            ([api-client.ts#L63](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/api/api-client.ts#L63))
+    → 后端 LocaleContextMiddleware 从 request.headers["accept-language"] 读取
+        → 传给带 @lru_cache 的 ProviderFactory
+        → 若语言不支持，fallback 到 en-US
+```
+
+> **重要区分**：[axios.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/axios.ts) 中的 axios 拦截器**仅处理 Authorization token 和 401 响应**，不涉及 Accept-Language。
 
 ---
 
@@ -489,7 +570,7 @@ async function signOut(callbackUrl: string = ""): Promise<void> {
 | 当前用户组数据 (含 preferences) | 模块级 `groupSelfRef` ref | `refreshGroupSelf()` 调用且无登录用户时、页面刷新 |
 | 家庭/组/分类/食材等**列表**缓存 | 9 个 store 模块 ref | `clearAllStores()`（登出时调用）、各 store 自有的 `flushStore()` |
 | 用户 UI 偏好（排序、视图、打印等） | `localStorage`（12 个 key） | 用户手动修改（自动同步）、浏览器手动清除、**登出不清理** |
-| 主题色配置 | 模块级 `__cachedTheme` 变量 + HTTP `Cache-Control: max-age=604800` | 页面刷新（JS 变量重置）、7 天后 HTTP 缓存失效 |
+| 主题色配置 | ① 模块级 `__cachedTheme` 变量（前端内存缓存）<br>② HTTP `Cache-Control: public, max-age=604800`（浏览器 7 天缓存）<br>③ theme.ts 内联硬编码 fallback（未使用 nuxt.config.ts 中的 `public.themes`） | 页面刷新（JS 变量重置）、7 天后 HTTP 缓存失效、API 失败时自动回退到硬编码色值 |
 | 亮/暗模式 | `localStorage['vueuse-color-scheme']` | 用户切换主题、浏览器手动清除、**登出不清理** |
 | 语言偏好 | i18n Cookie + `$axios.defaults.headers.common["Accept-Language"]` | 用户切换语言（写 Cookie 和默认请求头）、浏览器清除 Cookie、**登出不清理** |
 | 前端语言翻译文件 | `@nuxtjs/i18n` 内部缓存（懒加载） | 切换 locale 时按需重新加载 |
@@ -504,7 +585,7 @@ async function signOut(callbackUrl: string = ""): Promise<void> {
 | `household.preferences` 为 null | 前端渲染 `HouseholdPreferencesEditor` 前有 `v-if` 保护 | [HouseholdPreferencesEditor.vue#L2](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/components/Domain/Household/HouseholdPreferencesEditor.vue#L2) |
 | 创建食谱时 `household.preferences` 为 null | 回退到 `RecipeSettings()` 无参构造（即代码默认值） | [recipe_service.py#L217-L218](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/services/recipe/recipe_service.py#L217-L218) |
 | `localStorage` 中无用户偏好 | `useLocalStorage(..., defaults, { mergeDefaults: true })` 自动填充默认值 | [preferences.ts](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-users/preferences.ts) |
-| API `/api/app/about/theme` 获取失败 | 直接回退到前端硬编码默认值（不存在 nuxt.config.ts 环境变量中间层） | [theme.ts#L20-L31](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L20-L31) |
+| API `/api/app/about/theme` 获取失败 | 回退到 theme.ts 内联硬编码颜色值（如 `"#E58325"`）。注：`nuxt.config.ts` 的 `runtimeConfig.public.themes` 虽定义了环境变量 fallback 链，但 theme 插件并未读取它，属于死代码。 | [theme.ts#L20-L31](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L20-L31)、[theme.ts#L51-L69](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/plugins/theme.ts#L51-L69) |
 | 浏览器语言不在支持列表 | 前后端均回退到 `en-US` | [providers.py#L49-L53](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/mealie/lang/providers.py#L49-L53)、[i18n.config.ts#L97](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/i18n.config.ts#L97) |
 | 未登录访问 | `useHouseholdSelf()` / `useGroupSelf()` 的 `refreshXxxSelf()` 检测 `!auth.user.value` 时立即返回 null，不发起请求 | [use-households.ts#L11-L15](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/composables/use-households.ts#L11-L15) |
 | `recipe.settings` 为 undefined | 详情页中使用可选链 `recipe.value.settings?.landscapeView`，undefined 视为 false | [RecipePage.vue#L397](file:///d:/fz/0601/solo-dogfeeding/code/81-mealie/frontend/app/components/Domain/Recipe/RecipePage/RecipePage.vue#L397) |
