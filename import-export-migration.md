@@ -110,17 +110,30 @@ RECIPE_DATA_DIR/{recipe_id}/       ← recipe.directory
             └── ...
 ```
 
-**写入顺序**：
-1. 先调用 `zip.writestr(f"recipes/{slug}/{slug}.json", ...)` 写入 JSON
+**写入顺序（代码实现层面的非确定性）**：
+
+1. 先调用 `zip.writestr(f"recipes/{slug}/{slug}.json", ...)` 写入 JSON（这一步顺序确定）
 2. 再调用 `write_dir_to_zip(recipe_dir, f"recipes/{slug}", {".json"})` 递归遍历 `recipe.directory` 下所有非 `.json` 文件
 
-`Path.iterdir()` 的顺序取决于 OS/文件系统，典型（字母序）下目录内容为：
-```
-assets/          # 目录
-images/          # 目录
+**关键代码** [mealie/services/exporter/_abc_exporter.py](mealie/services/exporter/_abc_exporter.py#L79-L86)：
+```python
+for source_file in source_dir.iterdir():   # ← Path.iterdir() 未做任何排序
+    if source_file.is_dir():
+        func(source_file, ...)              # ← 深度优先，先处理目录项还是文件项取决于 iterdir 返回顺序
+    elif source_file.suffix not in ignore_ext:
+        zip.write(source_file, ...)
 ```
 
-在 `images/` 内按字母序：
+Python 官方文档明确 `Path.iterdir()` **"yields entries in arbitrary order"**（任意顺序），顺序由底层 OS/文件系统决定，代码层面没有 `sorted()` 或任何排序保证。因此 ZIP 内文件的插入顺序是**不可移植、不可复现**的。
+
+在多数常见文件系统（ext4、NTFS、APFS 等）上，若目录内条目按文件名哈希/字典序排列，可能观察到类似以下顺序——但以下仅为**典型场景示例**，不能作为任何确定性结论：
+
+```
+assets/          # 目录项（字母序 a < i）
+images/          # 目录项
+```
+
+在 `images/` 内按同样的典型字母序场景：
 ```
 min-original.webp    # 'm' < 'o' < 't'
 original.webp
@@ -128,7 +141,7 @@ tiny-original.webp
 timeline/            # 目录
 ```
 
-**因此，单食谱批量导出 ZIP 的 namelist() 典型顺序为**：
+**以下为典型（非必然）场景下的 ZIP namelist() 顺序示例**：
 ```
 recipes/slug/slug.json
 recipes/slug/assets/file1.pdf
@@ -140,7 +153,7 @@ recipes/slug/images/timeline/{uuid}/original.webp
 recipes/slug/images/timeline/{uuid}/tiny-original.webp
 ```
 
-**多食谱批量导出 ZIP（2 个食谱 A→B）namelist() 典型顺序**：
+**多食谱批量导出 ZIP（2 个食谱 A→B）在典型场景下的 namelist() 顺序示例**：
 ```
 recipes/A/A.json
 recipes/A/assets/...
@@ -153,8 +166,10 @@ recipes/B/assets/...
 recipes/B/images/min-original.webp
 recipes/B/images/original.webp
 recipes/B/images/tiny-original.webp
-recipes/B/images/timeline/{uuid}/.../tiny-original.webp   ← 最后一个 .webp
+recipes/B/images/timeline/{uuid}/.../tiny-original.webp
 ```
+
+**特别说明**：以上所有字母序示例仅用于说明"最后覆盖"机制可能导致的后果，实际顺序受 OS/文件系统/文件创建历史等因素影响，代码层面不保证任何确定性。
 
 ### 2.3 共享食谱单条 ZIP 导出
 
@@ -334,15 +349,31 @@ with ZipFile(temp_path) as myzip:
 - 多个 `.json` / `.webp` 时，**最后一次循环赋值生效**（非确定性，完全取决于 ZIP 内 `namelist()` 顺序）
 - 仅支持 `.webp` 后缀，`.jpg`、`.png`、`.jpeg` 等会被**静默忽略**，无任何警告
 
-**多张 webp "最后覆盖" 实际选中哪类图片（按典型 namelist 字母序推导）**：
+**多张 webp "最后覆盖"可能选中的图片类型（代码层面为非确定性，基于典型字母序场景的可能性分析）**：
 
-| ZIP 来源 | namelist() 中最后一个 .webp | 实际选中图片 | 分辨率 | 后果 |
-|---------|--------------------------|------------|-------|------|
-| **共享食谱单条导出** | `original.webp` | `images/original.webp` | max 2048×2048 | ✅ 正确 |
-| **单食谱批量导出（无 timeline）** | `images/tiny-original.webp` | **tiny 缩略图** | 300×300 center-crop | 🔴 严重画质下降 |
-| **单食谱批量导出（有 timeline）** | `images/timeline/{uuid}/tiny-original.webp` | **时间线事件的 tiny 缩略图** | 300×300 center-crop | 🔴 严重画质下降 + 可能不是食谱主图 |
-| **多食谱批量导出（N 个食谱）** | 最后一个食谱的 `.../tiny-original.webp` | **最后一个食谱**的 tiny 缩略图 | 300×300 | 🔴 最后一个食谱的 tiny 被当作"原图"，且 JSON 也是最后一个食谱的（JSON 和图片恰好同食谱，但图片分辨率错了） |
-| **手工构造 ZIP** | 取决于 namelist 顺序 | 不确定 | 不确定 | 🟠 非确定性 |
+`ZipFile.namelist()` 返回 ZIP 文件中条目按**插入顺序**排列的列表（即 `zip.write()` / `zip.writestr()` 的调用顺序）。而插入顺序又取决于 `Path.iterdir()` 的 OS/文件系统相关任意顺序。因此以下分析仅为**典型场景下的可能性**，并非必然结果：
+
+| ZIP 来源 | ZIP 内 .webp 数量 | 典型字母序下最后一个 .webp 的可能位置 | 可能被选中的图片类型 | 典型分辨率 | 风险 |
+|---------|------------------|-------------------------------------|-------------------|-----------|------|
+| **共享食谱单条导出** | 1（仅 `original.webp`） | 唯一匹配，顺序确定 | ✅ `images/original.webp` | max 2048×2048 | 无 |
+| **单食谱批量导出（无 timeline 事件）** | 3 | 可能落在 `images/tiny-original.webp` | 🔴 可能为 **tiny 缩略图** | 300×300 center-crop | 严重画质下降（可能性较高） |
+| **单食谱批量导出（有 timeline 事件）** | 3 + 3N (N 个事件) | 可能落在某个 `images/timeline/{uuid}/tiny-original.webp` | 🔴 可能为**时间线事件的 tiny 缩略图** | 300×300 center-crop | 画质下降 + 可能不是食谱主图（可能性较高） |
+| **多食谱批量导出（N 个食谱）** | N × (3 + 3M) | 可能落在**最后一个食谱**的某个 tiny 位置 | 🟠 **仅最后一个食谱有机会被导入**，其余 N-1 个完全丢失；被导入食谱仍可能拿到 tiny | 300×300 | 数据丢失 + 画质下降 |
+| **手工构造 ZIP** | 不确定 | 取决于 ZIP 写入顺序 | 不确定 | 不确定 | 非确定性 |
+
+**代码层面的非确定性来源链**（[mealie/services/exporter/_abc_exporter.py#L79-L86](mealie/services/exporter/_abc_exporter.py#L79-L86) → [mealie/services/recipe/recipe_service.py#L313-L320](mealie/services/recipe/recipe_service.py#L313-L320)）：
+```
+Path.iterdir()   [任意顺序，OS/FS 依赖]
+    ↓
+zip.write() 调用顺序   [由 iterdir 决定]
+    ↓
+ZIP 文件内条目顺序   [按写入顺序排列]
+    ↓
+ZipFile.namelist()   [按 ZIP 条目顺序返回]
+    ↓
+for file in namelist() 最后赋值覆盖   [最后一个匹配生效]
+```
+整条链路**没有任何 `sorted()` 调用**，不存在任何顺序保证。
 
 **Group/Household 强制重绑定**：[mealie/services/recipe/recipe_service.py](mealie/services/recipe/recipe_service.py#L283-L297)
 
@@ -398,45 +429,45 @@ min_dest = image_path.parent.joinpath("min-original.webp")
 tiny_dest = image_path.parent.joinpath("tiny-original.webp")
 ```
 
-**严重隐患**：如果输入的 bytes 本身是一张 300×300 的 `tiny-original.webp`，它会被当作 `original.webp` 写入磁盘，然后 minify 会再次从它生成：
-- `min-original.webp`：300×300 thumbnail → 被缩到 1024×1024 canvas（实际无放大，等于原图）
-- `tiny-original.webp`：300×300 → 再次 center-crop 到 300×300（重编码，画质进一步下降）
-- 最终新 recipe 的所有图片都来自时间线的 tiny 缩略图，最大分辨率仅 300×300。
+**严重隐患（当 tiny 被选中作为原图输入时）**：如果被选中的 bytes 本身是一张 300×300 的 `tiny-original.webp`，它会被当作 `original.webp` 写入磁盘，然后 minify 会再次从它生成：
+- `min-original.webp`：300×300 thumbnail → 被缩到 1024×1024 canvas（实际无放大，等于原图重新编码）
+- `tiny-original.webp`：300×300 → 再次 center-crop 到 300×300（二次重编码，画质进一步下降）
+- 最终新 recipe 的所有图片最高分辨率可能仅 300×300。此为**可能发生的最坏情况**，取决于 namelist 实际顺序。
 
 #### 3.3.3 导入 ZIP 与导出 ZIP 结构对应关系（代码核实版）
 
-| 导出类型 | ZIP 结构 | create_from_zip 匹配行为 | 兼容性结论 |
-|---------|---------|------------------------|----------|
-| **共享食谱单条导出** (`shared/{token}/zip`) | 扁平：`{slug}.json` + `original.webp`，共 2 个文件 | ✅ JSON 和 webp 都唯一匹配，namelist 顺序确定 | **完全兼容**（最匹配的导入来源） |
-| **单食谱批量导出（无 timeline 事件）** | `recipes/{slug}/{slug}.json` + `images/` 下 3 个 webp + `assets/` | `namelist()` 最后一个 webp 是 `images/tiny-original.webp`（300×300） | ⚠ **JSON 能读，图片错拿 tiny 缩略图当原图**；assets 文件和 DB 记录不匹配 |
-| **单食谱批量导出（有 timeline 事件）** | 同上 + `images/timeline/{uuid}/` 下 3 个 webp | 最后一个 webp 是 timeline 的 `tiny-original.webp` | 🔴 **JSON 能读，但图片拿了时间线事件的 300×300 缩略图**；可能不是食谱主图 |
-| **多食谱批量导出（N 个食谱）** | N 份 `recipes/{slug}/...` 叠加 | 最后 JSON 和最后 webp 都来自**最后一个食谱** | 🟠 **仅导入最后一个食谱**，其余 N-1 个完全丢失；且仍拿的是 tiny 缩略图 |
-| **MealieAlpha 迁移包** | `recipes/{slug}/{slug}.json` + 同级图片目录 | 取决于具体子目录结构 | ⚠ 不确定 |
-| **手工构造 ZIP** | 任意目录 + `.json`/`.webp` | 只要后缀匹配即可，但多文件结果不确定 | 🟡 需保证仅 1 JSON + 1 webp |
+| 导出类型 | ZIP 结构 | create_from_zip 匹配行为 | 兼容性结论（基于代码实现，非典型场景） |
+|---------|---------|------------------------|----------------------------------|
+| **共享食谱单条导出** (`shared/{token}/zip`) | 扁平：`{slug}.json` + `original.webp`，共 2 个文件 | ✅ JSON 和 webp 都唯一匹配，namelist 顺序由代码确定 | **完全兼容**（唯一代码层面可确定正确的导入来源） |
+| **单食谱批量导出（无 timeline 事件）** | `recipes/{slug}/{slug}.json` + `images/` 下 3 个 webp + `assets/` | JSON 唯一（`recipes/{slug}/{slug}.json`），但 3 个 webp 均匹配 `.endswith(".webp")`，最后覆盖结果**非确定** | ⚠ JSON 能可靠读取；图片有可能拿错为 min/tiny 缩略图；assets 文件和 DB 记录不匹配 |
+| **单食谱批量导出（有 timeline 事件）** | 同上 + `images/timeline/{uuid}/` 下各 3 个 webp | JSON 唯一，webp 总数增至 3+3N，最后覆盖结果更不确定 | 🔴 JSON 能读，但图片有较高概率命中 tiny（尤其 timeline 目录在字母序场景下排在最后时）；且可能拿到时间线事件图而非食谱主图 |
+| **多食谱批量导出（N 个食谱）** | N 份 `recipes/{slug}/...` 叠加 | JSON 共 N 个，最后一个覆盖生效；webp 共 N×(3+3M) 个，最后一个覆盖生效 | 🟠 **仅最后一个食谱有机会被导入**，其余 N-1 个完全静默丢失；被导入食谱仍存在图片错拿风险 |
+| **MealieAlpha 迁移包** | `recipes/{slug}/{slug}.json` + 同级图片目录 | 取决于具体子目录结构和文件数量 | ⚠ 非确定 |
+| **手工构造 ZIP** | 任意目录 + `.json`/`.webp` | 只要后缀匹配即可，但多文件结果非确定 | 🟡 可靠使用的前提：保证 ZIP 内仅 1 个 `.json` + 1 个 `.webp` |
 
-**代码核实的关键不匹配点**：
+**代码核实的关键要点**：
 
-1. **🔴 图片错配是确定性问题，不是"可能读不到"**：批量导出的 3+ 张 webp 全部匹配 `.endswith(".webp")`，不是之前认为的"图片读不到"；实际是**读多了且拿错了**。字母序下 `tiny-original.webp`（'t' 开头）几乎总是最后一个。
+1. **图片不是"读不到"，而是"读太多且拿哪张不确定"**：批量导出的所有 webp 文件都会匹配 `.endswith(".webp")`，但具体哪一张被 `recipe_image` 变量最终持有，取决于 ZIP 写入时的 `Path.iterdir()` 顺序——代码层面不提供任何保证。
 
-2. **🔴 RecipeAsset 孤儿 DB 记录**：
+2. **🔴 RecipeAsset 孤儿 DB 记录（确定存在的风险）**：
    - JSON 中 `recipe_asset: [{...}, {...}]` 列表随 Recipe 一起通过 `Recipe(**cleaned_dict)` 写入数据库（`recipe_assets` 表有记录）
    - 但 `assets/` 下的实际文件（PDF/MD 等）在 create_from_zip 中**完全不处理**，不会写入新 recipe 的 `assets/` 目录
    - 结果：DB 里有 RecipeAsset 行，磁盘上文件不存在 → 前端点击下载 404
 
-3. **🔴 Timeline 事件孤儿图片**：
+3. **🔴 Timeline 事件孤儿图片（确定存在的风险）**：
    - JSON 中 `recipe_timeline: [{... image: true ...}, ...]` 随 Recipe 写入 `recipe_timeline_events` 表
-   - 但 `images/timeline/{event_id}/` 下的 3 个 webp 文件完全不拷贝
+   - 但 `images/timeline/{event_id}/` 下的 webp 文件完全不拷贝
    - 结果：时间线事件引用图片路径，但文件不存在 → `/api/recipes/{id}/images/timeline/...` 返回 404
 
-4. **🟡 Recipe.image 缓存 key 不匹配**：
+4. **🟡 Recipe.image 缓存 key 不匹配（确定存在的风险）**：
    - `recipes.image` 列（[mealie/db/models/recipe/recipe.py](mealie/db/models/recipe/recipe.py#L84)）存储的是源 Recipe 的缓存 key 字符串
    - 新 Recipe 落库时沿用了 JSON 中的旧值
    - 但实际图片存放在 `RECIPE_DATA_DIR/{new_recipe_id}/images/`（按新 recipe id 生成路径）
    - 前端首次渲染可能尝试用旧缓存 key 取图 → 404；刷新后从新路径读取正常
 
-5. **🟡 多食谱批量导出 ZIP 仅导入最后一个**：
+5. **🟠 多食谱批量导出 ZIP 仅导入最后一个（确定存在的风险，具体哪一个取决于 namelist）**：
    - `ABCExporter.export()` 按 `items()` 顺序逐个写入 A→B→C→...
-   - 最后 JSON 和最后 webp 都来自最后一个食谱
+   - 最后 JSON 和最后 webp 都来自 namelist 中最后一个食谱
    - 前面 N-1 个食谱的 JSON 和图片被完全静默丢弃，无报错、无日志
 
 ---
@@ -587,29 +618,31 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 
 #### 5.2.2 Recipe ZIP 导入（代码核实版）
 
-| 资源类型 | 处理方式 | 风险等级 | 详细后果 |
-|---------|---------|---------|---------|
-| **共享 ZIP 的 `original.webp`** | `write_image(bytes, "webp")` → 写入 + minify 生成 3 尺寸 | ✅ 正常 | 仅共享 ZIP 可靠 |
-| **批量 ZIP 的 `images/original.webp`** | 被 `min-original.webp` 和 `tiny-original.webp` 覆盖，实际不会被选中 | 🔴 严重 | 原图永远不会被用到 |
-| **批量 ZIP 的 `images/tiny-original.webp`** | 被当作 "original" 写入 → 再次 minify 生成 min+tiny | 🔴 严重 | 300×300 center-crop 成为最高清版本，所有尺寸都模糊 |
-| **批量 ZIP 的 timeline `tiny-original.webp`** | 同上，但可能是**非食谱主图**的时间线事件图 | 🔴 严重 | 食物成品照片被替换成操作步骤截图 / 空盘照等 |
-| **非 webp 格式图片（jpg/png/gif...）** | `elif file.endswith(".webp")` 不匹配 → **静默丢弃** | 🔴 严重 | 图片完全丢失，无任何报错或日志 |
-| **RecipeAsset 文件（PDF/MD/TXT...）** | 完全不读取不拷贝 | 🔴 严重 | **DB 已创建 RecipeAsset 记录**（随 JSON 写入），磁盘上无文件 → 404 孤儿行 |
-| **Timeline 事件图片** | 完全不读取不拷贝 | 🟠 中高 | DB 已创建 `recipe_timeline_events` 记录，磁盘上无图片 → 时间线图片 404 |
-| **Recipe.image 缓存 key** | JSON 中源 recipe 的缓存 key 直接落库 | 🟡 中 | 缓存 key 与新 recipe 的图片路径/UUID 不匹配，首次前端加载可能 404 |
-| **多食谱 ZIP 中除最后一个外的所有食谱** | JSON 和图片被循环覆盖 | 🔴 严重 | N-1 个食谱完全静默丢失，无提示 |
+| 资源类型 | 处理方式 | 风险等级 | 详细后果（代码实现确定性 vs. 典型场景可能性） |
+|---------|---------|---------|------------------------------------------|
+| **共享 ZIP 的 `original.webp`** | `write_image(bytes, "webp")` → 写入 + minify 生成 3 尺寸 | ✅ 正常 | 仅共享 ZIP 可靠（代码层面确定性：2 个文件，顺序固定） |
+| **批量 ZIP 的 `images/original.webp`** | namelist 中若排在最后则被选中，否则被其他 webp 覆盖 | 🟠 中高 | 有可能被用到，但在典型字母序场景下，`original.webp`（'o' 开头）排在 `min-original.webp`（'m'）之后、`tiny-original.webp`（'t'）之前，被覆盖的**可能性较高** |
+| **批量 ZIP 的 `images/tiny-original.webp`** | namelist 中若排在最后则被选中，当作 "original" 写入 → 再次 minify 生成 min+tiny | 🔴 严重 | 在典型字母序场景下，`tiny-original.webp`（'t' 开头）有可能排在最后 → 300×300 center-crop 成为最高清版本，所有尺寸都模糊 |
+| **批量 ZIP 的 timeline `tiny-original.webp`** | 同上，但可能是**非食谱主图**的时间线事件图 | 🔴 严重 | 在典型字母序场景下 timeline 目录排在 `tiny-original.webp` 之后，其内的 tiny 文件更可能排在最后 → 食物成品照片被替换成操作步骤截图 / 空盘照等（可能性较高，但非必然） |
+| **非 webp 格式图片（jpg/png/gif...）** | `elif file.endswith(".webp")` 不匹配 → **静默丢弃** | 🔴 严重 | 代码层面**确定性**：非 webp 后缀的图片完全丢失，无任何报错或日志 |
+| **RecipeAsset 文件（PDF/MD/TXT...）** | 完全不读取不拷贝 | 🔴 严重 | 代码层面**确定性**：**DB 已创建 RecipeAsset 记录**（随 JSON 写入），磁盘上无文件 → 404 孤儿行 |
+| **Timeline 事件图片** | 完全不读取不拷贝 | 🟠 中高 | 代码层面**确定性**：DB 已创建 `recipe_timeline_events` 记录，磁盘上无图片 → 时间线图片 404 |
+| **Recipe.image 缓存 key** | JSON 中源 recipe 的缓存 key 直接落库 | 🟡 中 | 代码层面**确定性**：缓存 key 与新 recipe 的图片路径/UUID 不匹配，首次前端加载可能 404 |
+| **多食谱 ZIP 中除最后一个外的所有食谱** | JSON 和图片被循环覆盖 | 🔴 严重 | 代码层面**确定性**：N-1 个食谱完全静默丢失，具体哪一个被保留取决于 namelist 顺序 |
 
 **路径穿越防护**：create_from_zip 直接使用 `myzip.open(file)` 读取 bytes 到内存，不写入磁盘（无路径拼接），因此不存在 `../../` 目录穿越风险，这一点优于第三方迁移链路。
 
-**图片被误用的连锁损失（代码核实）**：
+**图片被误用的连锁损失（典型场景下的可能性分析，非必然发生）**：
 
-假设源食谱有一张 4000×3000 的原图，导出到批量 ZIP 后再导入：
+假设源食谱有一张 4000×3000 的原图，在典型字母序场景下 `tiny-original.webp` 被选中：
 1. 源 `tiny-original.webp`：300×300 center-crop（丢弃了边缘内容），~15KB
 2. 该 bytes 被写入新 recipe 的 `original.webp`
 3. minify 从这张 300×300 再次生成：
    - 新 `min-original.webp`：300×300 → thumbnail 到 1024 canvas（实际还是 300×300，被重新编码）
    - 新 `tiny-original.webp`：300×300 → 再次 center-crop 到 300×300（二次重编码，进一步损失）
 4. 最终新 recipe 的最高清图片就是那张 300×300 center-crop，原图细节永久丢失
+
+**上述场景是否实际发生，完全取决于运行导出时的 `Path.iterdir()` 顺序，代码层面不提供任何保证。**
 
 ### 5.3 冲突合并风险
 
@@ -632,8 +665,8 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | **Tag slug 冲突（同 Group 已有同名 Tag）** | `get_one(slug)` 命中 → 返回已有记录的 `model_dump()` | 🟠 中高 | 导入 JSON 中 tag 的自定义属性（如 id、创建时间）被静默丢弃，直接复用目标实例已有 tag |
 | **Category slug 冲突** | 同上 | 🟠 中高 | 同上 |
 | **User ID 冲突（JSON 中 user_id 指向不存在/跨 Group 用户）** | `_transform_user_id` 回退到当前用户 | 🟡 中 | 原作者信息丢失，全部归为导入者 |
-| **多 webp 互相覆盖** | 循环最后赋值生效 | 🔴 高 | 字母序下最后是 tiny 缩略图，高概率拿错图片 |
-| **多 JSON 互相覆盖（多食谱 ZIP）** | 循环最后赋值生效 | 🔴 高 | 仅最后一个食谱被导入，其余静默丢失 |
+| **多 webp 互相覆盖** | 循环最后赋值生效 | 🔴 高 | 代码层面非确定；在典型字母序场景下最后是 tiny 缩略图的可能性较高，但不同 OS/FS 下可能出现不同结果 |
+| **多 JSON 互相覆盖（多食谱 ZIP）** | 循环最后赋值生效 | 🔴 高 | 代码层面确定：仅 namelist 中最后一个食谱被导入，其余静默丢失 |
 | **图片文件名冲突** | `write_image` 内部 `image_path.unlink(missing_ok=True)` 先删再写 | 🟢 低 | 新 recipe 有独立 id 目录，不会冲突；同一 recipe 重试会覆盖自己，正常 |
 | **ID 冲突** | JSON 中 `id` 被 `_recipe_creation_factory` 忽略，由 ORM 重新生成 | 🟢 低 | UUID 冲突概率可忽略 |
 | **Group 交叉（从 A Group 导出导入到 B Group）** | `_process_recipe_data` 强制重写 `group_id` / `household_id` | 🔴 高 | **所有嵌套对象的 group_id 被 B Group 覆盖**；但 Tag/Category 按 slug 复用，如果 B Group 没有该 slug 会新建归属于 B，数据归属整体正确 |
@@ -653,9 +686,9 @@ CookBook 是少数**同时持有 group_id 和 household_id 两个独立外键**�
 | 字段缺失校验 | 🟡 Alembic 自动迁移 | 🟡 cleaner 清洗 | 🔴 纯 Pydantic 校验，无兼容层 |
 | RecipeAsset 处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **DB 孤儿记录，文件丢失** |
 | Timeline 图片处理 | ✅ 全量恢复 | ⚠ 视迁移器 | 🔴 **DB 孤儿记录，图片丢失** |
-| 主图分辨率正确性 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 **仅共享 ZIP 正确，批量 ZIP 拿 tiny 缩略图** |
-| 非 webp 图片 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 静默丢弃 |
-| 多食谱 ZIP 处理 | — | — | 🔴 **仅导入最后一个** |
+| 主图分辨率正确性 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 **仅共享 ZIP 代码层面保证正确；批量 ZIP 存在图片错拿（典型场景下 tiny 缩略图被选中可能性较高）** |
+| 非 webp 图片 | ✅ 原样恢复 | ⚠ 视迁移器 | 🔴 代码层面确定：静默丢弃 |
+| 多食谱 ZIP 处理 | — | — | 🔴 **代码层面确定：仅导入 namelist 最后一个，其余丢失** |
 | 路径穿越风险 | 🟢 无 | 🟡 safe_local_path 防护 | 🟢 无（直接读 bytes） |
 
 ---
