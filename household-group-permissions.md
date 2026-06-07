@@ -48,25 +48,37 @@ Group (组)
 
 ## 二、用户角色与权限体系
 
-### 2.1 权限标志位定义
+### 2.1 权限标志位定义（路由层实际使用核对）
 
-**[代码支撑]** 所有用户权限存储在 `users` 表的布尔字段中（`mealie/db/models/users/users.py#L60-L82`）：
+**[代码支撑]** 所有用户权限存储在 `users` 表的布尔字段中（`mealie/db/models/users/users.py#L60-L82`）。
+下表中的「实际控制功能」已通过路由层的全部调用点逐一核对：
 
-| 权限标志 | 含义 | 作用范围 |
-|---------|------|---------|
-| `admin` | 超级管理员 | 系统全局，可跨 Group/Household，绕过所有 Repository 过滤 |
-| `can_manage_household` | Household 管理员 | Household 内成员管理、权限设置 |
-| `can_manage` | 资源管理权限 | Group 级资源（分类/标签/工具等）管理 |
-| `can_invite` | 邀请用户权限 | 向当前 Group/Household 发送邀请 |
-| `can_organize` | 组织整理权限 | Cookbook 等整理类操作 |
+| 权限标志 | 数据库字段 | 实际控制功能（路由层调用点） | **不**控制的功能（常见误解） |
+|---------|-----------|--------------------------|---------------------------|
+| `admin` | `admin` | 系统全局超级管理员。可：① 绕过 Repository 的 group_id/household_id 过滤（通过 `BaseAdminController`）；② 列出所有邀请令牌；③ 为其他 Group/Household 创建邀请；④ 删除任意用户；⑤ 修改任意用户的 group/household 归属；⑥ 删除空 Household。 | — |
+| `can_manage_household` | `can_manage_household` | **仅控制一项**：修改当前 Household 的偏好设置（`private_household`、`lock_recipe_edits_from_other_households` 等），调用点：`controller_household_self_service.py#L60` | ❌ 不控制成员权限调整（那是 `can_manage`）；❌ 不控制 Household 创建删除（那是 Admin 专属） |
+| `can_manage` | `can_manage` | 两项功能：① **调整同 Household 其他成员的四个权限标志**（`can_invite`、`can_manage`、`can_manage_household`、`can_organize`），调用点：`controller_household_self_service.py#L66`，集成测试确认：`test_household_permissions.py#L20-L56`；② 管理 Group AI Provider（设置 + Provider 本身的 CRUD），调用点：`controller_group_ai_providers.py`（共 6 处） | ❌ 不控制 Tag/Category/工具/单位管理（那些是 `can_organize` 或无权限检查） |
+| `can_organize` | `can_organize` | Group 级「组织者」资源的增删改：① Recipe Tag（创建/更新/删除，3 处）；② Recipe Category（创建/更新/删除，3 处）；③ Ingredient Food（创建/合并/更新/删除，4 处）。调用文件：`controller_tags.py`、`controller_categories.py`、`foods.py` | ❌ 不控制 Cookbook（Cookbook 无任何权限检查）；❌ 不控制 Tool（无权限检查）；❌ 不控制 Unit（无权限检查）；❌ 不控制 Multi-purpose Label（无权限检查） |
+| `can_invite` | `can_invite` | 邀请功能：① 创建邀请令牌（直接检查 `self.user.can_invite`：`controller_invitations.py#L42-L46`）；② 发送邀请邮件（直接检查：`controller_invitations.py#L75-L79`）。注意：**从未通过 `checks.can_invite()` 调用**，始终直接检查字段。 | 邀请令牌列表查询不由 `can_invite` 控制，而是 `self.user.admin`（`controller_invitations.py#L25-L29`）。跨 Group/Household 创建邀请也需要 Admin。 |
 
-### 2.2 权限联动规则
+### 2.2 无需权限检查即可操作的资源
+
+**[代码支撑]** 以下资源的创建/更新/删除接口**无任何显式权限检查**，同 Group 内任意已登录用户均可操作：
+
+| 资源 | 控制器文件 | 说明 |
+|-----|-----------|------|
+| Cookbook（食谱书） | `mealie/routes/households/controller_cookbooks.py` | 列表按 Group 查询；创建/更新/删除均无检查 |
+| Recipe Tool（工具） | `mealie/routes/organizers/controller_tools.py` | 全部 CRUD 无权限检查 |
+| Ingredient Unit（单位） | `mealie/routes/unit_and_foods/units.py` | 全部 CRUD + 合并均无权限检查 |
+| Multi-purpose Label（多用途标签） | `mealie/routes/groups/controller_labels.py` | 全部 CRUD 无权限检查 |
+
+### 2.3 权限联动规则
 
 **[代码支撑]** 在 `_set_permissions()` 方法中（`mealie/db/models/users/users.py`）：
 - 若 `admin=True`，则自动授予 `can_manage_household`、`can_manage`、`can_invite`、`can_organize` 全部为 `True`
 - Admin 权限是唯一可以跨 Group/Household 的角色
 
-### 2.3 权限设置 Schema
+### 2.4 权限设置 Schema
 
 **[代码支撑]** `mealie/schema/household/household_permissions.py` 中定义：
 ```python
@@ -141,8 +153,14 @@ def _filter_builder(self, **kwargs) -> dict[str, Any]:
 
 ### 3.5 权限检查辅助类
 
-**[代码支撑]** `mealie/routes/_base/checks.py`：
-提供 `can_manage_household()`、`can_manage()`、`can_invite()`、`can_organize()` 方法，权限不足则抛 HTTP 403。
+**[代码支撑]** `mealie/routes/_base/checks.py` 中定义了 `OperationChecks` 类，提供以下方法（权限不足则抛 HTTP 403）：
+
+| 检查方法 | 实际在路由中被调用的次数 | 说明 |
+|---------|------------------------|------|
+| `can_manage_household()` | 1 次 | 仅用于修改 Household 偏好设置 |
+| `can_manage()` | 7 次 | 成员权限调整（1 次）+ AI Provider 管理（6 次） |
+| `can_organize()` | 10+ 次 | Tag/Category/Food 的增删改 |
+| `can_invite()` | **0 次** | 定义了但从未被调用。邀请功能通过直接检查 `self.user.can_invite` 字段实现 |
 
 ---
 
@@ -462,21 +480,95 @@ Household 删除前会检查是否有用户隶属于该 Household，有则拒绝
 
 ## 十一、权限边界速查表
 
-| 操作 | Group Admin | Household Admin | 同 Household 普通用户 | 同 Group 跨 Household 用户 | 跨 Group 用户 |
-|-----|------------|----------------|---------------------|------------------------|-------------|
+**列定义：**
+- **Admin** = `admin=True`（自动被授予全部其他权限）
+- **Household Admin** = `can_manage_household=True`（不保证拥有其他权限标志）
+- **同 Household 普通用户** = 无特殊权限标志，与目标资源在同一 Household
+- **同 Group 跨 Household 用户** = 无特殊权限标志，同 Group 但不同 Household
+- **跨 Group 用户** = 不属于目标 Group
+
+---
+
+### A. Recipe 相关
+
+| 操作 | Admin | Household Admin | 同 Household 普通用户 | 同 Group 跨 Household 用户 | 跨 Group 用户 |
+|-----|-------|----------------|---------------------|------------------------|-------------|
 | 查看同 Group Recipe | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 编辑自己的 Recipe | ✅ | ✅ | ✅ | N/A | ❌ |
-| 编辑他人 Recipe（未锁定） | ✅ | 取决于对方 Household 设置 | ✅ | 取决于对方 Household 设置 | ❌ |
-| 编辑他人 Recipe（已锁定） | ✅ | ❌（除非是所有者） | ❌（除非是所有者） | ❌ | ❌ |
-| 删除他人 Recipe | ✅ | ❌ | ❌ | ❌ | ❌ |
-| 锁定/解锁 Recipe | ❌（除非是该 Recipe 的创建者本人） | 仅自己创建的 | 仅自己创建的 | ❌ | ❌ |
+| 编辑自己创建的 Recipe | ✅ | ✅ | ✅ | N/A | ❌ |
+| 编辑他人 Recipe（未锁定） | 取决于对方 Household 设置¹ | 取决于对方 Household 设置¹ | ✅ | 取决于对方 Household 设置¹ | ❌ |
+| 编辑他人 Recipe（已锁定） | ❌（除非是所有者本人）² | ❌（除非是所有者本人） | ❌（除非是所有者本人） | ❌ | ❌ |
+| 删除他人 Recipe | ✅³ | ❌ | ❌ | ❌ | ❌ |
+| 锁定/解锁 Recipe | ❌（除非是该 Recipe 的创建者本人）⁴ | ❌（除非是该 Recipe 的创建者本人） | ❌（除非是该 Recipe 的创建者本人） | ❌ | ❌ |
+
+> ¹ `can_update()` 中无 Admin 绕过逻辑；若对方 Household 设置 `lock_recipe_edits_from_other_households=True` 则禁止跨 Household 编辑
+> ² 锁定的 Recipe 只有所有者可以编辑，`can_update()` 的 SQL 中无 Admin 绕过
+> ³ `can_delete()` 显式包含 `if self.user.admin: return True`
+> ⁴ `can_lock_unlock()` 仅判断 `recipe.user_id == self.user.id`，无 Admin 绕过
+
+---
+
+### B. 家庭 / 计划 资源
+
+| 操作 | Admin | Household Admin | 同 Household 普通用户 | 同 Group 跨 Household 用户 | 跨 Group 用户 |
+|-----|-------|----------------|---------------------|------------------------|-------------|
 | 查看 MealPlan/ShoppingList | ✅ | ✅（同 Household） | ✅ | ❌（被 Repository 过滤） | ❌ |
-| 查看 Cookbook | ✅ | ✅（同 Household） | ✅ | ❌（被 Repository 过滤） | ❌ |
-| 管理 Household 成员 | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 修改用户 Group/Household | ✅ | ❌ | ❌ | ❌ | ❌ |
+| 查看 Cookbook（列表+详情） | ✅ | ✅ | ✅ | ✅（Cookbook 列表按 Group 查询）⁵ | ❌ |
+| 创建/更新/删除 Cookbook | ✅ | ✅ | ✅ | ✅（无任何权限检查）⁶ | ❌ |
+| 创建/更新/删除 MealPlan | ✅ | ✅（同 Household） | ✅ | ❌（被 Repository 过滤） | ❌ |
+| 创建/更新/删除 ShoppingList | ✅ | ✅（同 Household） | ✅ | ❌（被 Repository 过滤） | ❌ |
+
+> ⁵ Cookbook 的 `get_all()` 和 `get_one()` 都使用 `group_cookbooks`（`household_id=None`），同 Group 内跨 Household 可见
+> ⁶ Cookbook 控制器的 create/update/delete 方法均**未调用任何权限检查**
+
+---
+
+### C. 权限与偏好管理
+
+| 操作 | Admin | Household Admin | 同 Household 普通用户 | 同 Group 跨 Household 用户 | 跨 Group 用户 |
+|-----|-------|----------------|---------------------|------------------------|-------------|
+| 修改 Household 偏好设置（private_household 等） | ✅ | ✅⁷ | ❌ | ❌ | ❌ |
+| 调整同 Household 其他成员的四个权限标志 | ✅ | ❌（需要 `can_manage`，不是 `can_manage_household`）⁸ | ❌ | ❌ | ❌ |
+| 调整自己的权限 | ❌（禁止自改）⁹ | ❌（禁止自改） | ❌（禁止自改） | N/A | N/A |
+| 修改用户 Group/Household 归属 | ✅¹⁰ | ❌ | ❌ | ❌ | ❌ |
 | 删除其他用户 | ✅ | ❌ | ❌ | ❌ | ❌ |
-| 删除 Household（有用户） | ❌ | ❌ | ❌ | ❌ | ❌ |
+| 删除 Household（有用户） | ❌¹¹ | ❌ | ❌ | ❌ | ❌ |
 | 删除 Household（无用户） | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+> ⁷ 由 `checks.can_manage_household()` 控制，调用点：`controller_household_self_service.py#L60`
+> ⁸ 由 `checks.can_manage()` 控制（不是 `can_manage_household`），调用点：`controller_household_self_service.py#L66`；集成测试确认：`test_household_permissions.py#L20-L56`
+> ⁹ 代码显式禁止：`if target_user.id == self.user.id: raise 403`
+> ¹⁰ 只能通过 Admin 管理 API：`mealie/routes/admin/admin_management_users.py`
+> ¹¹ 代码显式检查用户数：`user_count > 0 → raise 400`
+
+---
+
+### D. 邀请功能
+
+| 操作 | Admin | Household Admin | 同 Household 普通用户 | 同 Group 跨 Household 用户 | 跨 Group 用户 |
+|-----|-------|----------------|---------------------|------------------------|-------------|
+| 查看全部邀请令牌列表 | ✅¹² | ❌ | ❌ | ❌ | ❌ |
+| 为本 Group/Household 创建邀请令牌 | ✅ | 有 `can_invite` 即可 | 有 `can_invite` 即可 | 有 `can_invite` 即可 | ❌ |
+| 为**其他** Group/Household 创建邀请令牌 | ✅¹³ | ❌ | ❌ | ❌ | ❌ |
+| 发送邀请邮件 | ✅ | 有 `can_invite` 即可 | 有 `can_invite` 即可 | 有 `can_invite` 即可 | ❌ |
+
+> ¹² 列表接口仅检查 `self.user.admin`，不检查 `can_invite`：`controller_invitations.py#L25-L29`
+> ¹³ 创建接口检查：`not self.user.admin and (body.group_id != self.group_id or body.household_id != self.household_id) → 403`
+
+---
+
+### E. Group 级组织者资源
+
+| 操作 | Admin | Household Admin | 同 Household 普通用户 | 同 Group 跨 Household 用户 | 跨 Group 用户 |
+|-----|-------|----------------|---------------------|------------------------|-------------|
+| 创建/更新/删除 Recipe Tag | ✅ | 有 `can_organize` 即可 | 有 `can_organize` 即可 | 有 `can_organize` 即可 | ❌ |
+| 创建/更新/删除 Recipe Category | ✅ | 有 `can_organize` 即可 | 有 `can_organize` 即可 | 有 `can_organize` 即可 | ❌ |
+| 创建/合并/更新/删除 Ingredient Food | ✅ | 有 `can_organize` 即可 | 有 `can_organize` 即可 | 有 `can_organize` 即可 | ❌ |
+| 创建/更新/删除 Recipe Tool | ✅ | ✅¹⁴ | ✅¹⁴ | ✅¹⁴ | ❌ |
+| 创建/合并/更新/删除 Ingredient Unit | ✅ | ✅¹⁴ | ✅¹⁴ | ✅¹⁴ | ❌ |
+| 创建/更新/删除 Multi-purpose Label | ✅ | ✅¹⁴ | ✅¹⁴ | ✅¹⁴ | ❌ |
+| Group AI Provider 设置 + Provider CRUD | ✅ | 有 `can_manage` 即可 | 有 `can_manage` 即可 | 有 `can_manage` 即可 | ❌ |
+
+> ¹⁴ **无任何权限检查**：这些资源的 CRUD 接口对同 Group 内任意已登录用户开放
 
 ---
 
