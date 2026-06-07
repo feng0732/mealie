@@ -36,52 +36,90 @@ Cookbook 模型中仍保留以下字段，但已标记为 deprecated，不再使
 
 ### 2.1 完整路由树
 
+所有后端路由统一前缀为 `/api`，由 [routes/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/__init__.py#L20-L35) 定义。
+
 ```
 app.include_router(router)  # prefix = "/api"
+│
 ├── households.router
 │   └── controller_cookbooks.router
-│       prefix = "/households/cookbooks"
-│       ├── GET    /api/households/cookbooks          # 列表（跨 household）
-│       ├── GET    /api/households/cookbooks/{slug}   # 单个
-│       ├── POST   /api/households/cookbooks          # 创建
-│       ├── PUT    /api/households/cookbooks          # 批量更新 position
-│       ├── PUT    /api/households/cookbooks/{id}     # 更新单个
-│       └── DELETE /api/households/cookbooks/{id}     # 删除
+│       [定义: controller_cookbooks.py#L24]
+│       prefix = "/households/cookbooks", 需要认证
+│       ├── GET    /api/households/cookbooks              # 列表（跨 household）[L51]
+│       ├── GET    /api/households/cookbooks/{item_id}    # 单个（id 或 slug）[L104]
+│       ├── POST   /api/households/cookbooks              # 创建 [L62]
+│       ├── PUT    /api/households/cookbooks              # 批量更新 position [L78]
+│       ├── PUT    /api/households/cookbooks/{item_id}    # 更新单个 [L122]
+│       └── DELETE /api/households/cookbooks/{item_id}    # 删除 [L136]
 │
 ├── recipe.router
-│   ├── recipe_crud_routes.router  (prefix="/recipes", 需要认证)
-│   │   ├── GET    /api/recipes                    # 列表（支持 cookbook 参数）
-│   │   ├── GET    /api/recipes/{slug}             # 单个
-│   │   ├── POST   /api/recipes                    # 创建
-│   │   ├── PUT    /api/recipes/{slug}             # 更新
-│   │   ├── DELETE /api/recipes/{slug}             # 删除
-│   │   └── GET    /api/recipes/{slug}/summary     # 摘要
+│   ├── recipe_crud_routes.router
+│   │   [定义: recipe_crud_routes.py#L85, prefix="/recipes"]
+│   │   [挂载: recipe/__init__.py#L10, 无额外前缀]
+│   │   需要认证
+│   │   ├── 核心 CRUD
+│   │   │   ├── GET    /api/recipes                    # 分页列表（支持 cookbook 参数）[L340]
+│   │   │   ├── GET    /api/recipes/{slug}             # 单个完整 recipe [L415]
+│   │   │   ├── POST   /api/recipes                    # 创建 [L426]
+│   │   │   ├── PUT    /api/recipes/{slug}             # 更新单个 [L472]
+│   │   │   ├── PUT    /api/recipes                    # 批量更新 [L495]
+│   │   │   ├── PATCH  /api/recipes/{slug}             # 局部更新单个 [L520]
+│   │   │   ├── PATCH  /api/recipes                    # 批量局部更新 [L543]
+│   │   │   └── DELETE /api/recipes/{slug}             # 删除 [L592]
+│   │   ├── 创建辅助
+│   │   │   ├── POST /api/recipes/test-scrape-url          # 测试 URL 抓取 [L130]
+│   │   │   ├── POST /api/recipes/create/html-or-json      # 从 HTML/JSON 创建 [L144]
+│   │   │   ├── POST /api/recipes/create/html-or-json/stream # 流式创建 [L160]
+│   │   │   ├── POST /api/recipes/create/url               # 从 URL 创建 [L173]
+│   │   │   ├── POST /api/recipes/create/url/stream        # 流式从 URL 创建 [L186]
+│   │   │   ├── POST /api/recipes/create/url/bulk          # 批量 URL 创建 [L276]
+│   │   │   ├── POST /api/recipes/create/zip               # 从 zip 创建 [L295]
+│   │   │   └── POST /api/recipes/create/image             # 从图片创建 [L309]
+│   │   ├── 其他
+│   │   │   ├── GET    /api/recipes/suggestions            # 推荐 recipes [L397]
+│   │   │   ├── POST   /api/recipes/{slug}/duplicate       # 复制 recipe [L450]
+│   │   │   ├── PATCH  /api/recipes/{slug}/last-made       # 更新上次制作时间 [L568]
+│   │   │   ├── POST   /api/recipes/{slug}/image           # 从 URL 抓取图片 [L614]
+│   │   │   ├── PUT    /api/recipes/{slug}/image           # 上传图片 [L635]
+│   │   │   ├── DELETE /api/recipes/{slug}/image           # 删除图片 [L644]
+│   │   │   └── POST   /api/recipes/{slug}/assets          # 上传附件 [L653]
+│   │   │
+│   │   ├── comments.router (prefix="/recipes")       # 评论相关
+│   │   ├── bulk_actions.router (prefix="/recipes")   # 批量操作
+│   │   ├── exports.router                            # 导出
+│   │   └── timeline_events.router (prefix="/recipes") # 时间线
 │   │
-│   ├── shared_routes.router  (NO prefix, 无认证)
-│   │   ├── GET /api/recipes/shared/{token_id}      # 通过令牌获取 recipe
-│   │   └── GET /api/recipes/shared/{token_id}/zip  # 通过令牌下载 recipe zip
-│   │
-│   ├── comments.router  (prefix="/recipes", 需要认证)
-│   ├── bulk_actions.router  (prefix="/recipes", 需要认证)
-│   ├── exports.router  (需要认证)
-│   └── timeline_events.router  (prefix="/recipes", 需要认证)
+│   └── shared_routes.router
+│       [定义: recipe/shared_routes.py#L17]
+│       [挂载: recipe/__init__.py#L13, prefix="/recipes"]
+│       无需认证
+│       ├── GET /api/recipes/shared/{token_id}          # 通过令牌获取 recipe [L22]
+│       └── GET /api/recipes/shared/{token_id}/zip      # 通过令牌下载 recipe zip [L42]
 │
-├── shared.router  (prefix="/shared/recipes", 需要认证)
-│   ├── GET    /api/shared/recipes                  # 令牌列表（支持 recipe_id 过滤）
-│   ├── POST   /api/shared/recipes                  # 创建分享令牌
-│   ├── GET    /api/shared/recipes/{item_id}        # 获取单个令牌详情
-│   └── DELETE /api/shared/recipes/{item_id}        # 撤销分享令牌
+├── shared.router
+│   [定义: shared/__init__.py#L13]
+│   prefix = "/shared/recipes", 需要认证
+│   ├── GET    /api/shared/recipes                      # 令牌列表（支持 ?recipe_id= 过滤）[L26]
+│   ├── POST   /api/shared/recipes                      # 创建分享令牌 [L33]
+│   ├── GET    /api/shared/recipes/{item_id}            # 获取单个令牌详情 [L44]
+│   └── DELETE /api/shared/recipes/{item_id}            # 撤销分享令牌 [L48]
 │
 └── explore.router
-    ├── controller_public_cookbooks.router  (prefix="/cookbooks", 无认证)
-    │   ├── GET /api/explore/groups/{group_slug}/cookbooks        # 公开 cookbooks 列表
-    │   └── GET /api/explore/groups/{group_slug}/cookbooks/{slug} # 单个公开 cookbook
+    ├── controller_public_cookbooks.router
+    │   [定义: controller_public_cookbooks.py#L12]
+    │   prefix = "/cookbooks", 无需认证
+    │   ├── GET /api/explore/groups/{group_slug}/cookbooks            # 公开 cookbooks 列表 [L21]
+    │   └── GET /api/explore/groups/{group_slug}/cookbooks/{item_id}  # 单个公开 cookbook（id或slug）[L42]
     │
-    └── controller_public_recipes.router  (prefix="/recipes", 无认证)
-        ├── GET /api/explore/groups/{group_slug}/recipes                    # 公开 recipes 列表
-        ├── GET /api/explore/groups/{group_slug}/recipes/{slug}             # 单个公开 recipe
-        └── GET /api/explore/groups/{group_slug}/recipes/{slug}/summary     # 公开 recipe 摘要
+    └── controller_public_recipes.router
+        [定义: controller_public_recipes.py#L17]
+        prefix = "/recipes", 无需认证
+        ├── GET /api/explore/groups/{group_slug}/recipes                    # 公开 recipes 列表 [L30]
+        ├── GET /api/explore/groups/{group_slug}/recipes/suggestions        # 公开推荐 recipes [L94]
+        └── GET /api/explore/groups/{group_slug}/recipes/{recipe_slug}      # 单个公开 recipe [L114]
 ```
+
+**注意**：代码中**不存在** `/api/recipes/{slug}/summary` 和 `/api/explore/groups/{group_slug}/recipes/{slug}/summary` 这两个端点，为之前误写。
 
 ---
 
@@ -352,8 +390,9 @@ if not recipe.settings.public or recipe.household.preferences.private_household:
 
 #### 7.4.2 读取端（无需认证）
 
-路由：[recipe/shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py#L22-L58)
-- 前缀：`/api/recipes/shared`（挂载在 recipe.router 下，无额外 prefix）
+路由定义：[recipe/shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py#L17)
+路由挂载：[recipe/__init__.py#L13](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L13)（以 `prefix="/recipes"` 挂载）
+- 完整路径：`/api/recipes/shared`
 
 前端公开 API：[public/shared.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/shared.ts#L1-L13)
 
