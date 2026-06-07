@@ -91,6 +91,152 @@ else:
 
 ---
 
+## 第二章 A：前端筛选参数真实来源（Recipe Explorer 完整链路）
+
+后端接收到的 search、taxonomy、households、requireAll 参数并非凭空产生，而是经过 Recipe Explorer 前端多步拼接。完整链路从组件层级、状态管理、URL 同步到 API 调用如下。
+
+### A.1 组件层级与状态来源
+
+```
+RecipeExplorerPage.vue
+  ├─ RecipeExplorerPageSearch.vue
+  │   ├─ 搜索输入框 v-model="state.search"
+  │   ├─ RecipeExplorerPageSearchFilters.vue
+  │   │   ├─ SearchFilter v-model="selectedCategories" + requireAllCategories
+  │   │   ├─ SearchFilter v-model="selectedTags" + requireAllTags
+  │   │   ├─ SearchFilter v-model="selectedTools" + requireAllTools
+  │   │   ├─ SearchFilter v-model="selectedFoods" + requireAllFoods
+  │   │   └─ SearchFilter v-model="selectedHouseholds" (radio 单选)
+  │   └─ 排序按钮 → state.orderBy / state.orderDirection
+  │
+  └─ RecipeCardSection.vue
+      └─ useLazyRecipes.fetchMore() → api.recipes.getAll()
+```
+
+所有响应式状态由 `useRecipeExplorerSearch(groupSlug)` 统一管理，定义于 [use-recipe-explorer-search.ts](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-recipe-explorer-search.ts)。
+
+### A.2 五层状态源的优先级
+
+参数最终值的来源可拆成五层：search、taxonomy、households、requireAll* 先看 URL，再在 URL 为空时用 sessionStorage 恢复；排序参数则单独从 sortPreferences 恢复。
+
+| 层级 | 来源 | 存储介质 | 说明 |
+|------|------|---------|------|
+| 1（最高） | `route.query`（URL 查询参数） | 浏览器 URL | 用户刷新/分享链接时生效；对 search、taxonomy、households、requireAll* 是最高优先级 |
+| 2 | `searchQuerySession`（会话级） | `useSessionStorage("search-query", { recipe: "" })` | 仅在 URL query 为空时恢复上次查询，定义于 [preferences.ts L139-L149](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-users/preferences.ts#L139-L149) |
+| 3 | `sortPreferences`（持久化） | `useLocalStorage("recipe-section-preferences", ...)` | orderBy / orderDirection 不写入 URL，固定从这里恢复，定义于 [preferences.ts L109-L125](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-users/preferences.ts#L109-L125) |
+| 4 | Pinia stores（已选项映射） | 内存（categories/foods/tags/tools/households） | URL 中的 ID 通过 store 查找到对应对象，填充 selected* |
+| 5（最低） | 代码内 `queryDefaults` | 常量 | search 空字符串、orderBy created_at desc、requireAll* 全 False |
+
+### A.3 初始化流程（initialize → hydrateSearch → search）
+
+组件 `onMounted` 时调用 `initialize()`，执行顺序：
+
+```
+1. 若 searchQuerySession.value.recipe 非空 且 route.query 为空
+     → JSON.parse 后 router.replace({ query }) 恢复上次搜索（改 URL）
+2. hydrateSearch() 从 route.query 读取并填充所有状态：
+     - state.search / state.orderBy(来自 sortPreferences) / state.orderDirection(来自 sortPreferences)
+     - state.requireAllCategories/Tags/Tools/Foods（URL 有值则用 URL，否则默认 False）
+     - 对 categories/tags/tools/foods/households：
+         URL 有 ID → 等待对应 Pinia store 加载完成 → filter 出匹配对象到 selected*
+         URL 无值 → 清空 selected*
+3. search() 执行：参数无变化则短路，否则触发 URL 同步
+4. state.ready = true
+```
+
+关键代码 [use-recipe-explorer-search.ts L384-L400](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-recipe-explorer-search.ts#L384-L400)：
+
+```typescript
+async function initialize() {
+  if (searchQuerySession.value.recipe && !(Object.keys(route.query).length > 0)) {
+    try {
+      const query = JSON.parse(searchQuerySession.value.recipe);
+      await router.replace({ query });
+    } catch {
+      searchQuerySession.value.recipe = "";
+      router.replace({ query: {} });
+    }
+  }
+  await hydrateSearch();
+  await search();
+  state.value.ready = true;
+}
+```
+
+### A.4 URL 同步机制（search 函数）
+
+任何参数变化最终都会走到 `search()` 函数，它做两件事：
+1. **写 URL**：`router.push({ query })`，URL query 是对外可见、可刷新/分享的查询状态；排序偏好仍由 localStorage 维护
+2. **写 sessionStorage**：`searchQuerySession.value.recipe = JSON.stringify(query)`
+
+注意：URL query 对象里有两类字段：taxonomy 的 ID 数组直接来自当前 `passedQuery`，其他字段多按非默认值写入，定义于 [use-recipe-explorer-search.ts L213-L230](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-recipe-explorer-search.ts#L213-L230)：
+
+```typescript
+const query = {
+  categories: passedQuery.value.categories,     // taxonomy ID 数组直接进入 query 对象
+  foods: passedQuery.value.foods,
+  tags: passedQuery.value.tags,
+  tools: passedQuery.value.tools,
+  // 以下仅在非默认时写入：
+  auto: state.value.auto ? undefined : "false",
+  search: passedQuery.value.search === queryDefaults.search ? undefined : passedQuery.value.search,
+  households: !passedQuery.value.households?.length || passedQuery.value.households.length === households.store.value.length
+    ? undefined
+    : passedQuery.value.households,
+  requireAllCategories: passedQuery.value.requireAllCategories ? "true" : undefined,
+  requireAllTags: passedQuery.value.requireAllTags ? "true" : undefined,
+  requireAllTools: passedQuery.value.requireAllTools ? "true" : undefined,
+  requireAllFoods: passedQuery.value.requireAllFoods ? "true" : undefined,
+};
+```
+
+自动触发条件（`state.auto = true` 时）：`watchDebounced` 监听 state.search、四个 requireAll*、orderBy/orderDirection、以及五个 selected* 数组，500ms 防抖后自动调用 `search()`。
+
+### A.5 从前端状态到后端 API 参数的最终拼接
+
+`RecipeCardSection.vue` 通过 `props.query` 拿到 `passedQueryWithSeed`，然后调用 `useLazyRecipes.fetchMore()`，后者再调用 `getParams()` 构造最终请求参数。
+
+定义于 [use-recipes.ts L11-L37](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/recipes/use-recipes.ts#L11-L37)：
+
+```typescript
+function getParams(orderBy, orderDirection, orderByNullPosition, query, queryFilter) {
+  return {
+    orderBy,
+    orderDirection,
+    orderByNullPosition,
+    paginationSeed: query?._searchSeed,   // 对应后端 pagination_seed（随机排序用）
+    searchSeed: query?._searchSeed,       // 目前后端未使用
+    search: query?.search,                // 文本搜索关键词
+    cookbook: query?.cookbook,            // 食谱书 ID/slug
+    households: query?.households,        // 家庭 ID 列表
+    categories: query?.categories,        // 分类 ID 列表
+    requireAllCategories: query?.requireAllCategories,
+    tags: query?.tags,                    // 标签 ID 列表
+    requireAllTags: query?.requireAllTags,
+    tools: query?.tools,                  // 工具 ID 列表
+    requireAllTools: query?.requireAllTools,
+    foods: query?.foods,                  // 食材 ID 列表
+    requireAllFoods: query?.requireAllFoods,
+    queryFilter,                          // 高级查询过滤表达式
+  };
+}
+```
+
+然后 `api.recipes.getAll(page, perPage, params)` 发出 HTTP 请求，对应后端 `GET /api/recipes` 端点。
+
+### A.6 前端各缓存/状态是否缓存搜索结果
+
+| 机制 | 存储位置 | 是否缓存搜索结果 | 是否参与过滤 |
+|------|---------|-----------------|-------------|
+| `recipes` ref (useLazyRecipes) | 组件内存 | **是**（仅组件生命周期内，`appendRecipes`/`replaceRecipes` 维护） | 不参与，仅展示 |
+| `memo` 单例 (useRecipeExplorerSearch) | 模块内存 | **否**（仅缓存搜索状态对象，不缓存结果） | 不参与 |
+| `searchQuerySession` | SessionStorage | **否**（仅缓存查询参数 JSON，不缓存结果） | 不参与，仅恢复 URL |
+| `sortPreferences` | LocalStorage | **否**（仅缓存 orderBy/orderDirection） | 不参与筛选；参与请求排序 |
+| Pinia stores (categories/foods/...) | Pinia 内存 | **否**（仅缓存 taxonomy 选项列表） | 参与参数还原（URL ID → 对象映射） |
+| Recipe Explorer debounce | 前端定时器 | **否**（仅防抖） | 不参与 |
+
+---
+
 ## 三、文本搜索的实现
 
 ### 3.1 搜索入口
@@ -247,6 +393,33 @@ PostgreSQL 下列规范化搜索相关字段创建了 GIN 索引（`gin_trgm_ops
 | `IngredientFoodModel` | 2 个规范化字段 | 各自对应 `_gin` 索引 |
 
 此外，相关规范化字段还声明了普通索引；不过 tokenized 搜索使用前后通配的 `LIKE "%token%"`，普通 B-tree 索引不一定能被数据库有效利用，真正的 trigram 加速主要来自 PostgreSQL 的 GIN 索引。
+
+##### Unit/Food 规范化 trigram 索引与 Recipe 主搜索链路的关系
+
+**结论：`IngredientUnitModel` 和 `IngredientFoodModel` 的规范化字段 trigram 索引不参与 Recipe 主搜索链路。**
+
+具体区分如下：
+
+| 索引所属模型 | Recipe 主搜索是否使用 | 实际使用场景 | 搜索实现 |
+|-------------|----------------------|-------------|---------|
+| `RecipeModel.name_normalized` | ✅ 是 | 菜谱名称模糊匹配 | `RecipeModel.name_normalized %> search`（fuzzy）或 LIKE（tokenized） |
+| `RecipeModel.description_normalized` | ✅ 是 | 菜谱描述模糊匹配 | 同上 |
+| `RecipeIngredientModel.note_normalized` | ✅ 是 | 食材行备注模糊匹配 | 子查询查出 ingredient_ids，再 `recipe_ingredient.any(id IN (...))` |
+| `RecipeIngredientModel.original_text_normalized` | ✅ 是 | 食材行原始文本模糊匹配 | 同上 |
+| `IngredientFoodModel.name_normalized` | ❌ **否** | Food 字典独立搜索端点（如食材管理页）、**食材解析服务纯 Python 内存匹配** | Schema：`IngredientFood._searchable_properties = ["name_normalized", "plural_name_normalized"]`，走基类 `MealieModel.filter_search_query` |
+| `IngredientUnitModel.*_normalized` | ❌ **否** | Unit 字典独立搜索端点 | Schema：`IngredientUnit._searchable_properties` 包含 4 个规范化字段，同样走基类默认实现 |
+
+关键点说明：
+
+1. **Recipe 主搜索查的是「食材行（RecipeIngredient）的备注/原文」，不是「食材字典项（IngredientFood）的名称」**。当用户搜索 "tomato" 时，命中的是某菜谱某食材行里写了 "tomato" 这个词（note 或 original_text），而不是食材字典 Food 的 name 字段包含 "tomato"。
+
+2. `IngredientFood` 和 `IngredientUnit` 的规范化字段及 trigram 索引仅用于它们各自的**独立管理端点**（`GET /api/foods?search=...`、`GET /api/units?search=...`），以及食材解析服务 `_base.py` 中在 Python 内存里通过 `IngredientFoodModel.normalize()` 做字典匹配（该场景不打 DB 索引）。
+
+3. 两个 Schema 的 `_searchable_properties` 定义于 [recipe_ingredient.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/recipe/recipe_ingredient.py)：
+   - `IngredientFood`（L110-L113）：`["name_normalized", "plural_name_normalized"]`
+   - `IngredientUnit`（L181-L186）：`["name_normalized", "plural_name_normalized", "abbreviation_normalized", "plural_abbreviation_normalized"]`
+
+   两者均未覆写 `filter_search_query`，直接使用基类 `MealieModel.filter_search_query` 的默认实现（[mealie_model.py L139-L170](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/_mealie/mealie_model.py#L139-L170)），即对所有 `_searchable_properties` 字段 OR 连接，fuzzy 时按第一个字段 `<->>` 距离排序，tokenized 时按第一个字段 LIKE 匹配度排序。
 
 #### 3.5.2 Tokenized 搜索（通用 LIKE 匹配）
 
@@ -533,16 +706,23 @@ RecipeModel 中可过滤的主要字段（见 [recipe.py](file:///d:/fz/0601/sol
 
 ## 九、缓存机制及与过滤的关系
 
-各缓存/优化机制的来源、作用域，以及**是否参与过滤逻辑**的区分如下：
+本章完整梳理前后端所有缓存/状态/优化机制的来源、作用域，明确**是否缓存搜索结果**以及**是否参与过滤逻辑**。
 
-| 机制 | 来源 | 作用域 | 是否参与过滤 | 说明 |
-|------|------|--------|-------------|------|
-| 搜索结果 | 无缓存 | 每次请求实时查询 | N/A | 搜索/建议结果完全实时，无任何结果级缓存 |
-| Repository 实例 | `@cached_property` | 单次 HTTP 请求内 | **否** | 仅缓存 repository **对象实例**，不缓存查询结果，不影响过滤 |
-| 图片 cache_key | `cache.cache_key.new_key()` | 跨请求持久化 | **否** | 仅用于图片 URL 的浏览器缓存失效，与搜索过滤完全无关 |
-| 前端搜索 debounce | Vue composable | 前端客户端 | **否** | 仅减少 HTTP 请求频率，不改变后端过滤逻辑 |
+### 9.0 汇总总览表
 
-### 9.1 Repository 实例缓存
+| 层级 | 机制 | 来源 | 作用域 | 是否缓存搜索结果 | 是否参与过滤 | 说明 |
+|------|------|------|--------|-----------------|-------------|------|
+| 后端 | 搜索结果 | 无缓存 | 每次请求实时查询 | N/A | — | 搜索/建议结果完全实时，无任何结果级缓存 |
+| 后端 | Repository 实例 | `@cached_property` | 单次 HTTP 请求内 | **否** | **否** | 仅缓存 repository 对象实例（包括 group_id/household_id 绑定），不缓存查询结果，不影响过滤 |
+| 后端 | 图片 cache_key | `cache.cache_key.new_key()` | 跨请求持久化 | **否** | **否** | 仅用于图片 URL 的浏览器缓存失效，与搜索过滤完全无关 |
+| 前端 | `recipes` ref (Recipe Explorer 父组件) | Vue ref | 组件生命周期内 | **是** | **否** | `appendRecipes`/`replaceRecipes` 维护当前列表，仅用于展示，组件卸载即丢失 |
+| 前端 | `memo` 单例 (useRecipeExplorerSearch) | 模块内存 | 组件挂载期间 | **否** | **否** | 按 groupSlug 缓存搜索状态对象，unmounted 后 `clearRecipeExplorerSearchState` 删除 |
+| 前端 | `searchQuerySession` | `useSessionStorage("search-query")` | 浏览器标签页（关闭失效） | **否** | **否** | 仅缓存查询参数 JSON，刷新时恢复 URL |
+| 前端 | `sortPreferences` | `useLocalStorage("recipe-section-preferences")` | 浏览器跨标签页持久化 | **否** | 排序参数 | 仅缓存 orderBy/orderDirection，作为请求排序默认值，不参与筛选条件 |
+| 前端 | Pinia stores (categories/foods/tags/tools/households) | Pinia 内存 | 应用运行期间 | **否** | 参数还原 | 仅缓存 taxonomy 选项列表，用于 URL ID → 对象映射 |
+| 前端 | 搜索 debounce | Vue watchDebounced | 前端定时器 | **否** | **否** | 仅减少 HTTP 请求频率，不改变后端过滤逻辑 |
+
+### 9.1 后端：Repository 实例缓存
 
 [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/repos/repository_factory.py) 中 `AllRepositories` 类的各 repository 属性使用 `@cached_property` 装饰，在单次请求生命周期内只初始化一次。
 
@@ -550,7 +730,7 @@ RecipeModel 中可过滤的主要字段（见 [recipe.py](file:///d:/fz/0601/sol
 
 **与过滤的关系**：此缓存仅避免重复构造 repository 对象（包括 group_id/household_id 绑定），每次 page_all / find_suggested_recipes 调用都是**独立执行完整的 SQL 查询**，不受此缓存影响。
 
-### 9.2 前端图片缓存键
+### 9.2 后端：图片缓存键
 
 [cache_key.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/pkgs/cache/cache_key.py) 生成 4 位随机字符串（字母+数字），用于图片 URL 的缓存失效：
 
@@ -562,9 +742,57 @@ recipe.image = cache.cache_key.new_key()  # 例如 "aB3x"
 
 **与过滤的关系**：完全无关。cache_key 仅出现在 Recipe 响应的图片 URL 中（如 `/media/recipes/xxx-aB3x/original.jpg`），不参与任何搜索条件、排序或权限过滤。
 
-### 9.3 前端搜索防抖
+### 9.3 前端：搜索结果列表 (`recipes` ref)
 
-[use-recipe-search.ts](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/recipes/use-recipe-search.ts#L51-L57) 使用 500ms debounce 避免用户输入时频繁发请求。
+Recipe Explorer 父组件调用 `useLazyRecipes()` 得到的 `recipes` ref 在 [use-recipes.ts L45](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/recipes/use-recipes.ts#L45) 定义：
+
+```typescript
+const recipes = ref<Recipe[]>([]);
+```
+
+由 `appendRecipes`（无限滚动追加）和 `replaceRecipes`（重新赋值）维护。
+
+**与过滤的关系**：这是 Recipe Explorer 当前结果列表的前端持有处，不参与过滤；每次参数变化都重新拉取，仅用于 UI 展示。
+
+### 9.4 前端：搜索状态单例 (`memo`)
+
+[use-recipe-explorer-search.ts L50-L51](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-recipe-explorer-search.ts#L50-L51)：
+
+```typescript
+const memo: Record<string, RecipeExplorerSearchState> = {};
+```
+
+按 `groupSlug` 缓存搜索状态对象，组件 `onUnmounted` 时调用 `clearRecipeExplorerSearchState(groupSlug)` 删除。
+
+**与过滤的关系**：仅缓存状态（state / selected* / passedQuery），不缓存搜索结果，不参与过滤。
+
+### 9.5 前端：查询参数会话存储 (`searchQuerySession`)
+
+定义于 [preferences.ts L139-L149](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-users/preferences.ts#L139-L149)：
+
+```typescript
+export function useUserSearchQuerySession(): Ref<UserSearchQuery> {
+  return useSessionStorage(
+    "search-query",
+    { recipe: "" },
+    { mergeDefaults: true },
+  );
+}
+```
+
+在组件初始化时，若 `searchQuerySession.value.recipe` 非空且 `route.query` 为空，则将 JSON.parse 后的查询参数写回 URL；只有 JSON 解析失败时才清空该字段。
+
+**与过滤的关系**：不缓存结果，不直接参与筛选，仅在页面刷新且 URL query 为空时恢复 URL。
+
+### 9.6 前端：排序偏好持久化 (`sortPreferences`)
+
+定义于 [preferences.ts L109-L125](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-users/preferences.ts#L109-L125)，使用 `useLocalStorage` 跨标签页持久化 `orderBy` 与 `orderDirection`。
+
+**与过滤的关系**：不参与 taxonomy/text/household 等筛选条件；参与请求排序，作为 orderBy/orderDirection 默认值来源。
+
+### 9.7 前端：搜索防抖 (debounce)
+
+[use-recipe-explorer-search.ts L413-L436](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/use-recipe-explorer-search.ts#L413-L436) 使用 500ms debounce 避免频繁发请求。
 
 **与过滤的关系**：完全无关。debounce 仅在前端控制请求发送时机，一旦请求到达后端，过滤逻辑按正常流程完整执行。
 
