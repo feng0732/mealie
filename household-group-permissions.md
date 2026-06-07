@@ -72,11 +72,74 @@ Group (组)
 | Ingredient Unit（单位） | `mealie/routes/unit_and_foods/units.py` | 全部 CRUD + 合并均无权限检查 |
 | Multi-purpose Label（多用途标签） | `mealie/routes/groups/controller_labels.py` | 全部 CRUD 无权限检查 |
 
-### 2.3 权限联动规则
+### 2.3 Admin 与四权限标志的联动机制（完整代码路径）
 
-**[代码支撑]** 在 `_set_permissions()` 方法中（`mealie/db/models/users/users.py`）：
-- 若 `admin=True`，则自动授予 `can_manage_household`、`can_manage`、`can_invite`、`can_organize` 全部为 `True`
-- Admin 权限是唯一可以跨 Group/Household 的角色
+#### 2.3.1 核心同步逻辑：`_set_permissions()`
+
+**[代码支撑]** `mealie/db/models/users/users.py#L207-L230`：
+
+```python
+def _set_permissions(
+    self, admin, can_manage_household=False, can_manage=False, can_invite=False, can_organize=False, **_
+):
+    self.admin = admin
+    if self.admin:
+        self.can_manage_household = True
+        self.can_manage = True
+        self.can_invite = True
+        self.can_organize = True
+        self.advanced = True
+    else:
+        self.can_manage_household = can_manage_household
+        self.can_manage = can_manage
+        self.can_invite = can_invite
+        self.can_organize = can_organize
+```
+
+**关键规则：**
+- 当 `admin=True` 时，**强制覆盖** `can_manage_household`、`can_manage`、`can_invite`、`can_organize`、`advanced` 全部为 `True`，调用方传入的值被忽略
+- 当 `admin=False` 时，使用调用方传入的各权限标志值（默认均为 `False`）
+
+#### 2.3.2 `_set_permissions()` 的调用入口
+
+**[代码支撑]** `_set_permissions()` 在以下两个位置被调用：
+
+1. **`User.__init__()`**（`mealie/db/models/users/users.py#L176`）——用户创建时
+2. **`User.update()`**（`mealie/db/models/users/users.py#L202`）——用户更新时
+
+这两个方法都被 `@auto_init()` 装饰器（`mealie/db/models/_model_utils/auto_init.py#L104-L200`）包装：装饰器先处理列赋值和关联对象查找，然后才调用原始的 `__init__` / `update` 方法，最终执行 `_set_permissions()`。
+
+#### 2.3.3 正常路径：Admin 创建/更新均会同步四权限
+
+**[代码支撑]** 以下场景都会**保证**四权限标志与 `admin` 字段同步：
+
+| 场景 | 调用路径 | 是否同步 |
+|-----|---------|---------|
+| 通过 Admin API 创建用户 | `admin_management_users.py:create_one()` → `repos.users.create()` → `RepositoryGeneric.create()` → `User(**data)` → `User.__init__()` → `_set_permissions(admin=True, ...)` | ✅ 同步 |
+| 通过 Admin API 更新用户 | `admin_management_users.py:update_one()` → `repos.users.update()` → `RepositoryGeneric.update()` → `entry.update(**new_data)` → `User.update()` → `_set_permissions(admin=..., ...)` | ✅ 同步 |
+| 通过自助成员权限调整 | `controller_household_self_service.py:set_member_permissions()` → `repos.users.update()` → 同上 `User.update()` → `_set_permissions()`（注意：此接口无法修改 `admin` 字段） | ✅ 同步（但 admin 不变） |
+| 种子数据初始化默认 Admin | `mealie/repos/seed/init_users.py#L51-L63` → `db.users.create(default_user)` → `User.__init__()` → `_set_permissions(admin=True, ...)` | ✅ 同步 |
+| `make_admin` 脚本 | `mealie/scripts/make_admin.py#L21-L22`：先 `user.admin = True`，再 `repos.users.update(user.id, user)` → `RepositoryGeneric.update()` → `entry.update(**new_data)` → `User.update()` → `_set_permissions(admin=True, ...)` | ✅ 同步（间接触发） |
+
+**关于 `make_admin` 脚本的特别说明：**
+- 脚本代码仅显式设置了 `user.admin = True`，未显式设置四权限标志
+- 但由于后续调用了 `repos.users.update(user.id, user)`，Repository 层的 `update()` 会调用 ORM 模型的 `User.update()` 方法
+- `User.update()` 内部会调用 `_set_permissions(admin=True, ...)`，在 `if self.admin` 分支中将四权限全部强制设为 `True`
+- 因此，**`make_admin` 脚本执行后四权限标志是同步的**，只是同步发生在 Repository/ORM 层而非脚本显式代码中
+
+#### 2.3.4 风险路径：可能出现权限不一致的场景
+
+**[风险][代码支撑]** 当操作**绕过** `User.__init__()` 和 `User.update()` 时，`_set_permissions()` 不会被调用，可能导致 `admin=True` 但四权限标志仍为 `False` 的不一致状态：
+
+| 场景 | 原因 | 是否同步 |
+|-----|------|---------|
+| 直接 ORM 属性修改后提交 | `user.admin = True; session.commit()`（不调用 `repos.users.update()`） | ❌ **不同步** |
+| 原始 SQL UPDATE | `session.execute(sa.update(User).where(User.id == ...).values(admin=True))` | ❌ **不同步** |
+| 直接修改数据库 | 通过 psql 等工具直接 `UPDATE users SET admin = true WHERE ...` | ❌ **不同步** |
+
+**影响：** 不一致状态下，该用户虽然 `admin=True` 可通过 `BaseAdminController` 绕过 Repository 范围过滤，但四权限标志控制的功能（修改 Household 偏好、调整成员权限、创建邀请、管理 Tag/Category/Food）会因相应标志为 `False` 而被拒绝。
+
+Admin 权限是唯一可以跨 Group/Household 的角色。
 
 ### 2.4 权限设置 Schema
 
@@ -481,7 +544,7 @@ Household 删除前会检查是否有用户隶属于该 Household，有则拒绝
 ## 十一、权限边界速查表
 
 **列定义：**
-- **Admin** = `admin=True`（自动被授予全部其他权限）
+- **Admin** = `admin=True`。**注意**：仅当通过 `User.__init__()`（创建）或 `User.update()`（Repository 层更新）正常路径授予 Admin 时，才会**自动同步** `can_manage_household`、`can_manage`、`can_invite`、`can_organize` 全部为 `True`。若绕过正常路径（直接 ORM 属性修改、原始 SQL、直接改库），四权限标志可能不同步，详见章节 2.3。
 - **Household Admin** = `can_manage_household=True`（不保证拥有其他权限标志）
 - **同 Household 普通用户** = 无特殊权限标志，与目标资源在同一 Household
 - **同 Group 跨 Household 用户** = 无特殊权限标志，同 Group 但不同 Household
