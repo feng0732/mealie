@@ -594,45 +594,66 @@ T2（无单位）、T3（pinch 误识别）、T4（dash/splash 等未定义）�
 
 ### 8.3 对购物清单汇总 (Aggregation) 的影响
 
-[ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 中对单位的检查有**两层短路**，第一层是 `standard_unit` 是否存在，第二层才是 Pint 的 `can_convert`：
+[ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 实际由**三层判定**构成，每层都可能提前返回 False，通过所有层后才由最终 return 放行：
 
 ```python
+# L48-L55：第一层 —— 快速拒绝（checked / food_id 不匹配）
+if any([item1.checked, item2.checked, item1.food_id != item2.food_id]):
+    return False
+
+# L57-L68：第二层 —— 单位兼容性检查（仅当 unit_id 不同时才执行！）
 if item1.unit_id != item2.unit_id:
-    # 第一层短路：任一单位没有 standard_unit → 直接返回 False
-    if not (item1_unit and item1_unit.standard_unit):
+    item1_unit = item1.unit or self.data_matcher.units_by_id.get(item1.unit_id)
+    item2_unit = item2.unit or self.data_matcher.units_by_id.get(item2.unit_id)
+    if not (item1_unit and item1_unit.standard_unit):   # 第二层-A：任一无 standard_unit
         return False
-    if not (item2_unit and item2_unit.standard_unit):
+    if not (item2_unit and item2_unit.standard_unit):   # 第二层-B：同上
         return False
-    # 第二层短路：standard_unit 传给 can_convert 做 Pint 量纲检查
     uc = UnitConverter()
-    if not uc.can_convert(item1_unit.standard_unit, item2_unit.standard_unit):
+    if not uc.can_convert(item1_unit.standard_unit, item2_unit.standard_unit):  # 第二层-C：Pint 量纲
         return False
+
+# L70-L71：第三层 —— food_id 存在性 或 note 一致性
+return bool(item1.food_id) or item1.note == item2.note
 ```
 
-> ⚠️ **关键事实**：由于 T3（pinch）的 `standard_unit` 为 `None`，它在**第一层短路就被拦截**，Pint 对 pinch 的误识别（解析为 picoinch 长度单位）**在购物清单合并中完全不会生效**。T3 和 T4 在购物清单合并中的行为是完全一致的。
+> ⚠️ **极其重要的代码事实**：
+> 1. **`unit_id` 相同时（包括两者都为 `None`），第二层（standard_unit + Pint）被完全跳过**——两个无单位条目根本不会走到任何单位相关的检查
+> 2. **`item1.food_id != item2.food_id`**：两者都是 `None` 时判定为相等（通过）；一个有值一个为 `None` 时判定为不等（直接拒绝）
+> 3. **`return bool(item1.food_id) or item1.note == item2.note`**：只要有 `food_id`（非空）就放行，不管理 note 是否相同；**只有当 `food_id` 全部为 `None` 时，才要求 note 完全相同**
 
-各分类的实际汇总结果对照（考虑两层短路）：
+各分类的实际汇总结果对照（按三层判定标注拦截位置）：
 
-| 场景 | 能否合并 | 在哪一层被判定 | 结果 |
+| 场景 | 能否合并 | 在哪一层被判定 | 说明 |
 |------|---------|---------------|------|
-| 相同 `unit_id`（任意 T1/T3/T4-A/T4-B） | ✅ 可以 | `unit_id == unit_id` 跳过单位检查 | 数量直接相加，单位不变 |
-| 两个不同的 T1 单位，量纲兼容（cup + pint） | ✅ 可以 | 第一层通过；第二层 `can_convert("cup", "pint") = True` | 调用 `merge_quantity_and_unit`，换算后智能合并 |
-| 两个不同的 T1 单位，量纲不兼容（cup + pound） | ❌ 不行 | 第一层通过；第二层 `can_convert("cup", "pound") = False` | 相同食材显示为两行 |
-| T1 + T3（pinch），不同 `unit_id` | ❌ 不行 | 第一层短路：T3 的 `standard_unit = None` | 相同食材显示为两行 |
-| T1 + T4（dash），不同 `unit_id` | ❌ 不行 | 第一层短路：T4 的 `standard_unit = None` | 相同食材显示为两行 |
-| T3（pinch）+ T4（dash），不同 `unit_id` | ❌ 不行 | 第一层短路：两者 `standard_unit` 均为 `None` | 相同食材显示为两行 |
-| T4-A + T4-A，不同 `unit_id`（dash + splash） | ❌ 不行 | 第一层短路：两者 `standard_unit` 均为 `None` | 相同食材显示为两行 |
-| T3（pinch）+ T3（pinch），**相同** `unit_id` | ✅ 可以 | 同 unit_id，跳过单位检查 | 数量直接相加（T3 的误识别完全不影响此路径） |
-| T2（无单位，`unit_id=None`）+ T2，相同备注 | ✅ 可以 | 走备注完全相同分支 | 数量直接相加 |
-| T2（无单位，`unit_id=None`）+ T2，不同备注 | ❌ 不行 | 备注不同 | 相同食材显示为两行 |
+| **两个 T2（无单位，`unit_id=None`），相同 `food_id`，不同 note** | ✅ 可以 | 第三层：`bool(food_id)=True` 放行 | unit_id 相同跳过第二层；有 food_id 时 note 不影响合并，合并后 note 用 `" \| "` 拼接 |
+| **两个 T2（`unit_id=None`），`food_id` 都为 `None`，相同 note** | ✅ 可以 | 第三层：`note == note` 放行 | 无 food_id 时 note 必须相同才合并 |
+| **两个 T2（`unit_id=None`），`food_id` 都为 `None`，不同 note** | ❌ 不行 | 第三层：`bool(None)=False` 且 `note != note` | 无 food_id 且 note 不同 → 完全无法合并 |
+| **两个 T2，一个有 `food_id` 另一个 `food_id=None`** | ❌ 不行 | **第一层**：`food_id != None` → 直接拒绝 | 有无 food_id 的条目无法合并 |
+| **T2（`unit_id=None`）+ T1（cup 等，有 `unit_id`），相同 `food_id`** | ❌ 不行 | 第二层-A：`None and None.standard_unit` → False | 两个条目 unit_id 不同（None vs cup_id）→ 进入第二层；T2 无单位对象 → 短路拒绝 |
+| **相同 `unit_id`（任意 T1/T2/T3/T4），相同 `food_id`，任意 note** | ✅ 可以 | 第二层跳过；第三层有 food_id 放行 | unit_id 相同 → 完全跳过单位检查；有 food_id 时 note 不影响 |
+| **相同 `unit_id`，`food_id` 都为 `None`，相同 note** | ✅ 可以 | 第二层跳过；第三层 note 相同放行 |
+| **不同 T1，量纲兼容（cup + pint），相同 `food_id`** | ✅ 可以 | 第二层：standard_unit 均存在 + Pint 兼容；第三层 food_id 放行 |
+| **不同 T1，量纲不兼容（cup + pound），相同 `food_id`** | ❌ 不行 | 第二层-C：Pint `can_convert=False` |
+| **T1 + T3（pinch），不同 `unit_id`，相同 `food_id`** | ❌ 不行 | 第二层-A：T3 的 `standard_unit=None` |
+| **T1 + T4（dash），不同 `unit_id`，相同 `food_id`** | ❌ 不行 | 第二层-A：T4 的 `standard_unit=None` |
+| **T3（pinch）+ T4（dash），不同 `unit_id`，相同 `food_id`** | ❌ 不行 | 第二层-A：两者 `standard_unit` 均为 `None` |
+| **T4-A + T4-B（dash + splash），不同 `unit_id`，相同 `food_id`** | ❌ 不行 | 第二层-A：两者 `standard_unit` 均为 `None` |
 
-**典型案例**：一个食谱含有 "1 pinch salt" 和 "2 dashes salt"。两者 `food_id` 相同（盐），但 `unit_id` 不同（pinch vs dash），且两者 `standard_unit` 均为 `None`（T3 和 T4 都在第一层短路）。加入购物清单后会显示为两条独立记录，无法自动合并。
+**T3（pinch）误识别与合并逻辑的隔离**：由于 pinch 的 `standard_unit=None`，在**第二层-A 就被拦截**，Pint 对 pinch 的误识别（解析为 picoinch 长度单位）**在购物清单合并中完全不会生效**。T3 和 T4 在购物清单合并中的行为完全一致。
 
-**T3（pinch）误识别的唯一潜在风险场景**：如果用户**手动**将 pinch 的 `standard_unit` 改为 `"pinch"`，则：
-1. 第一层短路不再触发（`standard_unit` 非空）
-2. 第二层 `can_convert("pinch", "pinch")` 调用 Pint，pinch 被解析为 picoinch（[length]），与自己兼容 → 返回 `True`
-3. 此时 pinch + pinch 可以跨 unit_id 合并（但实际应是同 unit_id，所以此场景罕见）
-4. 若另一单位 `standard_unit="cup"`，则 `can_convert("pinch", "cup")`：[length] vs [length]³ → `False`，行为仍正确（不合并）
+**合并后 note 的处理**（[merge_items L98-L104](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L98-L104)）：
+```python
+if to_item.note != from_item.note:
+    to_item.note = " | ".join([note for note in [to_item.note, from_item.note] if note])
+# 再按集合去重一次
+```
+不同 note 以 `" | "` 为分隔符拼接并去重，因此合并后不会丢失任何备注信息。
+
+**T3（pinch）误识别的唯一潜在风险场景**：用户**手动**将 pinch 的 `standard_unit` 改为 `"pinch"`：
+1. 第二层-A 不再触发（`standard_unit` 非空）
+2. 第二层-C `can_convert("pinch", "pinch")`：Pint 将 `"pinch"` 解析为 picoinch（[length]），与自身兼容 → 返回 `True`
+3. 但即便如此，`can_convert("pinch", "cup")` 仍为 `False`（[length] vs [length]³ 不兼容），不会错误合并
 
 ---
 
@@ -640,21 +661,38 @@ if item1.unit_id != item2.unit_id:
 
 ### 9.1 合并判定逻辑
 
-两个购物清单项可以合并的条件（[can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71)）：
+两个购物清单项可以合并的条件（[can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71)），严格按以下顺序判定，任何一步返回 False 即终止：
 
-1. 两个条目都未勾选 (`checked == false`)
-2. 食材 ID 相同 (`food_id == food_id`)，或者（无食材 ID 时备注完全相同）
-3. 单位 ID 相同，或者（单位 ID 不同但两个单位都有标准化数据且量纲兼容）
+**第一层：快速拒绝（L48-L55）**
+- 两个条目都未勾选 (`checked == false`)
+- `food_id` 完全一致：注意两者都是 `None` 也视为一致（`None != None` 为 False）；一个有值一个为 `None` 视为不一致（直接返回 False）
+
+**第二层：单位兼容性检查（仅当 `unit_id != unit_id` 时执行，L57-L68）**
+- 若 `unit_id` 相同（包括两者都为 `None`）→ **跳过整个第二层**
+- 若 `unit_id` 不同：
+  - 两个单位都必须有对应的单位对象，且都有 `standard_unit`（非空）
+  - 两个 `standard_unit` 必须量纲兼容（Pint `can_convert` 返回 True）
+
+**第三层：最终放行（L70-L71）**
+```python
+return bool(item1.food_id) or item1.note == item2.note
+```
+- 只要存在 `food_id`（非空）即允许合并，**note 是否相同不影响**（note 会被拼接展示）
+- 只有当 `food_id` 全部为 `None` 时，才要求 `note` 完全相同
 
 ### 9.2 合并执行逻辑
 
 [merge_items](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L73-L128)：
 
-1. **数量合并**：
-   - 若两个单位都有标准化数据：调用 `merge_quantity_and_unit` 进行单位换算后智能合并
-   - 否则：直接相加数量（此时要求单位 ID 相同）
-2. **备注合并**：用 `" | "` 连接去重后的备注
-3. **食谱引用合并**：相同 recipe_id 的引用合并 `recipe_scale`（份数相加）
+1. **数量合并**（L84-L96）：
+   - 若**两个单位都有** `standard_unit` 和 `standard_quantity`：调用 `merge_quantity_and_unit` 进行单位换算后智能合并
+   - 否则：直接 `to_item.quantity += from_item.quantity` 相加（此分支覆盖所有 T2 无单位、T3 误识别、T4 未定义、以及同 unit_id 的所有情况）
+
+2. **备注合并**（L98-L104）：
+   - 若两个 note 不同，以 `" | "` 连接所有非空 note，并按集合去重
+   - 因此即使合并判定时 note 不同（因有 food_id 放行），合并后仍保留全部备注信息
+
+3. **食谱引用合并**：相同 recipe_id 的引用合并 `recipe_scale`（份数相加）；不同 recipe_id 的引用各自保留
 
 ### 9.3 批量创建/更新流程
 
@@ -718,10 +756,15 @@ for to_ref in to_item.recipe_references:
 
 | 场景 | 限制 / 行为 | 影响 |
 |------|------------|------|
-| **T3：pinch 被 Pint 误识别** | `"pinch"` / `"pinches"` 被 Pint 解析为 **picoinch（皮英寸，量纲 `[length]`）**，而非未定义 | 对购物清单合并**无直接影响**（因 `standard_unit=None` 在第一层短路被拦截）；若用户**手动**将 pinch 的 `standard_unit` 设为 `"pinch"`，误识别才会生效，但即便生效，与 cup/pound 的 can_convert 仍为 False，行为正确 |
+| **T3：pinch 被 Pint 误识别** | `"pinch"` / `"pinches"` 被 Pint 解析为 **picoinch（皮英寸，量纲 `[length]`）**，而非未定义 | 对购物清单合并**无直接影响**（因 `standard_unit=None` 在第二层-A 被拦截）；若用户**手动**将 pinch 的 `standard_unit` 设为 `"pinch"`，误识别才会生效，但即便生效，与 cup/pound 的 can_convert 仍为 False，行为正确 |
 | **T4：dash/splash/serving 等 Pint 未定义** | Pint 返回 `UndefinedUnitError`，`uc.parse()` 回退为原始字符串 | 与 T3 合并行为一致：`standard_unit=None` → 不同 unit_id 间无法跨单位换算合并，同 unit_id 可正常累加 |
 | **T2 dimensionless vs T3/T4 的本质区别** | T2 是合法 `pint.Unit`（量纲 `{}`），T3 是错误量纲的 `pint.Unit`，T4 是字符串 | T2 自兼容（`can_convert(T2,T2)=True`）；T3 与自身（长度量纲）兼容；T4 与任何单位（包括自己）都不兼容（非 Unit 短路） |
-| **购物清单合并的两层短路** | 第一层：任一 `standard_unit` 为 `None` 即返回 False；第二层才是 Pint 量纲检查 | T3（pinch 误识别）在第一层就被拦截，误识别结果**永远不会**传入第二层的 `can_convert`。T3 和 T4 在购物清单合并中行为完全一致 |
+| **`unit_id` 相同时跳过第二层** | `can_merge` 中第二层（standard_unit + Pint）仅在 `item1.unit_id != item2.unit_id` 时执行 | 两个 T2（`unit_id` 均为 `None`）→ `None != None` 为 False → **完全跳过单位检查**，直接进入第三层判定；两个同 unit_id 的 T3/T4 条目同样跳过第二层 |
+| **`food_id` 存在时 note 不影响合并** | `return bool(item1.food_id) or item1.note == item2.note` | 只要有 `food_id`（非空），即使 note 完全不同也能合并；合并后 note 以 `" \| "` 拼接并去重展示 |
+| **`food_id` 全为空时必须 note 相同** | `food_id` 均为 `None` 时走 `item1.note == item2.note` 分支 | 没有匹配到食材的条目（纯文本项）只有 note 完全相同时才能合并；note 不同时显示为独立行 |
+| **有无 food_id 的条目不能合并** | 第一层 `item1.food_id != item2.food_id` 中 `some_uuid != None` 为 True | 一个已匹配食材、一个未匹配食材的相同文本项无法合并，即使单位和 note 完全一致 |
+| **购物清单合并的第二层短路** | 第二层-A：任一 `standard_unit` 为 `None` 即返回 False；第二层-C 才是 Pint 量纲检查 | T3（pinch 误识别）在第二层-A 就被拦截，误识别结果**永远不会**传入第二层-C 的 `can_convert`。T3 和 T4 在购物清单合并中行为完全一致 |
+| **T2（unit_id=None）与 T1 无法跨单位合并** | T2 无单位对象 → 第二层-A `item1_unit and item1_unit.standard_unit` 为 False | 一条无单位、一条有 cup/gram 等单位的相同食材无法合并，因 unit_id 不同进入第二层后 T2 无单位对象被短路拒绝 |
 | **T3/T4 单位显示** | `fraction` 默认为 `True`，`use_abbreviation` 默认为 `False` | 数量默认以分数格式显示，单位默认使用全名而非缩写。Pint 的误识别对显示**无影响**——显示始终用数据库中的单位名 |
 | **盎司歧义消除** | 仅在与体积单位合用时才自动转液盎司 | 纯盎司合并（如 8 oz + 1 lb）按重量处理；单独的盎司条目保持不变 |
 | **模糊匹配阈值** | 食材 85 / 单位 70 / 购物清单标签匹配 80 | 拼写差异过大可能匹配失败，需要手动纠正或添加别名 |
