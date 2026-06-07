@@ -34,9 +34,140 @@ Cookbook 模型中仍保留以下字段，但已标记为 deprecated，不再使
 
 所有路由从 [app.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/app.py#L147-L156) 进入，通过 `api_routers()` 挂载，主路由前缀统一为 `/api`，由 [routes/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/__init__.py#L1-L35) 定义。
 
-### 2.1 完整路由树
+### 2.1 recipe.router 挂载层级详解
 
 所有后端路由统一前缀为 `/api`，由 [routes/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/__init__.py#L20-L35) 定义。
+
+recipe 模块下 6 个子 router **全部为平级 sibling 关系**，都直接挂载在 [recipe/__init__.py#L7](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L7) 定义的 `router = APIRouter()` 下。
+
+挂载逻辑由 [recipe/__init__.py#L5-L14](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L5-L14) 控制：
+
+```python
+prefix = "/recipes"
+
+router = APIRouter()
+
+# 组 A: 自身已定义 prefix="/recipes"，挂载时不额外加 prefix
+router.include_router(exports.router, tags=["Recipe: Exports"])          # L9
+router.include_router(recipe_crud_routes.router, tags=["Recipe: CRUD"])  # L10
+
+# 组 B: 自身未定义 prefix 或定义了子 prefix，挂载时额外加 prefix="/recipes"
+router.include_router(comments.router, prefix=prefix, tags=["Recipe: Comments"])      # L11
+router.include_router(bulk_actions.router, prefix=prefix, tags=["Recipe: Bulk Actions"])  # L12
+router.include_router(shared_routes.router, prefix=prefix, tags=["Recipe: Shared"])   # L13
+router.include_router(timeline_events.router, prefix=prefix, tags=["Recipe: Timeline"])  # L14
+```
+
+### 2.2 各子 router 的 prefix 组合与完整端点
+
+#### 组 A：自身定义 prefix="/recipes"，挂载时无额外 prefix
+
+**A1. recipe_crud_routes.router**
+- 自身定义：[recipe_crud_routes.py#L85](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/recipe_crud_routes.py#L85) `UserAPIRouter(prefix="/recipes")`
+- 挂载方式：[recipe/__init__.py#L10](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L10) 无额外 prefix
+- 完整前缀：`/api` + `/recipes` = `/api/recipes`
+- 需要认证
+- 端点列表：
+  ```
+  核心 CRUD:
+    GET    /api/recipes                               # 分页列表（支持 cookbook 参数）[L340]
+    GET    /api/recipes/{slug}                        # 单个完整 recipe [L415]
+    POST   /api/recipes                               # 创建 [L426]
+    PUT    /api/recipes/{slug}                        # 更新单个 [L472]
+    PUT    /api/recipes                               # 批量更新 [L495]
+    PATCH  /api/recipes/{slug}                        # 局部更新单个 [L520]
+    PATCH  /api/recipes                               # 批量局部更新 [L543]
+    DELETE /api/recipes/{slug}                        # 删除 [L592]
+
+  创建辅助:
+    POST /api/recipes/test-scrape-url                 # 测试 URL 抓取 [L130]
+    POST /api/recipes/create/html-or-json             # 从 HTML/JSON 创建 [L144]
+    POST /api/recipes/create/html-or-json/stream      # 流式创建 [L160]
+    POST /api/recipes/create/url                      # 从 URL 创建 [L173]
+    POST /api/recipes/create/url/stream               # 流式从 URL 创建 [L186]
+    POST /api/recipes/create/url/bulk                 # 批量 URL 创建 [L276]
+    POST /api/recipes/create/zip                      # 从 zip 创建 [L295]
+    POST /api/recipes/create/image                    # 从图片创建 [L309]
+
+  其他:
+    GET    /api/recipes/suggestions                   # 推荐 recipes [L397]
+    POST   /api/recipes/{slug}/duplicate              # 复制 recipe [L450]
+    PATCH  /api/recipes/{slug}/last-made              # 更新上次制作时间 [L568]
+    POST   /api/recipes/{slug}/image                  # 从 URL 抓取图片 [L614]
+    PUT    /api/recipes/{slug}/image                  # 上传图片 [L635]
+    DELETE /api/recipes/{slug}/image                  # 删除图片 [L644]
+    POST   /api/recipes/{slug}/assets                 # 上传附件 [L653]
+  ```
+
+**A2. exports.router**
+- 自身定义：[exports.py#L13](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/exports.py#L13) `UserAPIRouter(prefix="/recipes")`
+- 挂载方式：[recipe/__init__.py#L9](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L9) 无额外 prefix
+- 完整前缀：`/api` + `/recipes` = `/api/recipes`
+- 需要认证
+- 端点列表：
+  ```
+  GET /api/recipes/exports                             # 获取导出格式和模板列表 [L21]
+  GET /api/recipes/{slug}/exports                      # 按指定模板导出单个 recipe [L25]
+  ```
+
+---
+
+#### 组 B：挂载时额外加 prefix="/recipes"
+
+**B1. comments.router**
+- 自身定义：[comments.py#L5](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/comments.py#L5) `UserAPIRouter()`，**无自身 prefix**
+- 挂载方式：[recipe/__init__.py#L11](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L11) 额外加 `prefix="/recipes"`
+- 完整前缀：`/api` + `/recipes` + (无自身 prefix) = `/api/recipes`
+- 需要认证
+- 端点列表：
+  ```
+  GET /api/recipes/{slug}/comments                     # 获取 recipe 的所有评论 [L10]
+  ```
+
+**B2. bulk_actions.router**
+- 自身定义：[bulk_actions.py#L23](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/bulk_actions.py#L23) `APIRouter(prefix="/bulk-actions")`，**自身有子 prefix**
+- 挂载方式：[recipe/__init__.py#L12](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L12) 额外加 `prefix="/recipes"`
+- 完整前缀：`/api` + `/recipes` + `/bulk-actions` = `/api/recipes/bulk-actions`
+- 需要认证
+- 端点列表：
+  ```
+  POST   /api/recipes/bulk-actions/tag                 # 批量打标签 [L37]
+  POST   /api/recipes/bulk-actions/settings            # 批量设置 [L41]
+  POST   /api/recipes/bulk-actions/categorize          # 批量分类 [L45]
+  POST   /api/recipes/bulk-actions/delete              # 批量删除 [L49]
+  POST   /api/recipes/bulk-actions/export              # 批量导出（触发任务）[L60]
+  GET    /api/recipes/bulk-actions/export              # 列出所有导出任务 [L76]
+  GET    /api/recipes/bulk-actions/export/{export_id}/download  # 获取导出文件 token [L65]
+  DELETE /api/recipes/bulk-actions/export/purge        # 清理所有导出数据 [L80]
+  ```
+
+**B3. shared_routes.router**（公开读取分享令牌）
+- 自身定义：[recipe/shared_routes.py#L17](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py#L17) `APIRouter()`，**无自身 prefix**
+- 挂载方式：[recipe/__init__.py#L13](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L13) 额外加 `prefix="/recipes"`
+- 完整前缀：`/api` + `/recipes` + (无自身 prefix) = `/api/recipes`
+- **无需认证**
+- 端点列表：
+  ```
+  GET /api/recipes/shared/{token_id}                   # 通过令牌获取 recipe [L22]
+  GET /api/recipes/shared/{token_id}/zip               # 通过令牌下载 recipe zip [L42]
+  ```
+
+**B4. timeline_events.router**
+- 自身定义：[timeline_events.py#L26](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/timeline_events.py#L26) `UserAPIRouter(prefix="/timeline/events")`，**自身有子 prefix**
+- 挂载方式：[recipe/__init__.py#L14](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L14) 额外加 `prefix="/recipes"`
+- 完整前缀：`/api` + `/recipes` + `/timeline/events` = `/api/recipes/timeline/events`
+- 需要认证
+- 端点列表：
+  ```
+  GET    /api/recipes/timeline/events                  # 分页列表 [L47]
+  POST   /api/recipes/timeline/events                  # 创建事件 [L61]
+  GET    /api/recipes/timeline/events/{item_id}        # 获取单个 [L89]
+  PUT    /api/recipes/timeline/events/{item_id}        # 更新单个 [L96]
+  DELETE /api/recipes/timeline/events/{item_id}        # 删除单个 [L117]
+  PUT    /api/recipes/timeline/events/{item_id}/image  # 更新事件图片 [L147]
+  ```
+
+### 2.3 其他路由总览
 
 ```
 app.include_router(router)  # prefix = "/api"
@@ -52,51 +183,7 @@ app.include_router(router)  # prefix = "/api"
 │       ├── PUT    /api/households/cookbooks/{item_id}    # 更新单个 [L122]
 │       └── DELETE /api/households/cookbooks/{item_id}    # 删除 [L136]
 │
-├── recipe.router
-│   ├── recipe_crud_routes.router
-│   │   [定义: recipe_crud_routes.py#L85, prefix="/recipes"]
-│   │   [挂载: recipe/__init__.py#L10, 无额外前缀]
-│   │   需要认证
-│   │   ├── 核心 CRUD
-│   │   │   ├── GET    /api/recipes                    # 分页列表（支持 cookbook 参数）[L340]
-│   │   │   ├── GET    /api/recipes/{slug}             # 单个完整 recipe [L415]
-│   │   │   ├── POST   /api/recipes                    # 创建 [L426]
-│   │   │   ├── PUT    /api/recipes/{slug}             # 更新单个 [L472]
-│   │   │   ├── PUT    /api/recipes                    # 批量更新 [L495]
-│   │   │   ├── PATCH  /api/recipes/{slug}             # 局部更新单个 [L520]
-│   │   │   ├── PATCH  /api/recipes                    # 批量局部更新 [L543]
-│   │   │   └── DELETE /api/recipes/{slug}             # 删除 [L592]
-│   │   ├── 创建辅助
-│   │   │   ├── POST /api/recipes/test-scrape-url          # 测试 URL 抓取 [L130]
-│   │   │   ├── POST /api/recipes/create/html-or-json      # 从 HTML/JSON 创建 [L144]
-│   │   │   ├── POST /api/recipes/create/html-or-json/stream # 流式创建 [L160]
-│   │   │   ├── POST /api/recipes/create/url               # 从 URL 创建 [L173]
-│   │   │   ├── POST /api/recipes/create/url/stream        # 流式从 URL 创建 [L186]
-│   │   │   ├── POST /api/recipes/create/url/bulk          # 批量 URL 创建 [L276]
-│   │   │   ├── POST /api/recipes/create/zip               # 从 zip 创建 [L295]
-│   │   │   └── POST /api/recipes/create/image             # 从图片创建 [L309]
-│   │   ├── 其他
-│   │   │   ├── GET    /api/recipes/suggestions            # 推荐 recipes [L397]
-│   │   │   ├── POST   /api/recipes/{slug}/duplicate       # 复制 recipe [L450]
-│   │   │   ├── PATCH  /api/recipes/{slug}/last-made       # 更新上次制作时间 [L568]
-│   │   │   ├── POST   /api/recipes/{slug}/image           # 从 URL 抓取图片 [L614]
-│   │   │   ├── PUT    /api/recipes/{slug}/image           # 上传图片 [L635]
-│   │   │   ├── DELETE /api/recipes/{slug}/image           # 删除图片 [L644]
-│   │   │   └── POST   /api/recipes/{slug}/assets          # 上传附件 [L653]
-│   │   │
-│   │   ├── comments.router (prefix="/recipes")       # 评论相关
-│   │   ├── bulk_actions.router (prefix="/recipes")   # 批量操作
-│   │   ├── exports.router                            # 导出
-│   │   └── timeline_events.router (prefix="/recipes") # 时间线
-│   │
-│   └── shared_routes.router
-│       [定义: recipe/shared_routes.py#L17]
-│       [挂载: recipe/__init__.py#L13, prefix="/recipes"]
-│       无需认证
-│       ├── GET /api/recipes/shared/{token_id}          # 通过令牌获取 recipe [L22]
-│       └── GET /api/recipes/shared/{token_id}/zip      # 通过令牌下载 recipe zip [L42]
-│
-├── shared.router
+├── shared.router  （分享令牌管理，注意和 recipe.shared_routes 区分）
 │   [定义: shared/__init__.py#L13]
 │   prefix = "/shared/recipes", 需要认证
 │   ├── GET    /api/shared/recipes                      # 令牌列表（支持 ?recipe_id= 过滤）[L26]
@@ -119,7 +206,9 @@ app.include_router(router)  # prefix = "/api"
         └── GET /api/explore/groups/{group_slug}/recipes/{recipe_slug}      # 单个公开 recipe [L114]
 ```
 
-**注意**：代码中**不存在** `/api/recipes/{slug}/summary` 和 `/api/explore/groups/{group_slug}/recipes/{slug}/summary` 这两个端点，为之前误写。
+**重要勘误**：
+1. 代码中**不存在** `/api/recipes/{slug}/summary` 和 `/api/explore/groups/{group_slug}/recipes/{slug}/summary` 端点，为之前误写。
+2. `shared.router`（分享令牌管理，路径 `/api/shared/recipes`，需要认证）和 `recipe.shared_routes.router`（公开读取令牌，路径 `/api/recipes/shared/{token_id}`，无需认证）是**两套完全独立的路由**，挂载位置不同，认证要求不同。
 
 ---
 
@@ -535,19 +624,51 @@ POST /api/shared/recipes
 
 ## 九、关键代码索引
 
+### 9.1 路由挂载入口
+
+| 模块 | 文件 | 说明 |
+|------|------|------|
+| 全局路由入口 | [routes/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/__init__.py#L20-L35) | 统一前缀 `/api`，挂载各子 router |
+| recipe 路由挂载 | [recipe/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/__init__.py#L5-L14) | 6 个平级子 router，分 A/B 两组不同 prefix 策略 |
+
+### 9.2 Recipe 相关路由
+
+| 功能模块 | 后端 | 前端 |
+|---------|------|------|
+| Recipe CRUD（组A） | [recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/recipe_crud_routes.py#L85) | [user/recipes/recipe.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/recipes/recipe.ts) |
+| Recipe 导出（组A） | [exports.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/exports.py#L13) | - |
+| Recipe 评论（组B） | [comments.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/comments.py#L5) | - |
+| Recipe 批量操作（组B） | [bulk_actions.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/bulk_actions.py#L23) | [recipe-bulk-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/recipe-bulk-actions.ts) |
+| 分享令牌读取（组B，公开） | [recipe/shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py#L17) | [public/shared.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/shared.ts) |
+| Recipe 时间线（组B） | [timeline_events.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/timeline_events.py#L26) | - |
+| Recipe 查询仓库 | [repository_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/repos/repository_recipes.py) | [use-recipes.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/composables/recipes/use-recipes.ts) |
+| Recipe 公开 API | [controller_public_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/explore/controller_public_recipes.py#L17) | [public/explore/recipes.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/explore/recipes.ts) |
+
+### 9.3 Cookbook 相关路由
+
 | 功能模块 | 后端 | 前端 |
 |---------|------|------|
 | Cookbook 模型 | [cookbook.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/db/models/household/cookbook.py) | [cookbook.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/types/cookbook.ts) |
-| Cookbook 私有 API | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/households/controller_cookbooks.py) | [group-cookbooks.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/group-cookbooks.ts) |
-| Cookbook 公开 API | [controller_public_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/explore/controller_public_cookbooks.py) | [public/explore/cookbooks.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/explore/cookbooks.ts) |
-| Recipe 查询 | [repository_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/repos/repository_recipes.py) | [use-recipes.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/composables/recipes/use-recipes.ts) |
-| Recipe 私有 API | [recipe_crud_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/recipe_crud_routes.py) | [user/recipes/recipe.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/recipes/recipe.ts) |
-| Recipe 公开 API | [controller_public_recipes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/explore/controller_public_recipes.py) | [public/explore/recipes.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/explore/recipes.ts) |
+| Cookbook 私有 API | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/households/controller_cookbooks.py#L24) | [group-cookbooks.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/group-cookbooks.ts) |
+| Cookbook 公开 API | [controller_public_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/explore/controller_public_cookbooks.py#L12) | [public/explore/cookbooks.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/explore/cookbooks.ts) |
 | 查询过滤器 | [builder.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/services/query_filter/builder.py) | [CookbookEditor.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Cookbook/CookbookEditor.vue) |
-| 分享令牌管理 | [shared/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/shared/__init__.py) | [user/recipes/recipe-share.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/recipes/recipe-share.ts) |
-| 分享令牌读取 | [recipe/shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py) | [public/shared.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/shared.ts) |
+
+### 9.4 分享令牌相关
+
+| 功能模块 | 后端 | 前端 |
+|---------|------|------|
+| 分享令牌管理（需要认证） | [shared/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/shared/__init__.py#L13) | [user/recipes/recipe-share.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/user/recipes/recipe-share.ts) |
+| 分享令牌读取（公开） | [recipe/shared_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/routes/recipe/shared_routes.py#L17) | [public/shared.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/public/shared.ts) |
 | 分享令牌模型 | [shared.py](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/mealie/db/models/recipe/shared.py) | [recipe.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/lib/api/types/recipe.ts#L364-L387) |
-| 分享对话框 | - | [RecipeDialogShare.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeDialogShare.vue) |
-| 分享页面 | - | [shared/r/[id].vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue) |
-| Cookbook 页面组件 | - | [CookbookPage.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Cookbook/CookbookPage.vue) |
-| Recipe 卡片组件 | - | [RecipeCardSection.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeCardSection.vue) |
+| 分享对话框组件 | - | [RecipeDialogShare.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeDialogShare.vue) |
+| 分享页面路由 | - | [shared/r/[id].vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/pages/g/%5BgroupSlug%5D/shared/r/%5Bid%5D.vue) |
+
+### 9.5 前端展示组件
+
+| 功能模块 | 组件文件 |
+|---------|---------|
+| Cookbook 列表页 | [pages/g/[groupSlug]/cookbooks/index.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/pages/g/%5BgroupSlug%5D/cookbooks/index.vue) |
+| Cookbook 详情页组件 | [CookbookPage.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Cookbook/CookbookPage.vue) |
+| Cookbook 编辑器 | [CookbookEditor.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Cookbook/CookbookEditor.vue) |
+| Recipe 卡片列表 | [RecipeCardSection.vue](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/components/Domain/Recipe/RecipeCardSection.vue) |
+| Cookbook 状态管理 | [use-cookbook-store.ts](file:///d:/fz/0601/solo-dogfeeding/code/72-mealie/frontend/app/composables/store/use-cookbook-store.ts) |
