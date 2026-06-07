@@ -531,6 +531,201 @@ Tab A signOut()
     └─ authStatus 仅更新 Tab A 内存    saveRecipe() 静默失败，Tab B authStatus 仍为 authenticated
 ```
 
+### 6.9 跨 Tab 认证链路的关键前提
+
+前述 6.8 节的链路分析依赖几个容易被忽略的底层前提。本节逐一澄清。
+
+#### 6.9.1 Nuxt useCookie 对跨 Tab Cookie 变更的感知边界
+
+`useCookie(name)` 是 Nuxt 提供的 composable，返回一个 Vue `Ref`。它的读取行为分为两种语义：
+
+```typescript
+// use-auth-backend.ts
+const tokenCookie = useCookie(tokenName, {
+  maxAge: $appInfo.tokenTime * 60 * 60,
+  secure: $appInfo.production && window?.location?.protocol === "https:",
+});
+```
+
+**读取语义 A：初始化时的一次性读取**
+- 组件/composable 首次调用 `useCookie()` 时，从 `document.cookie` 解析一次值，作为 ref 的内部初始值
+- 此时建立的是 ref 内部状态和 cookie 字符串的一次性快照，不建立监听
+
+**读取语义 B：每次 `.value` 访问的惰性重读**
+- Nuxt 对 `useCookie()` 返回的 ref 做了自定义 getter，每次 `ref.value` 访问都会**重新解析 `document.cookie` 字符串**，不是从 ref 内部缓存取值
+- 这一行为对调用方透明，与普通 ref 语义不同
+
+**写入语义：`.value = xxx` 触发 `document.cookie = "name=xxx; ..."`**
+- 浏览器的 `document.cookie` 写入是同步操作，写入后同渲染进程的所有代码立即能读到新值
+- 由于同源下所有 Tab 共享同一个浏览器级 Cookie Jar，Tab A 写入后，Tab B 在**下一次读取 `document.cookie` 时**能看到新值
+
+**跨 Tab 感知的关键限制**：
+- 浏览器**没有 `cookiechange` 事件**（早期草案已废弃），Cookie 的变更不会主动推送给其他 Tab
+- Tab B 的 `tokenCookie.value` 只有在被代码主动访问时（如 axios 请求拦截器每次发请求时），才会重新解析 `document.cookie` 并看到 Tab A 删除后的结果
+- `authStatus` 和 `authUser` 是模块级 `ref`，与 cookie 没有任何响应式绑定，它们的变更只能通过 `signOut()` / `getSession()` / `handleAuthError()` / `refresh()` 等显式函数调用来触发，不会随 Cookie 变化自动更新
+
+**项目中无 refreshCookie / cookieStore / BroadcastChannel 等同步机制**：全局搜索确认没有使用上述 API。各 Tab 对认证状态的感知完全依赖「下次发请求时重新读 cookie → 后端返回 401 → 触发对应分支」这条隐式链路。
+
+#### 6.9.2 后端 logout 不吊销短期 JWT（JWT 无状态）
+
+**后端 logout 实现**（`mealie/routes/auth/auth.py`）：
+```python
+@user_router.post("/logout")
+async def logout(response: Response, accept_language: ... = None):
+    response.delete_cookie("mealie.access_token")
+    return {"message": translator.t("notifications.logged-out")}
+```
+
+后端 logout 只做一件事：在 HTTP 响应中附带 `Set-Cookie: mealie.access_token=; expires=...`，通知浏览器删除 cookie。**没有任何 JWT 吊销逻辑**：
+- 没有 Token Blacklist / Redis 吊销表
+- 没有数据库记录短期 Token
+- 没有 Token version 机制
+
+**JWT 验证逻辑**（`mealie/core/dependencies/dependencies.py` `get_current_user()`）：
+```python
+# 后端有双来源读取：优先 header，fallback 到 cookie
+if token is None and "mealie.access_token" in request.cookies:
+    token = request.cookies.get("mealie.access_token", "")
+
+payload = jwt.decode(token, settings.SECRET, algorithms=[ALGORITHM])  # 仅验证签名和 exp
+```
+
+`jwt.decode()` 只验证两件事：
+1. 签名是否正确（用服务端 `SECRET`）
+2. `exp` claim 是否已过期
+
+只要这两个条件满足，**无论前端是否调用过 logout，JWT 都会被接受**。这意味着：
+- 登出本质上是「让浏览器丢掉 token」，不是「让 token 失效」
+- 如果攻击者从某处窃取了一个未过期的 JWT，即使合法用户已登出，该 JWT 仍可被使用（直至自然过期）
+- JWT 有效期由 `settings.TOKEN_TIME`（小时）控制，默认值取决于部署配置
+
+#### 6.9.3 后端 token 的双来源读取
+
+`get_current_user()` 有两条获取 token 的路径（`mealie/core/dependencies/dependencies.py`）：
+
+| 来源 | 触发条件 | 代码 |
+|-----|---------|------|
+| Authorization header | `OAuth2PasswordBearer` 从 header 解析 `Bearer <token>` | `token: str \| None = Depends(oauth2_scheme_soft_fail)` |
+| Cookie | header 没取到且 `request.cookies` 中存在 `mealie.access_token` | `token = request.cookies.get("mealie.access_token", "")` |
+
+**双来源的意义**：
+- 常规 API 请求：前端 axios 拦截器把 token 从 cookie 读出来放进 `Authorization: Bearer` header → 走第一条路径
+- 浏览器直接发起的请求（如 `<img src>`、`<a href>` 下载）：浏览器自动带 Cookie，但不会加 Authorization header → 走第二条路径
+- 跨 Tab 登出场景：两条路径都可能拿不到 token（cookie 被清除 + 拦截器没设置 header）
+
+#### 6.9.4 Tab B 保存 Recipe 的两条路径
+
+基于以上前提，Tab A 登出后 Tab B 保存 Recipe 存在**成功**和**失败**两条路径，取决于请求发出的时间点。
+
+---
+
+**路径一：保存失败（绝大多数正常时序）**
+
+```
+Tab A 用户点击登出
+    │
+    ▼
+signOut() 执行 setToken(null)
+    │  → document.cookie 删除 mealie.access_token
+    │  → 浏览器 Cookie Jar 同步更新
+    │
+    ▼ （若干毫秒后）
+Tab B 用户点击保存
+    │
+    ▼
+axios 请求拦截器执行:
+  const token = useCookie(tokenName).value
+    │  → 重新解析 document.cookie → null
+    │  → 不设置 Authorization header
+    │
+    ▼
+浏览器自动附带 Cookie: （Cookie Jar 中已无 mealie.access_token）
+    │
+    ▼
+后端 get_current_user():
+  ├─ oauth2_scheme_soft_fail → None（无 header）
+  └─ request.cookies.get("mealie.access_token") → None（无 cookie）
+    │
+    ▼
+抛出 HTTPException 401
+    │
+    ▼
+axios 响应拦截器:
+  error.response.status === 401 → true
+  tokenCookie.value → 已是 null → if 条件 false → 不跳转 /login
+    │
+    ▼
+request.safe() catch: { response:null, error:e, data:null }
+    │
+    ▼
+saveRecipe() 静默失败
+```
+
+这是 6.8 节详细描述的路径，也是最常发生的路径。
+
+---
+
+**路径二：保存成功（时间窗口竞态）**
+
+Tab B 保存请求在「Tab A 登出导致 cookie 被清除」之前就已经携带有效 token 发出，且在后端被处理时 JWT 仍未过期。具体有两种子场景：
+
+**子场景 A：Tab B 请求先于 Tab A 登出发出**
+```
+Tab B 用户点击保存（时间点 T1）
+    │
+    ▼
+axios 请求拦截器读到有效 token → 设置 Authorization header
+    │
+    ▼
+HTTP 请求已进入网络层（携带着有效的 JWT）
+
+Tab A 用户点击登出（时间点 T2 > T1，但请求还未返回）
+    │
+    ▼
+signOut() 清 cookie + 跳转 /login
+    │
+    ▼
+Tab B 的保存请求到达后端（时间点 T3）
+    │
+    ▼
+jwt.decode() 验证：签名正确、exp 未过期 → 通过
+    │
+    ▼
+Recipe 正常更新，返回 200
+    │
+    ▼
+Tab B saveRecipe() 成功，退出编辑模式
+    │
+    ▼
+（Tab B 后续的其他请求才会因 cookie 被清除而失败）
+```
+
+**子场景 B：Tab B 请求在 Tab A logout API 处理完成前到达后端**
+
+Tab A 的 logout 请求和 Tab B 的保存请求同时在网络上传输，存在后端先处理 Tab B 保存请求的可能（取决于网络路由和后端调度顺序）。此时：
+- Cookie Jar 尚未被 logout 响应的 Set-Cookie 更新
+- Tab B 拦截器能读到 token，或浏览器自动附带了有效 cookie
+- JWT 未被吊销（也无法被吊销）
+- 保存成功
+
+**路径二的触发概率**：
+- 在用户手动操作场景下，子场景 A 偶发（两人同时操作）
+- 子场景 B 是纯粹的网络竞态，概率极低但理论上存在
+- 路径二一旦发生，Tab B 会误以为自己已登出（实际上 Tab B 的 authStatus 仍为 authenticated，但后续操作又会失败），造成更混乱的用户体验
+
+---
+
+**两条路径的根本原因总结**：
+
+| 要素 | 路径一（失败） | 路径二（成功） |
+|-----|--------------|--------------|
+| Tab B 拦截器读到 token | ❌ null | ✅ 有效字符串 |
+| 请求携带 Authorization header | ❌ 无 | ✅ Bearer <jwt> |
+| 请求附带有效 cookie | ❌ 无 | ✅ 有 |
+| 后端 jwt.decode() 结果 | —（未执行，无 token） | ✅ 签名正确、未过期 |
+| saveRecipe() 结果 | 静默失败 | 正常保存 |
+| 后续 Tab B 行为 | 仍在编辑模式，可继续改但都失败 | 退出编辑，回到 VIEW，下次请求才会失败 |
+
 ---
 
 ## 7. 关键代码索引
@@ -558,3 +753,6 @@ Tab A signOut()
 | API 请求包装层（request.safe 吞异常） | `frontend/app/composables/api/api-client.ts` | 8-66 |
 | API 入口导出 | `frontend/app/composables/api/index.ts` | 1-2 |
 | BaseCRUDAPI 抽象类 | `frontend/app/lib/api/base/base-clients.ts` | 16-82 |
+| 后端 auth 路由（token/logout/refresh） | `mealie/routes/auth/auth.py` | 64-162 |
+| JWT 创建（create_access_token） | `mealie/core/security/security.py` | 31-40 |
+| 后端认证依赖（get_current_user + 双来源 token 读取） | `mealie/core/dependencies/dependencies.py` | 88-123 |
