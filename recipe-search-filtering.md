@@ -153,42 +153,130 @@ Recipe 覆写了默认的搜索实现，定义于 [recipe.py](file:///d:/fz/0601
 |-----------|------|-------------|
 | `RecipeModel.name_normalized` | 菜谱名称规范化 | name set 事件 |
 | `RecipeModel.description_normalized` | 描述规范化 | description set 事件 |
-| `RecipeIngredientModel.note_normalized` | 食材备注规范化 | - |
-| `RecipeIngredientModel.original_text_normalized` | 食材原始文本规范化 | - |
+| `RecipeIngredientModel.note_normalized` | 食材备注规范化 | note set 事件 |
+| `RecipeIngredientModel.original_text_normalized` | 食材原始文本规范化 | original_text set 事件 |
 
 规范化逻辑：[SqlAlchemyBase.normalize()](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/db/models/_model_base.py#L29-L33)
 
+#### Ingredient 规范化字段的更新事件详解
+
+`RecipeIngredientModel` 的两个规范化字段通过 SQLAlchemy `@event.listens_for` 监听 set 事件自动更新，定义于 [ingredient.py L487-L500](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/db/models/recipe/ingredient.py#L487-L500)：
+
 ```python
-@classmethod
-def normalize(cls, val: str) -> str:
-    return unidecode(val).translate(_NORMALIZE_PUNCTUATION_TABLE).lower().strip()[:255]
+@event.listens_for(RecipeIngredientModel.note, "set")
+def receive_ingredient_note(target, value, oldvalue, initiator):
+    if value is not None:
+        target.note_normalized = RecipeIngredientModel.normalize(value)
+    else:
+        target.note_normalized = None
+
+@event.listens_for(RecipeIngredientModel.original_text, "set")
+def receive_ingredient_original_text(target, value, oldvalue, initiator):
+    if value is not None:
+        target.original_text_normalized = RecipeIngredientModel.normalize(value)
+    else:
+        target.original_text_normalized = None
 ```
+
+此外在 `__init__` 构造函数中也会直接赋值，因为代码注释明确说明 "SQLAlchemy events do not seem to register things that are set during auto_init"。
+
+除食材外，其他 recipe 相关模型也具备规范化字段及 set 事件：
+- `IngredientUnitModel`：name_normalized, plural_name_normalized, abbreviation_normalized, plural_abbreviation_normalized
+- `IngredientFoodModel`：name_normalized, plural_name_normalized
+- `IngredientFoodAliasModel` / `IngredientUnitAliasModel`：name_normalized
 
 #### 3.5.1 Fuzzy 搜索（PostgreSQL trigram）
 
-```python
-session.execute(text(f"set pg_trgm.word_similarity_threshold = {cls._fuzzy_similarity_threshold};"))
-# _fuzzy_similarity_threshold 默认 0.5，定义于 mealie_model.py
+定义于 [recipe.py L333-L361](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/recipe/recipe.py#L333-L361)。
+
+执行顺序与 pg_trgm 阈值影响：
+
+```
+1. 先对 RecipeIngredientModel 执行食材预查询（此时还未设置 pg_trgm 阈值）
+2. 然后才设置 pg_trgm.word_similarity_threshold
+3. 最后对 RecipeModel 的 name/description 执行主查询过滤
 ```
 
-过滤条件（三部分 OR）：
-1. `RecipeModel.name_normalized %> search`（trigram 词相似度运算符）
-2. `RecipeModel.description_normalized %> search`
-3. 食材中命中：先查出符合的 ingredient_ids，再用 `recipe_ingredient.any(id IN (...))`
+**关键细节：pg_trgm 阈值对食材预查询不生效**
+
+```python
+# 步骤 1：食材预查询（使用本次 SET 之前的 session 当前阈值）
+ingredient_ids = session.execute(
+    select(RecipeIngredientModel.id).filter(
+        or_(
+            RecipeIngredientModel.note_normalized.op("%>")(search),
+            RecipeIngredientModel.original_text_normalized.op("%>")(search),
+        )
+    )
+).scalars().all()
+
+# 步骤 2：设置阈值（在食材预查询之后！）
+session.execute(text(f"set pg_trgm.word_similarity_threshold = {cls._fuzzy_similarity_threshold};"))
+# _fuzzy_similarity_threshold 默认 0.5，定义于 mealie_model.py
+
+# 步骤 3：主查询过滤（此时阈值已生效为 0.5）
+return query.filter(
+    or_(
+        RecipeModel.name_normalized.op("%>")(search),
+        RecipeModel.description_normalized.op("%>")(search),
+        RecipeModel.recipe_ingredient.any(RecipeIngredientModel.id.in_(ingredient_ids)),
+    )
+).order_by(func.least(RecipeModel.name_normalized.op("<->>")(search)))
+```
+
+因此：
+- **食材预查询**使用本次 `SET` 执行前的 session 当前阈值；新连接通常是 PostgreSQL 默认 **0.3**，但若连接曾设置过阈值则以已有 session 值为准
+- **菜谱名称 / 描述过滤**使用自定义阈值 **0.5**（更严格）
 
 排序：按 name 的 trigram 距离升序（最相似的在前）
 ```sql
 ORDER BY LEAST(name_normalized <->> search)
 ```
 
-PostgreSQL 还为 `name_normalized` 和 `description_normalized` 创建了 GIN 索引（`gin_trgm_ops`）以加速 trigram 搜索。
+##### PostgreSQL trigram 索引覆盖范围
+
+PostgreSQL 下所有规范化搜索字段都创建了 GIN 索引（`gin_trgm_ops` 操作符类）以加速 trigram 搜索：
+
+| 模型 | 字段 | 索引名 |
+|------|------|--------|
+| `RecipeModel` | `name_normalized` | `ix_recipes_name_normalized_gin` |
+| `RecipeModel` | `description_normalized` | `ix_recipes_description_normalized_gin` |
+| `RecipeIngredientModel` | `note_normalized` | `ix_recipes_ingredients_note_normalized_gin` |
+| `RecipeIngredientModel` | `original_text_normalized` | `ix_recipes_ingredients_original_text_normalized_gin` |
+| `IngredientUnitModel` | 4 个规范化字段 | 各自对应 `_gin` 索引 |
+| `IngredientFoodModel` | 2 个规范化字段 | 各自对应 `_gin` 索引 |
+
+此外，相关规范化字段还声明了普通索引；不过 tokenized 搜索使用前后通配的 `LIKE "%token%"`，普通 B-tree 索引不一定能被数据库有效利用，真正的 trigram 加速主要来自 PostgreSQL 的 GIN 索引。
 
 #### 3.5.2 Tokenized 搜索（通用 LIKE 匹配）
+
+定义于 [recipe.py L363-L383](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/schema/recipe/recipe.py#L363-L383)。
+
+```python
+# 食材预查询（任一 token 命中 note 或 original_text 即可）
+ingredient_ids = session.execute(
+    select(RecipeIngredientModel.id).filter(
+        or_(
+            *[RecipeIngredientModel.note_normalized.like(f"%{ns}%") for ns in search_list],
+            *[RecipeIngredientModel.original_text_normalized.like(f"%{ns}%") for ns in search_list],
+        )
+    )
+).scalars().all()
+
+# 主查询过滤
+return query.filter(
+    or_(
+        *[RecipeModel.name_normalized.like(f"%{ns}%") for ns in search_list],
+        *[RecipeModel.description_normalized.like(f"%{ns}%") for ns in search_list],
+        RecipeModel.recipe_ingredient.any(RecipeIngredientModel.id.in_(ingredient_ids)),
+    )
+).order_by(desc(RecipeModel.name_normalized.like(f"%{search}%")))
+```
 
 过滤条件（对每个 search token，三部分 OR）：
 1. `RecipeModel.name_normalized LIKE '%token%'`
 2. `RecipeModel.description_normalized LIKE '%token%'`
-3. 食材中命中：先查出 note_normalized 或 original_text_normalized 包含任一 token 的 ingredient_ids
+3. 食材中命中任一 token：先查出符合的 ingredient_ids，再用 `recipe_ingredient.any(id IN (...))`
 
 排序：按完整搜索字符串在 name 中的匹配程度降序
 ```sql
@@ -443,13 +531,24 @@ RecipeModel 中可过滤的主要字段（见 [recipe.py](file:///d:/fz/0601/sol
 
 ---
 
-## 九、缓存机制
+## 九、缓存机制及与过滤的关系
+
+各缓存/优化机制的来源、作用域，以及**是否参与过滤逻辑**的区分如下：
+
+| 机制 | 来源 | 作用域 | 是否参与过滤 | 说明 |
+|------|------|--------|-------------|------|
+| 搜索结果 | 无缓存 | 每次请求实时查询 | N/A | 搜索/建议结果完全实时，无任何结果级缓存 |
+| Repository 实例 | `@cached_property` | 单次 HTTP 请求内 | **否** | 仅缓存 repository **对象实例**，不缓存查询结果，不影响过滤 |
+| 图片 cache_key | `cache.cache_key.new_key()` | 跨请求持久化 | **否** | 仅用于图片 URL 的浏览器缓存失效，与搜索过滤完全无关 |
+| 前端搜索 debounce | Vue composable | 前端客户端 | **否** | 仅减少 HTTP 请求频率，不改变后端过滤逻辑 |
 
 ### 9.1 Repository 实例缓存
 
 [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/repos/repository_factory.py) 中 `AllRepositories` 类的各 repository 属性使用 `@cached_property` 装饰，在单次请求生命周期内只初始化一次。
 
 同样，[BaseRecipeController](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/mealie/routes/recipe/_base.py#L37-L56) 中的 `recipes`, `group_recipes`, `group_cookbooks`, `service`, `mixins` 也使用 `@cached_property`。
+
+**与过滤的关系**：此缓存仅避免重复构造 repository 对象（包括 group_id/household_id 绑定），每次 page_all / find_suggested_recipes 调用都是**独立执行完整的 SQL 查询**，不受此缓存影响。
 
 ### 9.2 前端图片缓存键
 
@@ -461,9 +560,13 @@ recipe.image = cache.cache_key.new_key()  # 例如 "aB3x"
 
 当图片更新时，缓存键改变，前端自动拉取新图片。
 
+**与过滤的关系**：完全无关。cache_key 仅出现在 Recipe 响应的图片 URL 中（如 `/media/recipes/xxx-aB3x/original.jpg`），不参与任何搜索条件、排序或权限过滤。
+
 ### 9.3 前端搜索防抖
 
 [use-recipe-search.ts](file:///d:/fz/0601/solo-dogfeeding/code/77-mealie/frontend/app/composables/recipes/use-recipe-search.ts#L51-L57) 使用 500ms debounce 避免用户输入时频繁发请求。
+
+**与过滤的关系**：完全无关。debounce 仅在前端控制请求发送时机，一旦请求到达后端，过滤逻辑按正常流程完整执行。
 
 ---
 
