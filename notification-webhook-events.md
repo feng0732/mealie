@@ -40,14 +40,18 @@ mealie/app.py                                              # 调度任务注册
 
 所有事件定义在 `mealie/services/event_bus_service/event_types.py` 的 `EventTypes` 枚举类中，**共计 27 个枚举值**，按用途分为两类：
 - **内部事件**：`test_message`、`webhook_task` — 共 **2 个**，由系统内部或测试接口使用
-- **可订阅业务事件**：其余 `recipe_created` 等 — 共 **25 个**，面向普通用户，可通过 Apprise 通知器偏好配置订阅
+- **业务事件**：其余 `recipe_created` 等 — 共 **25 个**
+
+按配置可达性，业务事件又可分为两层：
+- **UI 可配置（22 个）**：前端通知器页面提供勾选入口，普通用户可见可操作
+- **Schema/API 级存在但 UI 不可见（3 个）**：`data_migrations`、`data_export`、`data_import`，在后端 Schema、API 出入参和数据库表中有对应字段，但前端 `optionsSections` 未呈现，普通用户无法通过界面配置，需绕过前端直接操作 API 或数据库才能开启
 
 ### 内部事件（Schema/数据库中有对应 options 字段，但不作为普通用户可订阅的业务事件）
 
 `EventTypes` 枚举与 `GroupEventNotifierOptions` Schema/`group_events_notifier_options` 数据库表是一一对齐生成的，因此 `test_message` 和 `webhook_task` 在 options 中确实存在布尔字段，默认均为 `False`。
 
 但这两个事件在真实业务中**不作为普通用户订阅事件使用**：
-- 前端 UI（`frontend/app/pages/household/notifiers.vue` 的 `optionsSections`）只暴露了食谱、用户、饮食计划等 8 类业务事件的开关，**完全没有呈现 `test_message` 和 `webhook_task` 的选项**，普通用户无法在界面上开启。
+- 前端 UI（`frontend/app/pages/household/notifiers.vue` 的 `optionsSections`）只暴露了 22 个业务事件的开关（见下文），**完全没有呈现 `test_message` 和 `webhook_task` 的选项**，普通用户无法在界面上开启。
 - 只有绕过前端直接调用 API 或修改数据库，才能把它们设为 `True`；即便如此，这两个事件的触发频率和语义也不适合作为日常通知。
 
 | 事件名 | 实际用途 | 触发方式 |
@@ -55,30 +59,34 @@ mealie/app.py                                              # 调度任务注册
 | `test_message` | 手动测试接口专用事件，仅用来验证某个 Webhook 或 Apprise 通知器的连通性 | 仅由两个 `/test` REST 接口派发（见下文"三类触发入口的边界"） |
 | `webhook_task` | Webhook 定时调度系统的内部事件，用来把"某个时间窗口到了"这一信号派发给 WebhookEventListener | 仅由定时任务 `post_group_webhooks` 每 5 分钟派发一次 |
 
-### 可订阅业务事件（前端 UI 呈现、普通用户可配置）
+### 业务事件（25 个；其中 22 个有 UI 勾选入口，3 个仅存在于 Schema/API）
 
-**食谱相关：**
+**食谱相关（UI 可见）：**
 - `recipe_created` / `recipe_updated` / `recipe_deleted`
 
-**用户相关：**
+**用户相关（UI 可见）：**
 - `user_signup`
 
-**数据管理相关：**
+**数据管理相关（仅 Schema/API 级存在，前端 UI 无勾选入口）：**
 - `data_migrations` / `data_export` / `data_import`
 
-**饮食计划相关：**
+这三个事件在后端 `GroupEventNotifierOptions` Schema 与数据库表中均有对应布尔字段，但 `frontend/app/pages/household/notifiers.vue` 的 `optionsSections` 未将其纳入渲染，普通用户无法通过界面配置订阅。
+
+**饮食计划相关（UI 可见）：**
 - `mealplan_entry_created` / `mealplan_entry_updated` / `mealplan_entry_deleted`
 
-**购物清单相关：**
+**购物清单相关（UI 可见）：**
 - `shopping_list_created` / `shopping_list_updated` / `shopping_list_deleted`
 
-**食谱集相关：**
+**食谱集相关（UI 可见）：**
 - `cookbook_created` / `cookbook_updated` / `cookbook_deleted`
 
-**标签 / 分类 / 标记：**
+**标签 / 分类 / 标记（UI 可见）：**
 - `tag_created` / `tag_updated` / `tag_deleted`
 - `category_created` / `category_updated` / `category_deleted`
 - `label_created` / `label_updated` / `label_deleted`
+
+UI 侧（`notifiers.vue`）共渲染 8 个分组、**22 个复选框**，与以上标注"UI 可见"的事件一一对应。
 
 ### 事件数据结构
 
@@ -451,8 +459,9 @@ Apprise 通知偏好定义在 `mealie/schema/household/group_events.py`，分为
 |------|------|-------------|
 | 通知器级 | `enabled` | 是否启用；`False` 时在查询层被过滤，该通知器下所有事件永不发送（但测试接口绕过此检查） |
 | 通知器级 | `apprise_url` | Apprise 协议 URL，直接决定通知渠道（邮件、Slack、Telegram、Webhook 等）和认证凭据；该字段在对外 API 响应中始终被隐藏（`GroupEventNotifierOut` 不含，仅 `GroupEventNotifierPrivate` 含） |
-| 选项级 `options` | `<业务事件名>: bool` | 与 `recipe_created`、`user_signup` 等**业务事件枚举名一一对应**的布尔字段，默认全部 `False`；前端 UI（`frontend/app/pages/household/notifiers.vue`）以分组复选框形式呈现给用户；通过 `getattr(notifier.options, event.event_type.name)` 动态读取，只有对应开关为 `True` 的事件才会推送到该通知器 |
-| 选项级 `options` | `test_message` / `webhook_task` | 因 Schema 与 `EventTypes` 枚举一一对齐而存在的字段，默认 `False`；**前端 UI 未提供勾选入口**，普通用户无法在界面中开启；直接操作 API/数据库可开启但无实际业务意义：`test_message` 仅由测试接口派发且会绕过 options 过滤，`webhook_task` 由调度器每 5 分钟派发一次（会导致过于频繁的通知） |
+| 选项级 `options` | UI 可见的 22 个业务事件字段 | `recipe_created/updated/deleted`、`user_signup`、`mealplan_entry_*`、`shopping_list_*`、`cookbook_*`、`tag_*`、`category_*`、`label_*`；默认全部 `False`；前端 UI（`frontend/app/pages/household/notifiers.vue`）以 8 个分组复选框形式呈现；通过 `getattr(notifier.options, event.event_type.name)` 动态读取，开关为 `True` 才会推送 |
+| 选项级 `options` | `data_migrations` / `data_export` / `data_import` | 因 Schema 与 `EventTypes` 枚举一一对齐而存在的字段，默认 `False`；**前端 UI 未提供勾选入口**，普通用户无法在界面中开启；需绕过前端直接操作 API/数据库才能配置 |
+| 选项级 `options` | `test_message` / `webhook_task` | 因 Schema 与 `EventTypes` 枚举一一对齐而存在的字段，默认 `False`；**前端 UI 未提供勾选入口**；直接操作 API/数据库可开启但无实际业务意义：`test_message` 仅由测试接口派发且会绕过 options 过滤，`webhook_task` 由调度器每 5 分钟派发一次（会导致过于频繁的通知） |
 
 核心过滤逻辑（`AppriseEventListener.get_subscribers()`）：
 ```python
@@ -472,7 +481,7 @@ Apprise 通知偏好的 REST 接口位于 `mealie/routes/households/controller_g
 | 偏好维度 | Webhook | Apprise 通知 |
 |---------|---------|-------------|
 | 总开关 | `enabled`（Webhook 级；测试接口绕过） | `enabled`（通知器级；测试接口绕过） |
-| 事件粒度过滤 | 不按事件类型过滤；仅由**调度时间窗口**隐式控制；所有业务事件均不会触发 Webhook | 每种业务事件独立开关（默认全关；前端 UI 仅呈现业务事件，不呈现 test_message/webhook_task） |
+| 事件粒度过滤 | 不按事件类型过滤；仅由**调度时间窗口**隐式控制；所有业务事件均不会触发 Webhook | 每种业务事件独立开关（默认全关；前端 UI 仅呈现 22 个业务事件，`data_migrations` / `data_export` / `data_import` 及两个内部事件均无 UI 入口） |
 | 目标地址 | 单一 `url` 字段 | `apprise_url`，由 Apprise 协议解析 |
 | 触发时机偏好 | `scheduled_time`（每天某 UTC 时间；测试接口不检查） | 无（即时触发） |
 | 请求内容偏好 | 由 `webhook_type` / `document_type` 隐式决定（当前仅 mealplan） | 自定义 URL 会自动注入事件元数据 query 参数 |
