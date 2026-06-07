@@ -188,7 +188,18 @@ def _add_standardized_unit(self, data):
             # ... 更多映射
 ```
 
-`standardized_unit_map` 构建时会读取当前 locale 的单位种子文件，将每个单位的 `name`、`plural_name`、`abbreviation` 都映射到标准单位 key。
+`standardized_unit_map` 构建时会调用 [IngredientUnitsSeeder.get_file](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/seed/seeders.py#L56-L59) 读取种子文件，其回退逻辑为：
+
+```python
+@classmethod
+def get_file(cls, locale: str | None = None) -> pathlib.Path:
+    locale_path = cls.resources / "units" / "locales" / f"{locale}.json"
+    return locale_path if locale_path.exists() else units.en_US
+```
+
+即：当 locale 为 `None`、或当前 locale 没有对应的种子文件时，**自动回退到英文 `en-US.json`**（默认值见 [units/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/repos/seed/resources/units/__init__.py)）。因此，匹配表中始终至少包含英文单位名。
+
+每个单位的 `name`、`plural_name`、`abbreviation` 都会被规范化后映射到标准单位 key。
 
 ---
 
@@ -309,7 +320,7 @@ def find_match[T: BaseModel](cls, match_value, *, store_map, fuzzy_match_thresho
 
 ### 6.2 后端缩放（购物清单场景）
 
-在 [ShoppingListService.get_shopping_list_items_from_recipe](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L323-L411) 中：
+在 [ShoppingListService.get_shopping_list_items_from_recipe](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L323-L411) 中，每个食材生成购物清单项时：
 
 ```python
 new_item = ShoppingListItemCreate(
@@ -317,18 +328,51 @@ new_item = ShoppingListItemCreate(
     recipe_references=[
         ShoppingListItemRecipeRefCreate(
             recipe_id=recipe_id,
-            recipe_quantity=ingredient.quantity,   # 原始单份量
-            recipe_scale=scale,                    # 份数
+            recipe_quantity=ingredient.quantity,   # 单份原始量（未缩放）
+            recipe_scale=scale,                    # 份数/缩放因子
             recipe_note=ingredient.note or None,
         )
     ],
 )
 ```
 
-关键点：
-1. `quantity` 存储的是 **缩放后** 的实际数量
-2. 同时保留 `recipe_quantity`（单份原始量）和 `recipe_scale`（份数），方便后续按份数增减
-3. 子食谱（referenced_recipe）会递归处理，缩放因子相乘：`sub_scale = ingredient.quantity * scale`
+核心字段关系：
+- `quantity` = **缩放后** 的实际数量（= `ingredient.quantity * scale`）
+- `recipe_quantity` = 单份食谱中的原始量（不随缩放改变）
+- `recipe_scale` = 该食谱被添加的份数（缩放因子）
+- 子食谱（referenced_recipe）会递归处理，缩放因子相乘：`sub_scale = ingredient.quantity * scale`
+
+#### 6.2.1 同食谱内重复食材的数量累加
+
+当同一食谱中多次出现相同食材（如两个条目都是 "cup flour"），在 `get_shopping_list_items_from_recipe` 内部会提前合并（[shopping_lists.py L387-L406](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L387-L406)）：
+
+```python
+# some recipes have the same ingredient multiple times, so we check to see if we can combine them
+merged = False
+for existing_item in list_items:
+    if not self.can_merge(existing_item, new_item):
+        continue
+
+    # since this is the same recipe, we combine the quanities, rather than the scales
+    # all items will have exactly one recipe reference
+    if ingredient.quantity:
+        existing_item.quantity += ingredient.quantity
+        existing_item.recipe_references[0].recipe_quantity += ingredient.quantity
+
+    # merge notes
+    ...
+```
+
+**累加逻辑详解**（以 scale=3、食谱内有 "1 cup flour" 和 "2 cup flour" 为例）：
+
+| 步骤 | existing_item.quantity | existing_item.recipe_quantity | 说明 |
+|------|----------------------|-----------------------------|------|
+| 处理第 1 条 "1 cup flour" | `1 * 3 = 3` (缩放后) | `1` (原始量) | 新条目加入列表 |
+| 处理第 2 条 "2 cup flour" | `3 + 2 = 5` | `1 + 2 = 3` | 累加的是**未缩放**的 `ingredient.quantity` |
+
+⚠️ **注意**：此时代码将 `ingredient.quantity`（未缩放的原始量 2）直接加到了 `existing_item.quantity`（已缩放为 3）上，最终得到 5 而非正确的 `(1+2)*3 = 9`。但 `recipe_quantity` 被正确累计为 3，后续若按份数增减操作仍可用 `recipe_quantity * recipe_scale` 重新计算。
+
+备注合并逻辑：用 `" | "` 分隔符连接去重后的备注集合。
 
 ### 6.3 复数形式决策
 
@@ -370,25 +414,47 @@ use_plural = self.quantity and self.quantity > 1
 
 ### 7.2 对标准化映射的影响
 
-由于 `standardized_unit_map` 的构建依赖当前 locale 的种子文件：
-- 如果用户输入的是德语 "Teelöffel"（茶匙），系统能正确匹配并注入 `standard_quantity=1/6, standard_unit=fluid_ounce`
-- 如果用户使用的 locale 没有对应的种子文件（或用了自定义单位名），则无法自动注入标准化数据，该单位将无法参与跨单位换算
+由于 `standardized_unit_map` 的构建依赖当前 locale 的种子文件（不存在时回退英文），实际影响分三种情况：
+
+| 场景 | 标准化注入结果 |
+|------|--------------|
+| **当前 locale 有种子文件，且用户输入名匹配** | ✅ 正确注入。例如德语 locale 下输入 "Teelöffel" → 匹配 `standard_quantity=1/6, standard_unit=fluid_ounce` |
+| **当前 locale 无种子文件（回退英文），用户输入英文名匹配** | ✅ 仍能注入。例如任何 locale 下输入 "teaspoon" 都能匹配到英文种子数据 |
+| **用户输入了自定义/本地语言名，且在种子（含回退英文）中无匹配** | ❌ 无法自动注入，`standard_quantity` 和 `standard_unit` 均为 `None`，该单位将无法参与跨单位换算。例如德语 locale 无种子文件时，输入 "Teelöffel" 无法匹配 |
+
+**注**：即便自动注入失败，用户仍可在单位管理界面手动填写 `standard_quantity` 和 `standard_unit`，手动配置后即可正常参与换算。
 
 ---
 
 ## 八、未知单位 (Unknown Units) 的影响
 
-当一个单位无法被 Pint 识别（`uc.parse()` 返回原始字符串而非 `pint.Unit`），或者没有标准化数据时：
+"未知单位"在此处指两类：
+1. **Pint 不认识的单位**：`uc.parse()` 返回原始字符串而非 `pint.Unit`（如自定义的 "pinch"、"dash"、"splash" 等计数类单位）
+2. **无标准化数据的单位**：`standard_quantity` 或 `standard_unit` 为 `None`（可能是用户创建时未配置，或本地化种子中无匹配）
 
-### 8.1 单位转换
+### 8.1 单位转换行为
 
-- `UnitConverter.can_convert()` 返回 `False`
-- `UnitConverter.convert()` 和 `merge()` 抛出 `UnitNotFound` 异常
-- `merge_quantity_and_unit()` 抛出 `ValueError: "Both units must contain standardized unit data"`
+- `UnitConverter.can_convert()`：任一单位不被 Pint 识别时返回 `False`
+- `UnitConverter.convert()` / `merge()`：任一单位不被 Pint 识别时抛出 `UnitNotFound` 异常
+- `merge_quantity_and_unit()`：任一单位缺少标准化数据时抛出 `ValueError: "Both units must contain standardized unit data"`
 
-### 8.2 购物清单合并
+### 8.2 对显示 (Display) 的影响
 
-[ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 中的检查：
+未知单位在前后端的显示行为如下：
+
+**后端 Schema 层**（[RecipeIngredientBase._format_*](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/schema/recipe/recipe_ingredient.py#L228-L323)）：
+- **数量格式**：`CreateIngredientUnit.fraction` 默认为 `True`，因此未知单位的数量默认按**分数**格式显示（如 `1 ½` 而非 `1.5`）。若用户手动将单位的 `fraction` 设为 `False`，则改为十进制显示
+- **单位名称**：直接使用单位对象的 `name` / `plural_name` / `abbreviation` / `plural_abbreviation`，是否使用缩写取决于 `use_abbreviation` 标志（默认 `False`）
+- **单复数**：`quantity > 1` 时尝试使用复数形式，若 `plural_name` 未设置则回退到单数 `name`
+
+**前端显示层**（[use-recipe-ingredients.ts](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/frontend/app/composables/recipes/use-recipe-ingredients.ts#L82-L143)）：
+- 同样根据 `unit.fraction` 决定分数/十进制显示（分数最大分母 10，十进制 3 位有效数字）
+- 单位名仅在 `quantity` 非零且存在时才显示（`unitName && quantity` 检查）
+- 若单位缺失（`unit` 为 `undefined`），则单位部分不显示
+
+### 8.3 对购物清单汇总 (Aggregation) 的影响
+
+[ShoppingListService.can_merge](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L45-L71) 中对单位的检查：
 
 ```python
 def can_merge(self, item1, item2) -> bool:
@@ -404,7 +470,16 @@ def can_merge(self, item1, item2) -> bool:
             return False
 ```
 
-**结论**：未知单位（无 `standard_unit`）**只能与完全相同 `unit_id` 的条目合并**。如果两个相同食材的条目使用了不同的未知单位，则无法合并，会在购物清单中显示为两行。
+不同场景的汇总结果：
+
+| 场景 | 能否合并 | 结果 |
+|------|---------|------|
+| 相同 `unit_id`（无论是否有标准化数据） | ✅ 可以 | 数量直接相加，单位不变 |
+| 不同 `unit_id`，**两者都有** `standard_unit` 且量纲兼容 | ✅ 可以 | 调用 `merge_quantity_and_unit` 换算合并 |
+| 不同 `unit_id`，**至少一方无** `standard_unit` | ❌ 不行 | 相同食材显示为两行独立条目 |
+| 不同 `unit_id`，都有 `standard_unit` 但量纲不兼容（如 cup vs pound） | ❌ 不行 | 相同食材显示为两行独立条目 |
+
+**典型案例**：用户创建了自定义单位 " handful "（无标准化数据），又创建了 "sprinkle"（也无标准化数据）。两者都用于同一种食材时，购物清单中会出现两条独立记录，无法自动合并。
 
 ---
 
@@ -438,7 +513,33 @@ def can_merge(self, item1, item2) -> bool:
 
 ### 9.4 同食谱内食材去重
 
-在从食谱生成购物清单项时（[get_shopping_list_items_from_recipe](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L387-L406)），同一食谱内重复的食材会在生成阶段就合并，而不是等到后续的批量创建阶段。
+在从食谱生成购物清单项时（[get_shopping_list_items_from_recipe](file:///d:/fz/0601/solo-dogfeeding/code/74-mealie/mealie/services/household_services/shopping_lists.py#L387-L406)），同一食谱内重复的食材会在生成阶段就合并，而不是等到后续的批量创建阶段。详细累加逻辑见 [6.2.1 节](#621-同食谱内重复食材的数量累加)。
+
+### 9.5 跨食谱（不同 recipe_id）合并行为
+
+当**不同食谱**的相同食材被添加到同一购物清单时（经过 `bulk_create_items` → `merge_items`），合并行为与同食谱内不同：
+
+1. **数量合并**：若单位有标准化数据，调用 `merge_quantity_and_unit` 做单位换算后合并；否则直接相加
+2. **食谱引用合并**：不同 `recipe_id` 的引用各自保留，相同 `recipe_id` 的引用累加 `recipe_scale`
+
+```python
+# merge_items 中对 recipe_references 的处理
+updated_refs = {ref.recipe_id: ref for ref in from_item.recipe_references}
+for to_ref in to_item.recipe_references:
+    if to_ref.recipe_id not in updated_refs:
+        updated_refs[to_ref.recipe_id] = to_ref
+        continue
+
+    # merge recipe scales
+    base_ref = updated_refs[to_ref.recipe_id]
+    if base_ref.recipe_scale is None:
+        base_ref.recipe_scale = 1
+    if to_ref.recipe_scale is None:
+        to_ref.recipe_scale = 1
+    base_ref.recipe_scale += to_ref.recipe_scale
+```
+
+此时 `quantity` 是两个条目的缩放后数量直接合并，而 `recipe_scale` 按 recipe_id 分别累加，两者保持一致。
 
 ---
 
@@ -462,11 +563,14 @@ def can_merge(self, item1, item2) -> bool:
 
 ## 十一、关键约束与潜在风险
 
-| 场景 | 限制 | 影响 |
-|------|------|------|
-| 未知/自定义单位 | 无 `standard_unit` 则无法跨单位换算 | 购物清单中相同食材不同单位会显示多行 |
-| 盎司歧义 | 仅在与体积单位合用时才自动转液盎司 | 纯盎司合并（如 8 oz + 1 lb）按重量处理 |
-| 模糊匹配阈值 | 食材 85/单位 70/购物清单 80 | 拼写差异过大可能匹配失败 |
-| 非 ASCII 字符 | 规范化时使用 unidecode 转写 | 某些语言（如中文）转写后可能完全丢失语义，匹配依赖于别名 |
-| 本地化种子 | 部分 locale 可能没有单位种子数据 | 无法自动注入标准化信息，用户需手动配置 |
-| 分数显示 | 最大分母 32（后端）/ 10（前端） | 某些精确小数无法以分数准确表示 |
+| 场景 | 限制 / 行为 | 影响 |
+|------|------------|------|
+| 未知/自定义单位 | 无 `standard_unit` 则无法跨单位换算 | 购物清单中相同食材、不同未知单位会显示为多行；只有相同 `unit_id` 才能合并 |
+| 未知单位显示 | `fraction` 默认为 `True`，`use_abbreviation` 默认为 `False` | 数量默认以分数格式显示，单位默认使用全名而非缩写 |
+| 盎司歧义消除 | 仅在与体积单位合用时才自动转液盎司 | 纯盎司合并（如 8 oz + 1 lb）按重量处理；单独的盎司条目保持不变 |
+| 模糊匹配阈值 | 食材 85 / 单位 70 / 购物清单标签匹配 80 | 拼写差异过大可能匹配失败，需要手动纠正或添加别名 |
+| 非 ASCII 字符 | 规范化时使用 unidecode 转写 | 中文等表意文字转写后可能完全丢失语义，匹配严重依赖于用户创建的别名 |
+| 本地化种子缺失 | 缺失 locale 文件时自动回退英文 `en-US.json` | 英文单位名始终可匹配标准化；纯本地语言名在无对应 locale 种子时无法自动注入标准化 |
+| 同食谱重复食材累加 | 累加的是未缩放的 `ingredient.quantity` 而非已缩放的 `new_item.quantity` | 可能导致 `quantity` 字段值不准确；但 `recipe_quantity` 被正确累计，按份数增减时仍可用 `recipe_quantity * recipe_scale` |
+| 分数显示精度 | 最大分母 32（后端 `limit_denominator`）/ 10（前端 `frac`） | 某些精确小数无法以分数准确表示，会有舍入误差 |
+| 未勾选合并约束 | 已勾选 (`checked=true`) 的条目永不参与合并 | 购物清单中手动勾选过的相同食材会保持为独立行 |
