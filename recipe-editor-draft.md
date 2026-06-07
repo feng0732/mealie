@@ -348,10 +348,188 @@ new_data = self.group_recipes.update(recipe.slug, update_data)  # 写
 
 ### 6.8 认证状态变化的跨 Tab 传播边界
 
-虽然 Cookie 是共享的，但认证状态的内存表示（`authStatus` ref）不跨 Tab 同步：
-- Tab A 执行 `signOut()` → 清 Cookie + `authStatus = "unauthenticated"` + 跳转 `/login`
-- Tab B 的 `authStatus` ref 仍为 `"authenticated"`，直到下一次需要 token 的 API 调用返回 401 才会被 `handleAuthError` 重置
-- 对 Recipe 编辑的直接影响：Tab A 登出后，Tab B 仍可继续编辑，但保存时会因 401 失败，且 `saveRecipe()` 没有友好错误提示
+虽然 Cookie 是共享的，但认证状态的内存表示（`authStatus` ref）不跨 Tab 同步。下面以"Tab A 登出 → Tab B 保存 Recipe 失败"为场景，逐步拆解完整代码链路。
+
+#### 阶段一：Tab A 执行 signOut()
+
+调用链：`useMealieAuth().signOut()` → `useAuthBackend().signOut()`
+
+```typescript
+// use-auth-backend.ts signOut()
+async function signOut(callbackUrl: string = ""): Promise<void> {
+  try {
+    await $axios.post("/api/auth/logout");   // 可选调用后端 logout API
+  }
+  finally {
+    setToken(null);                          // 1. 清 Cookie
+    authUser.value = null;                   // 2. 清 Tab A 的内存 ref
+    authStatus.value = "unauthenticated";    // 3. 更新 Tab A 的内存状态
+    clearAllStores();
+    clearNuxtData();
+    await router.push(callbackUrl || "/login"); // 4. Tab A 跳转 /login
+  }
+}
+```
+
+关键副作用：
+- `setToken(null)` 通过 Nuxt 的 `useCookie()` 将 Cookie 设置为 `null` → 浏览器 Cookie Jar 被更新
+- 由于 HTTP Cookie 是浏览器级资源，**同源下所有 Tab 共享同一个 Cookie Jar**，因此 Tab B 的 Cookie 也被同步清除（这是浏览器行为，不是 JS 主动通知）
+- 但 `authUser` 和 `authStatus` 是 **ES 模块顶层 ref**，仅存在于 Tab A 的 JS 运行时内存中，对 Tab B 不可见
+
+#### 阶段二：Tab B 点击保存，发起 API 请求
+
+```typescript
+// RecipePage.vue saveRecipe()
+async function saveRecipe() {
+  const { data, error } = await api.recipes.updateOne(recipe.value.slug, recipe.value);
+  // ... 后续处理
+}
+```
+
+完整调用链：
+```
+saveRecipe()
+  → RecipeAPI.updateOne()                        [frontend/app/lib/api/user/recipes/recipe.ts]
+    → BaseCRUDAPI.updateOne()                    [frontend/app/lib/api/base/base-clients.ts]
+      → requests.put()                           [frontend/app/composables/api/api-client.ts]
+        → request.safe(axiosInstance.put, ...)   [frontend/app/composables/api/api-client.ts]
+          → axiosInstance.put(url, payload)      [触发 axios 拦截器链]
+```
+
+#### 阶段三：axios 请求拦截器读取 Cookie
+
+`frontend/app/plugins/axios.ts` 的请求拦截器在每个请求发出前执行：
+
+```typescript
+axiosInstance.interceptors.request.use((config) => {
+  const token = useCookie(tokenName).value;  // 从浏览器 Cookie 读取
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+```
+
+此时由于 Tab A 已经清除了 Cookie，`useCookie(tokenName).value` 返回 `null` / `undefined` → **请求不携带 Authorization header** 直接发出。
+
+#### 阶段四：后端返回 401，axios 响应拦截器处理
+
+后端 FastAPI 依赖检查 token 缺失或无效 → 返回 `401 Unauthorized`。
+
+`frontend/app/plugins/axios.ts` 的响应拦截器处理错误分支：
+
+```typescript
+axiosInstance.interceptors.response.use(
+  (response) => { ... },
+  (error) => {
+    // 优先 toast 显示后端消息
+    if (error?.response?.data?.detail?.message) {
+      alert.error(error.response.data.detail.message as string);
+    }
+
+    // 401 处理
+    if (error?.response?.status === 401) {
+      const tokenCookie = useCookie(tokenName);
+      // 关键判断：只有当本地 Cookie 仍有值时才执行跳转
+      if (tokenCookie.value) {        // ← 漏洞点：Tab A 已清 Cookie，此处为 false！
+        tokenCookie.value = null;
+        window.onbeforeunload = null;
+        window.location.href = "/login";
+      }
+    }
+
+    return Promise.reject(error);  // 继续抛出错误给上层
+  },
+);
+```
+
+**关键判断漏洞**：`if (tokenCookie.value)` 这个条件在跨 Tab 登出场景下为 `false`（因为 Cookie 已被 Tab A 清除）。因此：
+- ❌ 不执行 `window.location.href = "/login"` 跳转
+- ❌ 不清除本地任何内存状态
+- ✅ 仅执行 `return Promise.reject(error)` 把错误抛给上层
+
+（如果是本 Tab 自己 token 过期导致的 401，则 `tokenCookie.value` 仍有值，会正常跳转到 `/login`）
+
+#### 阶段五：API client 层吞掉异常
+
+`frontend/app/composables/api/api-client.ts` 中 `request.safe()` 捕获 Promise rejection：
+
+```typescript
+const request = {
+  async safe<T, U>(funcCall, url, data, config) {
+    let error = null;
+    const response = await funcCall(url, data, config).catch(function (e) {
+      console.log(e);             // 仅打印到控制台
+      error = e;                  // 存到 error 变量
+      return null;                // 返回 null 而非继续抛异常
+    });
+    return { response, error, data: response?.data ?? null };
+  },
+};
+```
+
+**异常不再向上冒泡**，而是被包装成 `{ response: null, error: e, data: null }` 的正常返回值。
+
+#### 阶段六：saveRecipe() 静默失败
+
+回到 `RecipePage.vue`：
+
+```typescript
+async function saveRecipe() {
+  const { data, error } = await api.recipes.updateOne(recipe.value.slug, recipe.value);
+  if (!error) {                   // error 不为 null → 跳过
+    setMode(PageMode.VIEW);
+  }
+  if (data?.slug) {               // data 为 null → 跳过
+    recipe.value = data;
+    originalRecipe.value = deepCopy(recipe.value);
+    // router.replace(...)
+  }
+  // 函数结束，无任何 UI 反馈给用户
+}
+```
+
+两个 `if` 分支均不执行，编辑器仍停留在 EDIT 模式，用户完全不知道保存失败。
+
+#### 阶段七：authStatus ref 不同步的根因
+
+整个链路中有两处地方会更新 `authStatus`，但跨 Tab 登出场景都未触发：
+
+| 更新 authStatus 的位置 | 触发条件 | 本场景是否触发 |
+|----------------------|---------|-------------|
+| `use-auth-backend.ts` → `signOut()` | 本 Tab 主动调用登出 | ❌ 是 Tab A 调用，不是 Tab B |
+| `use-auth-backend.ts` → `handleAuthError()` | auth 相关 API（`signIn`、`getSession`、`refresh`）返回 401 | ❌ `saveRecipe()` 走的是通用 axios 拦截器，不经过 `handleAuthError()` |
+| `axios.ts` 响应拦截器 401 分支 | Cookie 仍有值时跳转 `/login` | ❌ Cookie 已被清除，条件不满足 |
+
+因此 Tab B 的内存中：
+- `authStatus.value` 仍为 `"authenticated"`
+- `authUser.value` 仍保留旧用户对象
+- UI 上的头像、用户名显示正常
+- `isOwnGroup` 权限判断仍返回 `true`
+- 编辑器继续允许修改，但所有需要认证的 API 调用都会失败
+
+#### 小结：跨 Tab 登出的失效链路
+
+```
+Tab A signOut()
+    │
+    ├─ setToken(null) ──── 浏览器 Cookie Jar 同步清除
+    │                           │
+    │                           ▼
+    │                   Tab B 请求拦截器读 Cookie → null → 无 Authorization header
+    │                           │
+    │                           ▼
+    │                   后端返回 401 Unauthorized
+    │                           │
+    │                           ▼
+    │                   Tab B 响应拦截器: if (tokenCookie.value) → false → 不跳转
+    │                           │
+    │                           ▼
+    │                   request.safe() catch → { response:null, error:e, data:null }
+    │                           │
+    │                           ▼
+    └─ authStatus 仅更新 Tab A 内存    saveRecipe() 静默失败，Tab B authStatus 仍为 authenticated
+```
 
 ---
 
@@ -376,3 +554,7 @@ new_data = self.group_recipes.update(recipe.slug, update_data)  # 写
 | 认证后端（Cookie + authStatus ref） | `frontend/app/composables/use-auth-backend.ts` | 24-142 |
 | 认证插件初始化 | `frontend/app/plugins/init-auth.client.ts` | 1-9 |
 | Mealie Auth 包装 | `frontend/app/composables/use-mealie-auth.ts` | 1-56 |
+| axios 插件（请求/响应拦截器 + 401 分支） | `frontend/app/plugins/axios.ts` | 1-64 |
+| API 请求包装层（request.safe 吞异常） | `frontend/app/composables/api/api-client.ts` | 8-66 |
+| API 入口导出 | `frontend/app/composables/api/index.ts` | 1-2 |
+| BaseCRUDAPI 抽象类 | `frontend/app/lib/api/base/base-clients.ts` | 16-82 |
