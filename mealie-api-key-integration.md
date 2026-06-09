@@ -437,3 +437,484 @@ def dispatch(self, integration_id, group_id, household_id, event_type, document_
 | [credentials_provider.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/core/security/providers/credentials_provider.py) | 用户名密码认证实现 |
 | [api-tokens.vue](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/pages/user/profile/api-tokens.vue) | 前端 Token 管理页面 |
 | [users.ts](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/lib/api/user/users.ts) | 前端用户/Token API 封装 |
+
+---
+
+## 七、普通用户权限模型与 OperationChecks
+
+### 7.1 用户权限字段定义
+
+用户权限存储在数据库 `users` 表中，ORM 模型定义在 [users.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/users/users.py#L78-L82)：
+
+```python
+# Permissions
+can_manage_household: Mapped[bool | None] = mapped_column(Boolean, default=False)
+can_manage:         Mapped[bool | None] = mapped_column(Boolean, default=False)
+can_invite:         Mapped[bool | None] = mapped_column(Boolean, default=False)
+can_organize:       Mapped[bool | None] = mapped_column(Boolean, default=False)
+admin:              Mapped[bool | None] = mapped_column(Boolean, default=False)
+```
+
+**权限层级与关联设置逻辑**（[users.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/users/users.py#L207-L226)）：
+
+```python
+def _set_permissions(self, admin, can_manage_household=False, can_manage=False, can_invite=False, can_organize=False, **_):
+    self.admin = admin
+    if self.admin:
+        # 管理员自动拥有所有权限
+        self.can_manage_household = True
+        self.can_manage = True
+        self.can_invite = True
+        self.can_organize = True
+        self.advanced = True
+    else:
+        # 普通用户按字段分别设置
+        self.can_manage_household = can_manage_household
+        self.can_manage = can_manage
+        self.can_invite = can_invite
+        self.can_organize = can_organize
+```
+
+| 权限字段 | 说明 |
+|----------|------|
+| `admin` | 超级管理员，可跨 Group/Household 操作，自动拥有全部其他权限 |
+| `can_manage` | 组级管理权限，可设置用户权限、管理 Group 级别资源 |
+| `can_manage_household` | 家庭级管理权限，可修改家庭偏好设置 |
+| `can_invite` | 可创建邀请链接、发送邀请邮件 |
+| `can_organize` | 可创建/修改/删除标签、分类、食谱等组织类资源 |
+
+### 7.2 OperationChecks 统一检查类
+
+所有控制器通过 `self.checks` 访问权限检查方法，其实现位于 [checks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/_base/checks.py)：
+
+```python
+class OperationChecks:
+    user: PrivateUser
+    ForbiddenException = HTTPException(status.HTTP_403_FORBIDDEN)
+
+    def can_manage_household(self) -> bool:
+        if not self.user.can_manage_household:
+            raise self.ForbiddenException
+        return True
+
+    def can_manage(self) -> bool:
+        if not self.user.can_manage:
+            raise self.ForbiddenException
+        return True
+
+    def can_invite(self) -> bool:
+        if not self.user.can_invite:
+            raise self.ForbiddenException
+        return True
+
+    def can_organize(self) -> bool:
+        if not self.user.can_organize:
+            raise self.ForbiddenException
+        return True
+```
+
+**设计特点**：
+- 检查不通过时直接抛出 `HTTP 403 Forbidden`，调用方无需额外处理返回值
+- 通过 `BaseUserController.checks` 懒加载属性注入（[base_controllers.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/_base/base_controllers.py#L169-L172)）
+
+### 7.3 权限检查的实际调用场景
+
+#### 场景 1：组织类操作（can_organize）
+以标签管理为例，[controller_tags.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_tags.py) 中所有写操作均检查：
+
+```python
+@router.post("", status_code=201)
+def create_one(self, tag: TagIn):
+    self.checks.can_organize()  # ← 写操作必须检查
+    ...
+
+@router.put("/{item_id}")
+def update_one(self, item_id: UUID4, new_tag: TagIn):
+    self.checks.can_organize()
+    ...
+
+@router.delete("/{item_id}")
+def delete_recipe_tag(self, item_id: UUID4):
+    self.checks.can_organize()
+    ...
+```
+
+#### 场景 2：家庭偏好设置（can_manage_household）
+[controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L58-L62)：
+
+```python
+@router.put("/preferences", response_model=ReadHouseholdPreferences)
+def update_household_preferences(self, new_pref: UpdateHouseholdPreferences):
+    self.checks.can_manage_household()
+    return self.repos.household_preferences.update(self.household_id, new_pref)
+```
+
+#### 场景 3：用户权限管理（can_manage）
+[controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L64-L87) 中不仅检查 `can_manage`，还额外做了三层范围校验：
+
+```python
+@router.put("/permissions", response_model=UserOut)
+def set_member_permissions(self, permissions: SetPermissions):
+    self.checks.can_manage()  # ① 必须有组管理权限
+
+    target_user = self.repos.users.get_one(permissions.user_id)
+    if target_user.group_id != self.group_id:          # ② 目标用户必须同 Group
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="User is not a member of this group")
+    if target_user.household_id != self.household_id:  # ③ 目标用户必须同 Household
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="User is not a member of this household")
+    if target_user.id == self.user.id:                  # ④ 不能修改自己的权限
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="User is not allowed to change their own permissions")
+    ...
+```
+
+#### 场景 4：邀请功能（can_invite + 特殊范围限制）
+[controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L33-L55)：
+
+```python
+@router.post("", response_model=ReadInviteToken, status_code=status.HTTP_201_CREATED)
+def create_invite_token(self, body: CreateInviteToken):
+    if not self.user.can_invite:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="User is not allowed to create invite tokens")
+
+    body.group_id = body.group_id or self.group_id
+    body.household_id = body.household_id or self.household_id
+
+    # 非管理员只能为自己的 Group/Household 创建邀请
+    if not self.user.admin and (body.group_id != self.group_id or body.household_id != self.household_id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only admins can create invite tokens for other groups or households")
+    ...
+```
+
+---
+
+## 八、Group / Household 数据范围隔离机制
+
+Mealie 采用「Group（组）→ Household（家庭）」两级组织架构，所有数据查询通过 Repository 层的 `_filter_builder` 自动注入范围过滤，实现 API Key 携带的用户只能访问其所属范围内的数据。
+
+### 8.1 两级组织架构模型
+
+**Group 模型**: [group.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/group/group.py)
+- 一个 Group 可包含多个 Household
+- Group 级资源：分类（Category）、用户、标签组、AI 配置、数据导出等
+
+**Household 模型**: [household.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/household.py)
+- Household 从属于一个 Group（`group_id` 外键）
+- Household 级资源：食谱、购物清单、餐计划、Webhook、通知器、Cookbook 等
+
+**User 与两级组织的关联**: 每个用户同时属于一个 Group 和一个 Household（[users.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/users/users.py#L63-L68)）
+
+```python
+group_id: FilterableColumn[GUID] = mapped_column(GUID, ForeignKey("groups.id"), nullable=False, index=True)
+group: Mapped["Group"] = orm.relationship("Group", back_populates="users")
+
+household_id: FilterableColumn[GUID | None] = mapped_column(GUID, ForeignKey("households.id"), nullable=True, index=True)
+household: Mapped["Household"] = orm.relationship("Household", back_populates="users")
+```
+
+### 8.2 Repository 层的三类访问控制
+
+Repository 层在 [repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py) 中定义了三个基类，通过构造函数强制传入范围参数：
+
+```python
+class RepositoryGeneric[Schema, Model]:
+    """无范围过滤 — 仅由管理员或内部系统使用"""
+    _group_id: UUID4 | None = None
+    _household_id: UUID4 | None = None
+
+class GroupRepositoryGeneric[Schema, Model](RepositoryGeneric[Schema, Model]):
+    """Group 级范围 — 自动注入 group_id 过滤"""
+    def __init__(self, session, primary_key, sql_model, schema, *, group_id: UUID4 | None | NotSet):
+        super().__init__(...)
+        if group_id is NOT_SET:
+            raise ValueError("group_id must be set")  # ← 强制校验
+        self._group_id = group_id if group_id else None
+
+class HouseholdRepositoryGeneric[Schema, Model](RepositoryGeneric[Schema, Model]):
+    """Household 级范围 — 自动注入 group_id + household_id 过滤"""
+    def __init__(self, session, primary_key, sql_model, schema, *, group_id, household_id):
+        super().__init__(...)
+        if group_id is NOT_SET:
+            raise ValueError("group_id must be set")
+        if household_id is NOT_SET:
+            raise ValueError("household_id must be set")  # ← 强制校验
+        self._group_id = group_id if group_id else None
+        self._household_id = household_id if household_id else None
+```
+
+### 8.3 自动范围注入的核心逻辑
+
+所有查询方法（`get_one`、`multi_query`、`page_all` 等）都通过 `_filter_builder` 自动拼接过滤条件：
+
+```python
+# [repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py#L94-L102)
+def _filter_builder(self, **kwargs) -> dict[str, Any]:
+    dct = {}
+    if self.group_id:
+        dct["group_id"] = self.group_id      # ← 自动注入 Group 过滤
+    if self.household_id:
+        dct["household_id"] = self.household_id  # ← 自动注入 Household 过滤
+    return {**dct, **kwargs}
+```
+
+**调用示例**（`_query_one`）：
+```python
+def _query_one(self, match_value, match_key=None):
+    fltr = self._filter_builder(**{match_key: match_value})  # 自动加上范围条件
+    return self.session.execute(self._query().filter_by(**fltr)).unique().scalars().one()
+```
+
+这意味着即使用户通过 API Key 直接传入一个其他 Group 的资源 ID，查询也会因 `filter_by(group_id=...)` 条件不匹配而返回空。
+
+### 8.4 典型 Repository 的范围分类
+
+| Repository 类型 | 示例资源 | 代码位置 |
+|-----------------|----------|----------|
+| `GroupRepositoryGeneric` | API Token、用户、分类、标签、通知器、Webhook | [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L190-L192) |
+| `HouseholdRepositoryGeneric` | 食谱、购物清单、餐计划、Cookbook、家庭偏好 | [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L240-L243) |
+| `RepositoryGeneric`（无范围） | 仅限 `get_current_user` 内部调用、管理员路由 | — |
+
+### 8.5 控制器基类决定 Repository 的范围
+
+控制器基类在 `@property repos` 中自动使用当前用户的 Group/Household ID 创建 Repository：
+
+```python
+# [base_controllers.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/_base/base_controllers.py#L47-L50)
+@property
+def repos(self):
+    if not self._repos:
+        # 使用当前用户的 group_id 和 household_id
+        self._repos = AllRepositories(self.session, group_id=self.group_id, household_id=self.household_id)
+    return self._repos
+```
+
+- `BaseUserController`：`self.group_id = user.group_id`, `self.household_id = user.household_id` → **仅能访问本家庭数据**
+- `BaseAdminController`：`self._repos = AllRepositories(session, group_id=None, household_id=None)` → **管理员无范围限制**
+
+### 8.6 Router 级别的强制认证
+
+在 [routers.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/_base/routers.py) 中定义的路由类通过 `dependencies` 参数强制所有子路由必须认证：
+
+```python
+class AdminAPIRouter(APIRouter):
+    """管理员路由 — 所有子路由自动注入 get_admin_user"""
+    def __init__(self, tags=None, prefix="", **kwargs):
+        super().__init__(tags=tags, prefix=prefix, dependencies=[Depends(get_admin_user)], **kwargs)
+
+class UserAPIRouter(APIRouter):
+    """用户路由 — 所有子路由自动注入 get_current_user"""
+    def __init__(self, tags=None, prefix="", **kwargs):
+        super().__init__(tags=tags, prefix=prefix, dependencies=[Depends(get_current_user)], **kwargs)
+```
+
+这意味着外部应用使用 API Key 访问 `UserAPIRouter` 下的任何端点时，都会先经过 `get_current_user` 校验，确保 Token 有效且用户存在。
+
+---
+
+## 九、Webhook 与通知（Apprise）消费的权限差异
+
+Mealie 的事件总线有两种下游消费者：**Webhook（定时触发的数据推送）** 和 **Apprise 通知（实时事件通知）**，两者在触发时机、数据内容、权限模型上有本质区别。
+
+### 9.1 事件总线的两条消费链路
+
+```
+EventBusService.dispatch(event)
+    │
+    ├──→ AppriseEventListener  → ApprisePublisher  → 第三方通知渠道（Slack/邮件/Telegram 等）
+    │     （实时事件触发，发送 title + body 文本消息）
+    │
+    └──→ WebhookEventListener  → WebhookPublisher  → 用户配置的 HTTP URL
+          （仅定时任务触发 webhook_task 事件，POST 完整数据 JSON）
+```
+
+### 9.2 AppriseEventListener（通知）
+
+**代码位置**: [event_bus_listeners.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L72-L132)
+
+#### 9.2.1 通知数据模型
+
+每个通知器（Notifier）按事件类型精细订阅，配置存储在 `group_events_notifiers` 表：
+
+- **数据库模型**: [GroupEventNotifierModel](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/events.py#L60-L83)
+- **订阅选项模型**: [GroupEventNotifierOptions](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/group_events.py#L13-L54)
+
+每个事件类型（如 `recipe_created`、`tag_updated`）对应一个独立的布尔字段，用户可独立开关：
+
+```python
+class GroupEventNotifierOptions(MealieModel):
+    recipe_created: bool = False
+    recipe_updated: bool = False
+    recipe_deleted: bool = False
+    user_signup: bool = False
+    mealplan_entry_created: bool = False
+    shopping_list_created: bool = False
+    # ... 其他事件类型
+```
+
+#### 9.2.2 订阅者筛选逻辑
+
+```python
+def get_subscribers(self, event: Event) -> list[str]:
+    with self.ensure_repos(self.group_id, self.household_id) as repos:
+        notifiers = repos.group_event_notifier.multi_query(
+            {"enabled": True}, override_schema=GroupEventNotifierPrivate
+        )
+        # 仅返回对该事件类型订阅了的通知器 URL
+        urls = [n.apprise_url for n in notifiers if getattr(n.options, event.event_type.name)]
+        urls = AppriseEventListener.update_urls_with_event_data(urls, event)
+    return urls
+```
+
+**范围约束**：`repos.group_event_notifier` 是 `HouseholdRepositoryGeneric`，自动按当前 Household 过滤，不会触发其他家庭的通知器。
+
+#### 9.2.3 ApprisePublisher 实际发送
+
+**位置**: [publisher.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/publisher.py#L14-L37)
+
+```python
+class ApprisePublisher:
+    def publish(self, event: Event, notification_urls: list[str]):
+        for dest in notification_urls:
+            tag = str(event.event_id)
+            self.apprise.add(dest, tag=tag)
+        # 仅发送 title + body，不包含完整业务数据
+        self.apprise.notify(title=event.message.title, body=event.message.body, tag=tags)
+```
+
+**关键特征**：
+- **通知内容极简**：只包含 `event.message.title` 和 `event.message.body`（人类可读文本），不暴露食谱详情、用户信息等敏感数据
+- **支持自定义参数扩展**：对 `form`、`json`、`xml` 等结构化 URL，通过 query params 注入 `event_type`、`integration_id`、`document_data`、`event_id`、`timestamp`（[event_bus_listeners.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L91-L109)）
+
+### 9.3 WebhookEventListener（数据推送）
+
+**代码位置**: [event_bus_listeners.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L134-L179)
+
+#### 9.3.1 Webhook 数据模型
+
+Webhook 配置存储在 `webhook_urls` 表：
+- **数据库模型**: [GroupWebhooksModel](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/webhooks.py#L16-L40)
+- **关键字段**：`url`、`enabled`、`webhook_type`（目前仅 `"mealplan"`）、`scheduled_time`（每日触发时间）
+
+#### 9.3.2 与 Apprise 的核心差异
+
+Webhook **不响应实时 CRUD 事件**，仅响应定时任务触发的 `webhook_task` 事件：
+
+```python
+def get_subscribers(self, event: Event) -> list[ReadWebhook]:
+    # 仅处理 webhook_task 类型事件 + EventWebhookData 数据
+    if not (event.event_type == EventTypes.webhook_task and isinstance(event.document_data, EventWebhookData)):
+        return []  # ← 所有实时 CRUD 事件都不会触发 Webhook
+
+    return self.get_scheduled_webhooks(
+        event.document_data.webhook_start_dt, event.document_data.webhook_end_dt
+    )
+```
+
+Webhook 的触发由 [post_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/scheduler/tasks/post_webhooks.py) 定时任务每日在指定时间执行。
+
+#### 9.3.3 WebhookPublisher 实际发送
+
+**位置**: [publisher.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/publisher.py#L40-L49)
+
+```python
+class WebhookPublisher:
+    def publish(self, event: Event, notification_urls: list[str]):
+        event_payload = jsonable_encoder(event)  # ← 发送完整 Event 对象（含 document_data）
+        for url in notification_urls:
+            requests.post(url, json=event_payload, timeout=15)
+```
+
+**关键特征**：
+- **发送完整 Event JSON**：包括 `integration_id`、`document_data`（完整业务数据）、`event_id`、`timestamp`
+- **内容取决于 document_type**：当前仅支持 `mealplan`，会查询并发送指定时间范围内的全部餐计划数据（[event_bus_listeners.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/event_bus_listeners.py#L153-L159)）
+
+### 9.4 Apprise vs Webhook 对比总结
+
+| 维度 | Apprise 通知 | Webhook 数据推送 |
+|------|-------------|----------------|
+| **触发时机** | 实时 CRUD 事件发生时 | 每日定时任务（scheduled_time） |
+| **事件范围** | 所有 EventTypes（按订阅开关） | 仅 `webhook_task` 事件 |
+| **发送内容** | `title` + `body`（简短文本） | 完整 Event JSON（含 `document_data` 业务数据） |
+| **数据敏感性** | 低（无用户/食谱详情） | 高（含完整餐计划/食谱数据） |
+| **integration_id 暴露** | 通过 URL query params（仅限结构化协议） | 直接在 JSON body 中 |
+| **配置位置** | Household → Notifiers | Household → Webhooks |
+| **权限要求** | Household 成员可配置 | Household 成员可配置 |
+| **数据库表** | `group_events_notifiers` + `group_events_notifier_options` | `webhook_urls` |
+| **Publisher 实现** | `ApprisePublisher`（apprise 库） | `WebhookPublisher`（requests.post） |
+
+---
+
+## 十、API Key 权限边界全景图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                          API Key 请求进入系统                                      │
+│                  Authorization: Bearer <long_lived_jwt>                           │
+└──────────────────────────────────┬───────────────────────────────────────────────┘
+                                   │
+          ┌────────────────────────▼────────────────────────┐
+          │  Layer 1: 身份认证（get_current_user）            │
+          │  • JWT 签名校验（HS256 + settings.SECRET）        │
+          │  • JWT 过期时间校验（exp claim）                  │
+          │  • long_token 标识 → 查 DB 确认 Token 未被吊销     │
+          │  • 返回 PrivateUser 对象                          │
+          └────────────────────────┬────────────────────────┘
+                                   │
+          ┌────────────────────────▼────────────────────────┐
+          │  Layer 2: Router 级认证（UserAPIRouter）          │
+          │  • dependencies=[Depends(get_current_user)]     │
+          │  • 未通过直接返回 401                             │
+          └────────────────────────┬────────────────────────┘
+                                   │
+          ┌────────────────────────▼────────────────────────┐
+          │  Layer 3: 数据范围隔离（Repository 层）            │
+          │  • AllRepositories(group_id=user.group_id,       │
+          │                    household_id=user.household_id)│
+          │  • _filter_builder 自动注入 group_id + household_id│
+          │  • 跨范围 ID 查询返回空 → 404                      │
+          └────────────────────────┬────────────────────────┘
+                                   │
+          ┌────────────────────────▼────────────────────────┐
+          │  Layer 4: 功能权限检查（OperationChecks）         │
+          │  • can_organize: 标签/分类/食谱 CRUD              │
+          │  • can_manage_household: 家庭偏好设置             │
+          │  • can_manage: 用户权限管理、组级配置              │
+          │  • can_invite: 创建邀请链接/邮件                  │
+          │  • admin: 跳过所有范围限制 + 拥有全部权限          │
+          └────────────────────────┬────────────────────────┘
+                                   │
+          ┌────────────────────────▼────────────────────────┐
+          │  Layer 5: 业务逻辑 + 事件发布                      │
+          │  • publish_event(event_type, document_data)      │
+          │  • 携带 integration_id 注入 Event 对象            │
+          └────────────────────────┬────────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+          ┌─────────▼──────────┐      ┌──────────▼───────────┐
+          │ Apprise 通知        │      │ Webhook 数据推送     │
+          │ • 实时触发          │      │ • 每日定时触发       │
+          │ • title + body 文本 │      │ • 完整 Event JSON    │
+          │ • 低敏感            │      │ • 含业务数据（高敏感）│
+          └────────────────────┘      └──────────────────────┘
+```
+
+---
+
+## 十一、补充文件索引
+
+| 文件 | 职责 |
+|------|------|
+| [checks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/_base/checks.py) | OperationChecks 权限检查类实现 |
+| [routers.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/_base/routers.py) | AdminAPIRouter / UserAPIRouter 路由级强制认证 |
+| [repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py) | 三级 Repository 基类、_filter_builder 范围注入 |
+| [household_permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/household_permissions.py) | SetPermissions 设置用户权限请求模型 |
+| [group_events.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/group_events.py) | GroupEventNotifierOptions 按事件类型订阅配置 |
+| [events.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/events.py) | GroupEventNotifierModel / GroupEventNotifierOptionsModel ORM |
+| [webhooks.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/webhooks.py) | GroupWebhooksModel Webhook 配置 ORM |
+| [publisher.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/publisher.py) | ApprisePublisher / WebhookPublisher 两种发送实现 |
+| [event_bus_listeners.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/services/event_bus_service/event_bus_listeners.py) | AppriseEventListener / WebhookEventListener 订阅筛选逻辑 |
+| [controller_tags.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_tags.py) | can_organize 检查示例（标签 CRUD） |
+| [controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py) | can_invite + 范围限制检查示例 |
+| [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py) | can_manage_household / can_manage 检查示例 |
+| [group.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/group/group.py) | Group ORM 模型（两级组织架构顶层） |
+| [household.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/household.py) | Household ORM 模型（两级组织架构底层） |
