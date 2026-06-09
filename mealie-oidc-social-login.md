@@ -244,13 +244,86 @@ if settings.OIDC_REQUIRES_GROUP_CLAIM:                           # ← 进入条
 
 | 场景 | Level 1 结果 | Level 2 结果 | 最终认证结果 |
 |------|-------------|-------------|------------|
-| `OIDC_REQUIRES_GROUP_CLAIM=False`；id_token 有 name/email/user_claim | 通过 → 发 token | 不执行 | ✅ 成功 |
+| `OIDC_REQUIRES_GROUP_CLAIM=False`（两个组都未配置）；id_token 有 name/email/user_claim | 通过 → 发 token | 不执行 | ✅ 成功 |
 | `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token 有 name/email/user_claim **且有 groups claim**；groups 满足 USER_GROUP 或 ADMIN_GROUP | 通过 → 发 token | 不执行 | ✅ 成功 |
-| `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token **缺少 groups claim** | `MissingClaimException` | 进入 Level 2：`use_default_groups=True` 使 groups 缺失不报错；但 `group_claim=[]`，若配置了 `OIDC_USER_GROUP` 则匹配失败 return None | ❌ 401（除非两个组都未配置） |
+| `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token **缺少 groups claim**（详见 2.5.4 节的各种组配置组合） | `MissingClaimException` | 进入 Level 2：`use_default_groups=True` 使 groups 缺失不报错；`group_claim=[]`；最终结果取决于 **哪个组被配置** | ⚠️ 见 2.5.4 节组合表 |
 | `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token 缺少 name/email/user_claim | `MissingClaimException` | 进入 Level 2：若 userinfo 也缺这些基础字段 → 再抛 `MissingClaimException` → auth=None | ❌ 401 |
 | `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token 有 groups 但 groups 列表中既不含 USER_GROUP 也不含 ADMIN_GROUP | return None（组判定失败） | 不执行（MissingClaimException 才会 fallback） | ❌ 401 |
 
 **重要**：fallback 只由 `MissingClaimException` 触发。如果 Level 1 的 claims 完整存在但组判定失败（return None），**不会**降级到 Level 2，直接返回 401。
+
+### 2.5.4 admin-only 分支与组配置组合深度分析
+
+组校验核心代码位于 [openid_provider.py L64-L68](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L64-L68)：
+
+```python
+group_claim = claims.get(settings.OIDC_GROUPS_CLAIM, []) or []
+is_admin = settings.OIDC_ADMIN_GROUP in group_claim if settings.OIDC_ADMIN_GROUP else False
+is_valid_user = settings.OIDC_USER_GROUP in group_claim if settings.OIDC_USER_GROUP else True
+
+if not (is_valid_user or is_admin):
+    return None
+```
+
+两个关键三元表达式的语义：
+
+| 变量 | 计算规则 | 含义 |
+|------|---------|------|
+| `is_admin` | `OIDC_ADMIN_GROUP` 已配置 → `OIDC_ADMIN_GROUP in group_claim`；未配置 → **固定 `False`** | 用户是否在管理员组；未配置管理员组时所有人都不是 admin |
+| `is_valid_user` | `OIDC_USER_GROUP` 已配置 → `OIDC_USER_GROUP in group_claim`；未配置 → **固定 `True`** | 用户是否在普通用户组；未配置普通用户组时所有人默认是有效用户 |
+
+最终判定：`not (is_valid_user or is_admin)` → 只有当两者都为 `False` 时才拒绝登录。
+
+`OIDC_REQUIRES_GROUP_CLAIM` 的派生规则在 [settings.py L384-L385](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/settings/settings.py#L384-L385)：
+```python
+@property
+def OIDC_REQUIRES_GROUP_CLAIM(self) -> bool:
+    return self.OIDC_USER_GROUP is not None or self.OIDC_ADMIN_GROUP is not None
+```
+即只要配置了其中任何一个组，组校验分支就会被启用。
+
+#### 组配置 × groups claim 缺失的完整组合矩阵
+
+以下场景假设 `OIDC_REQUIRES_GROUP_CLAIM=True` 且 claims 中缺少 groups 字段（如 Keycloak 在某些场景下不返回 groups），此时 `group_claim = []`（空列表），分析 Level 2 fallback 后的实际行为：
+
+| `OIDC_USER_GROUP` | `OIDC_ADMIN_GROUP` | `is_valid_user` 计算 | `is_admin` 计算 | `is_valid_user or is_admin` | 最终结果 |
+|---|---|---|---|---|---|
+| **未配置** (None) | **未配置** (None) | `True`（USER_GROUP 未配置） | `False`（ADMIN_GROUP 未配置） | `True` | ✅ 认证通过；`admin=False`（注意：两组都未配置时 `OIDC_REQUIRES_GROUP_CLAIM=False`，组校验分支根本不会进入，此处仅为逻辑完整性） |
+| **未配置** (None) | **已配置** `"admin_group"`（admin-only 场景） | `True`（USER_GROUP 未配置） | `"admin_group" in []` → `False` | `True` | ✅ **认证通过**；`admin=False`。由于 `is_valid_user=True` 兜底，即使 groups 为空也不会被拒绝，用户以普通用户身份登录 |
+| **已配置** `"user_group"` | **未配置** (None)（user-only 场景） | `"user_group" in []` → `False` | `False`（ADMIN_GROUP 未配置） | `False` | ❌ 认证被拒绝（return None）。`is_valid_user` 和 `is_admin` 均为 False |
+| **已配置** `"user_group"` | **已配置** `"admin_group"`（双组都配） | `"user_group" in []` → `False` | `"admin_group" in []` → `False` | `False` | ❌ 认证被拒绝（return None）。空 groups 列表中两个组都匹配不到 |
+
+#### admin-only + groups 缺失的完整控制流（重点场景）
+
+前提：`OIDC_USER_GROUP=None`、`OIDC_ADMIN_GROUP="admin_group"`、claims 中没有 groups 字段。
+
+**Level 1（`use_default_groups=False`）**：
+1. `OIDC_REQUIRES_GROUP_CLAIM = True`（ADMIN_GROUP 已配置）
+2. `required_claims` 计算：`OIDC_REQUIRES_GROUP_CLAIM=True and not False=True` → **groups claim 被加入 required_claims**
+3. claims 中缺少 groups → `required_claims.issubset(claims.keys())` 为 False → 抛 `MissingClaimException`
+4. 进入 Level 2 fallback
+
+**Level 2（`use_default_groups=True`）**：
+1. `required_claims` 计算：`OIDC_REQUIRES_GROUP_CLAIM=True and not True=False` → **groups claim 不被加入 required_claims**
+2. claims 中 name/email/user_claim 存在 → required_claims 校验通过
+3. 进入组校验分支（`OIDC_REQUIRES_GROUP_CLAIM=True` 仍成立）
+4. `OIDC_GROUPS_CLAIM not in claims` → 打 warning：`"claims did not include a groups claim, using an empty list as default"`
+5. `group_claim = claims.get("groups", []) or [] = []`
+6. `is_admin = "admin_group" in [] = False`（ADMIN_GROUP 已配置，空列表中匹配不到）
+7. `is_valid_user = ... if None else True = True`（USER_GROUP 未配置，**默认为 True**）
+8. `if not (True or False)` → `if not True` → 条件为 False，**不进入 return None 分支**
+9. 继续执行用户查找/创建逻辑，以 `admin=False` 完成登录
+
+**结论**：仅配置 `OIDC_ADMIN_GROUP`、不配置 `OIDC_USER_GROUP` 时，即使 IdP 完全不返回 groups claim（如 Keycloak），Level 2 fallback 后认证仍能通过，用户以普通身份（`admin=False`）登录。这是因为 `is_valid_user` 在 `OIDC_USER_GROUP` 未配置时默认 `True`，对空 groups 列表兜底放行。
+
+#### user-only + groups 缺失的对比
+
+若只配置 `OIDC_USER_GROUP` 而未配置 `OIDC_ADMIN_GROUP`，则：
+- `is_valid_user = "user_group" in [] = False`
+- `is_admin = False`（ADMIN_GROUP 未配置）
+- `not (False or False) = True` → 认证被拒绝
+
+这种场景下 groups 缺失会导致所有用户无法登录，必须确保 IdP 稳定返回 groups claim。
 
 ---
 
