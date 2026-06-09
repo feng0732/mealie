@@ -581,7 +581,328 @@ class BackupSchemaMismatch(Exception): ...
 
 ---
 
-## 九、关键设计要点
+## 九、上传备份进入恢复列表的输入链路
+
+上传一个外部备份 ZIP 文件，使其出现在备份列表中可供恢复，完整链路如下：
+
+### 9.1 前端上传触发
+
+**入口组件**：`frontend/app/pages/admin/backups.vue#L89-L95`
+
+```html
+<AppButtonUpload
+  :text-btn="false"
+  url="/api/admin/backups/upload"
+  accept=".zip"
+  color="info"
+  @uploaded="refreshBackups()"
+/>
+```
+
+- 用户点击上传按钮后触发文件选择
+- 限制文件类型为 `.zip`
+- 上传成功后回调 `refreshBackups()` 刷新列表
+
+### 9.2 AppButtonUpload 上传逻辑
+
+**组件代码**：`frontend/app/components/global/AppButtonUpload.vue#L96-L130`
+
+执行步骤：
+1. 监听隐藏的 `<input type="file">` 的 `change` 事件（`onFileChanged`）
+2. 将选中的文件封装为 `FormData`（字段名默认为 `"archive"`）
+3. 通过 `api.upload.file(url, formData)` 发起 POST 请求到 `/api/admin/backups/upload`
+4. 上传成功后 `emit("uploaded", response)` 通知父组件刷新
+
+### 9.3 后端接收上传
+
+**路由处理**：`mealie/routes/admin/admin_backups.py#L79-L101`（`upload_one`）
+
+```python
+@router.post("/upload", response_model=SuccessResponse)
+def upload_one(self, archive: UploadFile = File(...)):
+    if "." not in archive.filename:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+    if archive.filename.split(".")[-1] != "zip":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+
+    name = Path(archive.filename).stem
+    app_dirs = get_app_dirs()
+    dest = app_dirs.BACKUP_DIR.joinpath(f"{name}.zip")
+
+    if dest.resolve().parent != app_dirs.BACKUP_DIR.resolve():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+
+    with dest.open("wb") as buffer:
+        shutil.copyfileobj(archive.file, buffer)
+
+    if not dest.is_file():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST)
+    return SuccessResponse.respond("Upload successful")
+```
+
+安全校验：
+- 校验文件扩展名必须是 `.zip`
+- 校验目标路径必须位于 `BACKUP_DIR` 下（防止路径遍历）
+- 校验文件确实被写入
+
+### 9.4 进入备份列表
+
+**刷新列表接口**：`mealie/routes/admin/admin_backups.py#L29-L42`（`get_all`）
+
+```python
+@router.get("", response_model=AllBackups)
+def get_all(self):
+    app_dirs = get_app_dirs()
+    imports = []
+    for archive in app_dirs.BACKUP_DIR.glob("*.zip"):
+        backup = BackupFile(
+            name=archive.name, date=archive.stat().st_mtime, size=pretty_size(archive.stat().st_size)
+        )
+        imports.append(backup)
+    imports.sort(key=operator.attrgetter("date"), reverse=True)
+    return AllBackups(imports=imports, templates=templates)
+```
+
+- 通过 `BACKUP_DIR.glob("*.zip")` 扫描目录下所有 ZIP 文件
+- 按修改时间倒序排列
+- 上传文件落盘后自然出现在列表中，可供后续点击"恢复"按钮使用
+
+### 9.5 上传链路全景图
+
+```
+用户点击上传按钮
+  │
+  ▼
+AppButtonUpload 组件
+  ├─ onButtonClick() → 触发隐藏 <input type="file"> click
+  ├─ onFileChanged() → 获取选中文件
+  └─ upload()
+      ├─ 构造 FormData，字段名为 fileName prop 默认值 "archive"
+      └─ POST /api/admin/backups/upload
+          │
+          ▼
+      upload_one() [admin_backups.py]
+        ├─ 校验扩展名 == .zip
+        ├─ 校验路径不越界
+        ├─ shutil.copyfileobj() 写入 BACKUP_DIR/{name}.zip
+        └─ 返回 SuccessResponse
+          │
+          ▼
+      @uploaded 事件触发 → refreshBackups()
+        │
+        ▼
+      GET /api/admin/backups → get_all()
+        └─ 扫描 BACKUP_DIR/*.zip，返回 AllBackups
+          │
+          ▼
+      前端 v-data-table 渲染新上传的备份文件
+```
+
+---
+
+## 十、前端页面到后端路由的调用顺序
+
+### 10.1 涉及的前端文件
+
+| 文件 | 角色 |
+|------|------|
+| `frontend/app/pages/admin/backups.vue` | 管理员备份管理页面（实际使用） |
+| `frontend/app/composables/use-backups.ts` | 旧版 composable（未被 admin 页面使用） |
+| `frontend/app/lib/api/admin/admin-backups.ts` | Admin API 客户端（实际使用） |
+| `frontend/app/lib/api/user/backups.ts` | User API 客户端（旧版，未被 admin 页面使用） |
+| `frontend/app/lib/api/client-admin.ts` | Admin API 聚合类 |
+| `frontend/app/components/global/AppButtonUpload.vue` | 通用文件上传组件 |
+
+### 10.2 Admin Backups 页面完整调用链
+
+页面初始化与操作的完整前后端调用顺序：
+
+#### (1) 页面加载 → 获取备份列表
+
+```
+frontend/app/pages/admin/backups.vue
+  └─ onMounted(refreshBackups)              # 挂载时触发
+      └─ adminApi.backups.getAll()           # frontend/app/lib/api/admin/admin-backups.ts#L14-L16
+          └─ GET /api/admin/backups
+              └─ get_all()                    # mealie/routes/admin/admin_backups.py#L29-L42
+                  └─ 返回 AllBackups{imports, templates}
+```
+
+#### (2) 点击 "Create Backup" → 创建备份
+
+```
+backups.vue#L82-L88: <BaseButton @click="createBackup">
+  └─ createBackup()                           # backups.vue#L180-L192
+      └─ adminApi.backups.create()            # admin-backups.ts#L18-L20
+          └─ POST /api/admin/backups, body={}
+              └─ create_one()                 # admin_backups.py#L44-L54
+                  ├─ BackupV2().backup()
+                  └─ 返回 SuccessResponse
+      ├─ 成功 → refreshBackups() + toast 成功
+      └─ 失败 → toast 错误
+```
+
+#### (3) 点击 "Upload" 上传备份文件
+
+```
+backups.vue#L89-L95: <AppButtonUpload url="/api/admin/backups/upload" ...>
+  └─ AppButtonUpload.onButtonClick()          # AppButtonUpload.vue#L141-L151
+      └─ <input type="file">.click()
+          └─ onFileChanged()                   # AppButtonUpload.vue#L132-L139
+              └─ upload()                      # AppButtonUpload.vue#L96-L130
+                  └─ POST /api/admin/backups/upload, FormData
+                      └─ upload_one()          # admin_backups.py#L79-L101
+                          └─ 返回 SuccessResponse
+                  └─ emit("uploaded")
+                      └─ backups.vue @uploaded="refreshBackups()"
+                          └─ GET /api/admin/backups → 刷新列表
+```
+
+#### (4) 点击 "Restore" → 恢复备份
+
+```
+backups.vue#L131-L139: <BaseButton @click.stop="setSelected(item); state.importDialog = true">
+  └─ 用户勾选确认 → <BaseButton @click="restoreBackup(selected)">  # backups.vue#L51-L60
+      └─ restoreBackup(fileName)              # backups.vue#L194-L210
+          └─ adminApi.backups.restore(fileName)  # admin-backups.ts#L30-L32
+              └─ POST /api/admin/backups/{file_name}/restore, body={}
+                  └─ import_one()              # admin_backups.py#L103-L120
+                      ├─ _backup_path() 路径校验
+                      ├─ BackupV2().restore(file)
+                      └─ 返回 SuccessResponse
+          ├─ 成功 → toast 成功 → window.location.reload()
+          └─ 失败 → 关闭对话框 + toast 错误
+```
+
+#### (5) 点击 "Delete" → 删除备份
+
+```
+backups.vue#L112-L123: <v-btn @click.stop="state.deleteDialog = true; deleteTarget = item.name">
+  └─ 确认对话框 → @confirm="deleteBackup()"     # backups.vue#L214-L221
+      └─ adminApi.backups.delete(deleteTarget)  # admin-backups.ts#L26-L28
+          └─ DELETE /api/admin/backups/{file_name}
+              └─ delete_one()                    # admin_backups.py#L66-L77
+                  └─ file.unlink()
+      └─ 成功 → refreshBackups()
+```
+
+#### (6) 点击下载图标 → 下载备份文件
+
+```
+backups.vue#L124-L130: <BaseButton download :download-url="backupsFileNameDownload(item.name)">
+  └─ backupsFileNameDownload()               # backups.vue#L246
+      └─ 返回 URL: `api/admin/backups/${fileName}`
+          └─ 浏览器直接访问 GET /api/admin/backups/{file_name}
+              └─ get_one()                    # admin_backups.py#L56-L64
+                  ├─ _backup_path() 路径校验
+                  └─ 返回 FileTokenResponse{file_token}
+                      └─ 中间层使用 token 下载实际文件
+```
+
+### 10.3 两套 API 客户端对比
+
+项目中存在两套备份 API 客户端，是代码演进遗留：
+
+| 客户端 | 文件 | 使用方 | 请求体 |
+|--------|------|--------|--------|
+| `AdminBackupsApi` | `frontend/app/lib/api/admin/admin-backups.ts` | `backups.vue` 页面（当前实际使用） | `create()` / `restore()` 均传空对象 `{}` |
+| `BackupAPI` | `frontend/app/lib/api/user/backups.ts` | `use-backups.ts`（旧 composable，未被 admin 页面使用） | `createOne(payload: CreateBackup)` / `restoreDatabase(fileName, payload: BackupOptions)` |
+
+同样，`use-backups.ts` 是旧版 composable，定义了完整的 `BackupOptions` 选项和 UI 交互，但管理员页面 `backups.vue` 直接使用 `AdminBackupsApi`，走的是简单的全量备份/恢复路径。
+
+---
+
+## 十一、BackupOptions / CreateBackup / ImportJob 实际参与度分析
+
+三个 Schema 均定义于 `mealie/schema/admin/backup.py`，但在当前代码中的实际参与度差异很大。
+
+### 11.1 Schema 定义回顾
+
+```python
+# mealie/schema/admin/backup.py#L6-L24
+
+class BackupOptions(BaseModel):
+    recipes: bool = True
+    settings: bool = True
+    themes: bool = True
+    groups: bool = True
+    users: bool = True
+    notifications: bool = True
+
+class ImportJob(BackupOptions):
+    name: str
+    force: bool = False
+    rebase: bool = False
+
+class CreateBackup(BaseModel):
+    tag: str | None = None
+    options: BackupOptions
+    templates: list[str] | None = None
+```
+
+### 11.2 后端路由使用情况
+
+**结论：后端路由完全不使用这三个 Schema 做参数解析。**
+
+| 端点 | 参数类型 | 是否使用 BackupOptions/CreateBackup/ImportJob |
+|------|----------|---------------------------------------------|
+| `POST /api/admin/backups`（创建备份） | 无 body 参数 | ❌ 不使用 CreateBackup |
+| `POST /api/admin/backups/upload` | `UploadFile = File(...)` | ❌ 不使用 |
+| `POST /api/admin/backups/{file_name}/restore` | 仅 `file_name: str`（路径参数） | ❌ 不使用 ImportJob 或 BackupOptions |
+
+代码证据（`mealie/routes/admin/admin_backups.py`）：
+- `create_one(self)` — 无 body 参数，直接 `BackupV2().backup()` 全量备份
+- `import_one(self, file_name: str)` — 只有路径参数，直接 `BackupV2().restore(file)` 全量恢复
+
+这三个 Schema 仅在 `mealie/schema/admin/__init__.py` 中被导出，没有任何路由函数将其作为 Pydantic 请求体模型。
+
+### 11.3 前端使用情况
+
+**`AdminBackupsApi`（实际使用的客户端）**：`frontend/app/lib/api/admin/admin-backups.ts`
+
+```typescript
+async create() {
+  return await this.requests.post<SuccessResponse | ErrorResponse>(routes.base, {});
+}
+
+async restore(fileName: string) {
+  return await this.requests.post<SuccessResponse | ErrorResponse>(routes.restore(fileName), {});
+}
+```
+
+- `create()` 传空对象 `{}`，**不使用** `CreateBackup`
+- `restore()` 传空对象 `{}`，**不使用** `BackupOptions`
+
+**`BackupAPI`（旧版，未使用）**：`frontend/app/lib/api/user/backups.ts`
+
+```typescript
+async createOne(payload: CreateBackup) { ... }      // 类型声明了但页面未调用
+async restoreDatabase(fileName: string, payload: BackupOptions) { ... }  // 类型声明了但页面未调用
+```
+
+**`use-backups.ts`（旧 composable，未使用）**：`frontend/app/composables/use-backups.ts`
+
+- 构造了完整的 `backupOptions`（含所有 `BackupOptions` 字段）
+- 调用 `api.backups.createOne(backupOptions)` 和 `api.backups.restoreDatabase(...)`
+- 但管理员页面 `backups.vue` **未引入此 composable**，使用的是简化逻辑
+
+### 11.4 结论：均为死代码 / 预留代码
+
+| Schema | 后端路由使用 | 前端 Admin 页面使用 | 状态 |
+|--------|------------|-------------------|------|
+| `BackupOptions` | ❌ 未作为请求参数解析 | ❌ 传空对象，未传递选项字段 | 预留/死代码 |
+| `CreateBackup` | ❌ 未作为请求参数解析 | ❌ 传空对象，未传 tag/options/templates | 预留/死代码 |
+| `ImportJob` | ❌ 未作为请求参数解析 | ❌ 前端未声明此类型变量 | 预留/死代码 |
+
+**设计意图推测**：这三个 Schema 原本是为了支持"选择性备份/恢复"功能（比如只备份食谱、不备份用户），以及带标签（tag）的备份管理。但当前实现走的是"全量备份/全量恢复"的简单路径，这些精细控制的接口尚未在后端路由中落地。
+
+对应的前端代码也分为两条线：
+- 新线（`AdminBackupsApi` + `backups.vue`）：简化实现，全量操作，实际运行
+- 旧线（`BackupAPI` + `use-backups.ts`）：保留了选项参数传递逻辑，但未接入实际页面
+
+---
+
+## 十二、关键设计要点
 
 1. **备份非自动调度**：备份任务未注册到 SchedulerRegistry，需手动通过 API 触发
 2. **SQLite 自动预备份**：恢复前自动创建数据库文件副本（PostgreSQL 暂未实现）
@@ -591,3 +912,6 @@ class BackupSchemaMismatch(Exception): ...
 6. **PostgreSQL 序列恢复**：手动恢复自增 ID 序列值
 7. **分级异常策略**：修复/清理类异常忽略继续，核心流程异常终止并报告
 8. **BackupSchemaMismatch 死代码**：异常已定义并捕获但从未抛出，schema 版本兼容由 Alembic 迁移机制实际处理
+9. **上传即可见**：备份 ZIP 上传后直接写入 BACKUP_DIR，列表接口通过扫描 `*.zip` 使文件立即可用于恢复
+10. **前后端两套遗留代码**：存在 `BackupAPI/use-backups.ts`（旧）和 `AdminBackupsApi/backups.vue`（新）两条实现线，当前实际使用后者
+11. **BackupOptions/CreateBackup/ImportJob 均未落地**：三个 Schema 仅定义未被路由使用，对应"选择性备份/恢复"功能尚未实现
