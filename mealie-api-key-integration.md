@@ -918,3 +918,222 @@ class WebhookPublisher:
 | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py) | can_manage_household / can_manage 检查示例 |
 | [group.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/group/group.py) | Group ORM 模型（两级组织架构顶层） |
 | [household.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/household.py) | Household ORM 模型（两级组织架构底层） |
+
+---
+
+## 十二、通知器与 Webhook 配置端点的 Repository 范围与权限边界深度分析
+
+通知器（Event Notifiers / Apprise）和 Webhook 是 Mealie 向外暴露事件的两条核心通道。两者的 Repository 归属、权限检查模式存在容易混淆的细节，尤其是与其他 Household 级资源（如 Cookbook、标签分类）对比时，权限边界设计呈现出显著差异。
+
+### 12.1 两个控制器的基本结构对比
+
+| 维度 | 通知器（Event Notifiers） | Webhook |
+|------|---------------------------|---------|
+| 控制器 | [GroupEventsNotifierController](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_group_notifications.py#L36-L104) | [ReadWebhookController](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_webhooks.py#L18-L66) |
+| 基类 | `BaseUserController` | `BaseUserController` |
+| 路由前缀 | `/households/events/notifications` | `/households/webhooks` |
+| 所属模块注册 | [households/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/__init__.py#L18-L24) | 同上 |
+| Router 类型 | `APIRouter`（裸路由） | `APIRouter`（裸路由） |
+
+两者均直接继承 `BaseUserController`、使用裸 `APIRouter`（而非 `UserAPIRouter`），但由于 `BaseUserController` 内部已通过 `@controller` 装饰器注入 `get_current_user`，因此所有端点仍强制要求 Bearer Token 认证。
+
+### 12.2 Repository 范围归属：都是 HouseholdRepositoryGeneric
+
+两个资源在 [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L382-L397) 中均注册为 **HouseholdRepositoryGeneric**，即同时按 `group_id` 和 `household_id` 双重过滤：
+
+```python
+@cached_property
+def group_event_notifier(self) -> HouseholdRepositoryGeneric[GroupEventNotifierOut, GroupEventNotifierModel]:
+    return HouseholdRepositoryGeneric(
+        self.session,
+        PK_ID,
+        GroupEventNotifierModel,
+        GroupEventNotifierOut,
+        group_id=self.group_id,       # ← 控制器用户的 group_id
+        household_id=self.household_id,  # ← 控制器用户的 household_id
+    )
+
+@cached_property
+def webhooks(self) -> HouseholdRepositoryGeneric[ReadWebhook, GroupWebhooksModel]:
+    return HouseholdRepositoryGeneric(
+        self.session, PK_ID, GroupWebhooksModel, ReadWebhook,
+        group_id=self.group_id, household_id=self.household_id
+    )
+```
+
+结合 `RepositoryGeneric._filter_builder`（[repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py#L94-L102)），这意味着：
+
+- **API Key 携带的用户属于 Household A** → 查询/修改只会命中 `household_id = A` 的记录
+- 即使构造请求传入另一个 Household 的 Webhook/Notifier ID，`_filter_builder` 会自动追加范围条件，返回空 → 404
+- 创建时通过 `mapper.cast(data, SaveModel, group_id=self.group_id, household_id=self.household_id)` 强制注入当前用户的范围（见下文）
+
+### 12.3 创建时的范围注入机制
+
+两个控制器的 `create_one` 方法均**不在请求体中接受 group_id/household_id**，而是在服务端强制注入当前用户的值：
+
+**通知器创建** — [controller_group_notifications.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_group_notifications.py#L64-L67)：
+```python
+@router.post("", response_model=GroupEventNotifierOut, status_code=201)
+def create_one(self, data: GroupEventNotifierCreate):
+    # 强制用当前用户的 group_id / household_id 覆盖
+    save_data = cast(data, GroupEventNotifierSave, group_id=self.group_id, household_id=self.household_id)
+    return self.mixins.create_one(save_data)
+```
+
+**Webhook 创建** — [controller_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_webhooks.py#L38-L41)：
+```python
+@router.post("", response_model=ReadWebhook, status_code=201)
+def create_one(self, data: CreateWebhook):
+    # 同样强制注入范围
+    save = mapper.cast(data, SaveWebhook, group_id=self.group_id, household_id=self.household_id)
+    return self.mixins.create_one(save)
+```
+
+对应的 Schema 定义确保了前端请求体不含范围字段：
+- `GroupEventNotifierCreate`（[group_events.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/group_events.py#L70-L73)）：仅含 `name`, `apprise_url`
+- `CreateWebhook`（[webhook.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/webhook.py#L16-L22)）：仅含 `enabled`, `name`, `url`, `webhook_type`, `scheduled_time`
+
+### 12.4 关键发现：两个控制器均无 OperationChecks
+
+对两个控制器全文搜索 `self.checks.` / `can_`，**结果为空**：
+
+| 端点 | 方法 | OperationChecks 调用 | 实际权限要求 |
+|------|------|---------------------|-------------|
+| GET `/households/events/notifications` | get_all | ❌ 无 | 任意已认证 Household 成员 |
+| POST `/households/events/notifications` | create_one | ❌ 无 | 任意已认证 Household 成员 |
+| GET `/households/events/notifications/{id}` | get_one | ❌ 无 | 任意已认证 Household 成员 |
+| PUT `/households/events/notifications/{id}` | update_one | ❌ 无 | 任意已认证 Household 成员 |
+| DELETE `/households/events/notifications/{id}` | delete_one | ❌ 无 | 任意已认证 Household 成员 |
+| POST `/households/events/notifications/{id}/test` | test_notification | ❌ 无 | 任意已认证 Household 成员 |
+| GET `/households/webhooks` | get_all | ❌ 无 | 任意已认证 Household 成员 |
+| POST `/households/webhooks` | create_one | ❌ 无 | 任意已认证 Household 成员 |
+| POST `/households/webhooks/rerun` | rerun_webhooks | ❌ 无 | 任意已认证 Household 成员 |
+| GET `/households/webhooks/{id}` | get_one | ❌ 无 | 任意已认证 Household 成员 |
+| POST `/households/webhooks/{id}/test` | test_one | ❌ 无 | 任意已认证 Household 成员 |
+| PUT `/households/webhooks/{id}` | update_one | ❌ 无 | 任意已认证 Household 成员 |
+| DELETE `/households/webhooks/{id}` | delete_one | ❌ 无 | 任意已认证 Household 成员 |
+
+这意味着：**只要 API Key 对应的用户是该 Household 的成员（无论权限等级），就可以完整 CRUD 通知器和 Webhook，包括删除其他成员创建的配置。**
+
+### 12.5 前端「隐形」防线：`advanced-only` Middleware
+
+虽然后端无 OperationChecks，但前端页面通过 Nuxt 路由中间件设置了访问门槛：
+
+**Webhook 前端** — [webhooks.vue](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/pages/household/webhooks.vue#L76-L78)：
+```typescript
+definePageMeta({
+  middleware: ["advanced-only"],
+});
+```
+
+**通知器前端** — [notifiers.vue](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/pages/household/notifiers.vue#L201-L203)：
+```typescript
+definePageMeta({
+  middleware: ["advanced-only"],
+});
+```
+
+**中间件实现** — [advanced-only.ts](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/middleware/advanced-only.ts)：
+```typescript
+export default defineNuxtRouteMiddleware(() => {
+  const { user } = useMealieAuth();
+  if (!user.value?.advanced) {
+    console.warn("User is not allowed to access advanced features");
+    navigateTo("/");
+  }
+});
+```
+
+**`advanced` 字段的后端定义**：
+- ORM：[users.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/users/users.py#L61) `advanced: Mapped[bool | None] = mapped_column(Boolean, default=False)`
+- Schema：[user.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/user/user.py#L118) `advanced: bool = False`
+- 管理员自动获得：[users.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/users/users.py#L225) `self.advanced = True`
+
+**关键不对称**：后端 `routes/households/` 下所有控制器代码中**完全没有**对 `user.advanced` 的校验（对全项目 grep `self.user.advanced` 结果为空）。这意味着持有普通成员 API Key 的外部应用可以绕过前端，直接调用后端 API 创建/修改/删除通知器和 Webhook。
+
+### 12.6 与其他 Household/Group 级资源的权限对比
+
+将通知器、Webhook 与相邻资源的权限模式并置，可以看出 Mealie 在 Household 级资源上的权限设计并不统一：
+
+| 资源 | Repository 类型 | 写操作是否需要 OperationChecks | 具体检查 | 控制器文件 |
+|------|----------------|-------------------------------|----------|-----------|
+| 通知器（Notifiers） | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_group_notifications.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_group_notifications.py) |
+| Webhook | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_webhooks.py) |
+| Cookbook | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_cookbooks.py) |
+| 购物清单（Shopping List） | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_shopping_lists.py) |
+| 家庭偏好设置 | HouseholdRepositoryGeneric | ✅ 有 | `can_manage_household` | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L58-L62) |
+| 用户权限分配 | HouseholdRepositoryGeneric | ✅ 有 | `can_manage` + 多层范围校验 | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L64-L87) |
+| 邀请链接/邮件 | GroupRepositoryGeneric | ✅ 有 | `can_invite` + 跨组限制 | [controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L33-L55) |
+| 标签（Tag） | GroupRepositoryGeneric | ✅ 有 | `can_organize` | [controller_tags.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_tags.py#L51-L54) |
+| 分类（Category） | GroupRepositoryGeneric | ✅ 有 | `can_organize` | [controller_categories.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_categories.py) |
+
+**规律总结**：
+- **Group 级资源**（标签、分类、邀请）：统一使用 `can_organize` / `can_invite` 检查
+- **Household 级高敏感配置**（用户权限、家庭偏好）：使用 `can_manage` / `can_manage_household` 检查
+- **Household 级常规业务资源**（Cookbook、购物清单、通知器、Webhook）：**纯范围隔离，无功能权限检查**
+
+### 12.7 API Key 持有者对通知器/Webhook 的实际可达能力
+
+基于以上分析，一个持有 Household 普通成员（非 admin、无任何 can_* 权限）API Key 的外部应用，在通知器和 Webhook 上的实际权限边界为：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│             API Key 用户（普通 Household 成员）                        │
+│  admin=False, can_manage=False, can_invite=False, can_organize=False │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+        ┌──────────────────┴──────────────────┐
+        │                                     │
+┌───────▼─────────┐                 ┌─────────▼────────┐
+│  通知器 CRUD     │                 │  Webhook CRUD     │
+│  ✅ 全部允许     │                 │  ✅ 全部允许      │
+│  - 创建/编辑/删除│                 │  - 创建/编辑/删除 │
+│  - 发送测试通知  │                 │  - 触发 rerun     │
+│                 │                 │  - 发送测试 Webhook│
+└───────┬─────────┘                 └─────────┬────────┘
+        │                                     │
+        └──────────────────┬──────────────────┘
+                           │
+                  ┌────────▼────────┐
+                  │  Repository 层   │
+                  │  Household 过滤   │
+                  │  - 不能跨家庭操作  │
+                  │  - 不能跨组操作    │
+                  └─────────────────┘
+                           │
+                  ┌────────▼────────┐
+                  │  前端限制          │
+                  │  advanced-only    │
+                  │  ⚠️ 后端不校验      │
+                  └─────────────────┘
+```
+
+### 12.8 通知器 vs Webhook 配置权限的细微差异
+
+虽然两者都无 OperationChecks，但在**测试端点**和**关联事件的可见性**上存在细微区别：
+
+| 特性 | 通知器测试 | Webhook 测试 |
+|------|-----------|-------------|
+| 路由 | `POST /households/events/notifications/{id}/test` | `POST /households/webhooks/{id}/test` |
+| 实现 | 同步调用 `AppriseEventListener.publish_to_subscribers` | 通过 `BackgroundTasks` 异步执行 `post_test_webhook` |
+| 发送内容 | 简单 Event（test_message 类型） | 实际构造包含 webhook body 的完整 Event |
+| 测试 rerun | 无 | `POST /households/webhooks/rerun`（重跑今日全部定时 Webhook） |
+
+---
+
+## 十三、关键文件索引（补充：通知器与 Webhook 专项）
+
+| 文件 | 职责 |
+|------|------|
+| [controller_group_notifications.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_group_notifications.py) | 通知器 CRUD + 测试端点（无 OperationChecks） |
+| [controller_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_webhooks.py) | Webhook CRUD + rerun + 测试端点（无 OperationChecks） |
+| [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L382-L397) | 通知器与 Webhook 注册为 HouseholdRepositoryGeneric |
+| [group_events.py (schema)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/group_events.py) | GroupEventNotifierCreate/Save/Out 等 Schema |
+| [webhook.py (schema)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/schema/household/webhook.py) | CreateWebhook/SaveWebhook/ReadWebhook 等 Schema |
+| [events.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/events.py) | GroupEventNotifierModel + OptionsModel ORM |
+| [webhooks.py (db)](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/webhooks.py) | GroupWebhooksModel ORM |
+| [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_cookbooks.py) | Cookbook 控制器（同样无 OperationChecks，作为对照组） |
+| [controller_shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_shopping_lists.py) | 购物清单控制器（同样无 OperationChecks，作为对照组） |
+| [notifiers.vue](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/pages/household/notifiers.vue) | 通知器前端页面（使用 advanced-only middleware） |
+| [webhooks.vue](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/pages/household/webhooks.vue) | Webhook 前端页面（使用 advanced-only middleware） |
+| [advanced-only.ts](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/frontend/app/middleware/advanced-only.ts) | 前端 advanced-only 中间件实现 |
