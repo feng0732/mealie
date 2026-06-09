@@ -188,8 +188,69 @@ async def oauth_callback(request: Request, session: Session = Depends(generate_s
 ```
 
 外部身份获取具有 **fallback 两级策略**：
-1. **Level 1**：直接使用 id_token 内的 claims（`token["userinfo"]`，由 authlib 自动解析 id_token）。
-2. **Level 2**：若 Level 1 缺少必要 claims，则主动调用 IdP 的 `userinfo` endpoint 拉取完整身份。此时 `use_default_groups=True`，允许 groups claim 缺失（对 Keycloak 等不总是返回 groups 的 IdP 做兼容）。
+1. **Level 1**：直接使用 id_token 内的 claims（`token["userinfo"]`，由 authlib 自动解析 id_token）。`use_default_groups=False`（默认值）。
+2. **Level 2**：若 Level 1 缺少必要 claims（抛出 `MissingClaimException`），则主动调用 IdP 的 `userinfo` endpoint 拉取完整身份。此时显式传入 `use_default_groups=True`。
+
+### 2.5.1 `use_default_groups` 对 `required_claims` 的真实影响 — [openid_provider.py L119-L126](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L119-L126)
+
+```python
+@property
+def required_claims(self):
+    settings = get_app_settings()
+    claims = {settings.OIDC_NAME_CLAIM, "email", settings.OIDC_USER_CLAIM}
+    if settings.OIDC_REQUIRES_GROUP_CLAIM and not self.use_default_groups:
+        claims.add(settings.OIDC_GROUPS_CLAIM)
+    return claims
+```
+
+两级 fallback 中 `required_claims` 的差异：
+
+| 条件 | Level 1 (`use_default_groups=False`) | Level 2 (`use_default_groups=True`) |
+|------|-------------------------------------|-------------------------------------|
+| `OIDC_REQUIRES_GROUP_CLAIM=False` | `{name, email, OIDC_USER_CLAIM}` — **不包含** groups claim | `{name, email, OIDC_USER_CLAIM}` — **不包含** groups claim |
+| `OIDC_REQUIRES_GROUP_CLAIM=True` | `{name, email, OIDC_USER_CLAIM, OIDC_GROUPS_CLAIM}` — **包含** groups claim | `{name, email, OIDC_USER_CLAIM}` — **不包含** groups claim |
+
+结论：`use_default_groups=True` 的作用是 **在启用了组校验的前提下，放宽对 groups claim 存在性的强制要求**。Level 1 要求 groups claim 必须存在于 claims 中，否则直接抛 `MissingClaimException`；Level 2 不再强制要求 groups claim 必须存在，允许其缺失。
+
+### 2.5.2 `use_default_groups` 对组校验逻辑的真实影响 — [openid_provider.py L53-L75](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L53-L75)
+
+```python
+if settings.OIDC_REQUIRES_GROUP_CLAIM:                           # ← 进入条件：与 use_default_groups 无关
+    if settings.OIDC_GROUPS_CLAIM not in claims:
+        self._logger.warning(
+            "[OIDC] claims did not include a %s claim%s",
+            settings.OIDC_GROUPS_CLAIM,
+            ", using an empty list as default" if self.use_default_groups else "",
+        )
+    group_claim = claims.get(settings.OIDC_GROUPS_CLAIM, []) or []   # ← 无论如何都用 [] 兜底
+    is_admin = settings.OIDC_ADMIN_GROUP in group_claim if settings.OIDC_ADMIN_GROUP else False
+    is_valid_user = settings.OIDC_USER_GROUP in group_claim if settings.OIDC_USER_GROUP else True
+
+    if not (is_valid_user or is_admin):
+        return None                                                # ← 组判定失败
+```
+
+关键发现：
+1. **组校验分支的进入条件完全由 `OIDC_REQUIRES_GROUP_CLAIM` 决定**，与 `use_default_groups` 无关。只要启用了组校验，后续逻辑就一定会执行。
+2. `use_default_groups` 对组校验逻辑本身的影响仅体现在两处：
+   - 日志消息：`use_default_groups=True` 时附加 `", using an empty list as default"` 提示
+   - （间接）由于 Level 2 的 `required_claims` 不包含 groups claim，claims 中没有 groups 不会在前置校验阶段被拦截，而是能进入到组校验分支
+3. **组匹配的判定逻辑完全相同**，无论 `use_default_groups` 为何值：
+   - `group_claim = claims.get(..., []) or []` —— groups 缺失或为假值时统一按空列表处理
+   - `is_admin`、`is_valid_user` 的计算方式相同
+   - 最终 `if not (is_valid_user or is_admin): return None` 的判定相同
+
+### 2.5.3 两级 fallback 的实际组合行为
+
+| 场景 | Level 1 结果 | Level 2 结果 | 最终认证结果 |
+|------|-------------|-------------|------------|
+| `OIDC_REQUIRES_GROUP_CLAIM=False`；id_token 有 name/email/user_claim | 通过 → 发 token | 不执行 | ✅ 成功 |
+| `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token 有 name/email/user_claim **且有 groups claim**；groups 满足 USER_GROUP 或 ADMIN_GROUP | 通过 → 发 token | 不执行 | ✅ 成功 |
+| `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token **缺少 groups claim** | `MissingClaimException` | 进入 Level 2：`use_default_groups=True` 使 groups 缺失不报错；但 `group_claim=[]`，若配置了 `OIDC_USER_GROUP` 则匹配失败 return None | ❌ 401（除非两个组都未配置） |
+| `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token 缺少 name/email/user_claim | `MissingClaimException` | 进入 Level 2：若 userinfo 也缺这些基础字段 → 再抛 `MissingClaimException` → auth=None | ❌ 401 |
+| `OIDC_REQUIRES_GROUP_CLAIM=True`；id_token 有 groups 但 groups 列表中既不含 USER_GROUP 也不含 ADMIN_GROUP | return None（组判定失败） | 不执行（MissingClaimException 才会 fallback） | ❌ 401 |
+
+**重要**：fallback 只由 `MissingClaimException` 触发。如果 Level 1 的 claims 完整存在但组判定失败（return None），**不会**降级到 Level 2，直接返回 401。
 
 ---
 
@@ -536,30 +597,100 @@ def get_user(self) -> PrivateUser | None:
 
 ## 4. 会话建立流程
 
-### 4.1 JWT Access Token 生成 — [auth_provider.py L29-L52](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/auth_provider.py#L29-L52)
+### 4.1 初始登录 Token 与刷新 Token 的载荷差异
+
+Mealie 存在 **两个独立的 JWT 生成函数**，分别服务于初始登录和 token 刷新，两者的载荷存在显著差异。
+
+#### 4.1.1 初始登录 Token：`AuthProvider.create_access_token` — [auth_provider.py L29-L52](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/auth_provider.py#L29-L52)
+
+所有登录方式（OIDC / 密码 / LDAP）在首次认证成功后，通过 Provider 基类的 `get_access_token()` 调用此静态方法：
 
 ```python
+# auth_provider.py L12
+ISS = "mealie"
+remember_me_duration = timedelta(days=14)
+
+# auth_provider.py L29-L36
 def get_access_token(self, user: PrivateUser, remember_me=False) -> tuple[str, timedelta]:
+    settings = get_app_settings()
     duration = timedelta(hours=settings.TOKEN_TIME)
     if remember_me:
-        duration = max(remember_me_duration, duration)  # remember_me_duration = 14 天
+        duration = max(remember_me_duration, duration)  # remember_me 时取 max(14天, TOKEN_TIME)
     return AuthProvider.create_access_token({"sub": str(user.id)}, duration)
 
+# auth_provider.py L38-L52
 @staticmethod
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> tuple[str, timedelta]:
+    settings = get_app_settings()
     to_encode = data.copy()
+    expires_delta = expires_delta or timedelta(hours=settings.TOKEN_TIME)
     expire = datetime.now(UTC) + expires_delta
     to_encode["exp"] = expire
-    to_encode["iss"] = "mealie"
-    return (jwt.encode(to_encode, settings.SECRET, algorithm="HS256"), expires_delta)
+    to_encode["iss"] = ISS    # ← 始终设置 iss="mealie"
+    return (jwt.encode(to_encode, settings.SECRET, algorithm=ALGORITHM), expires_delta)
 ```
 
-JWT 载荷：
-- `sub`: 用户 ID（UUID）
-- `exp`: 过期时间
-- `iss`: `"mealie"`
+调用方：
+- OIDC：[openid_provider.py L107](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L107)、[L114](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L114) — `self.get_access_token(user, settings.OIDC_REMEMBER_ME)`
+- 密码：[credentials_provider.py L56](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/credentials_provider.py#L56) — `self.get_access_token(user, data.remember_me)`
+- LDAP：[ldap_provider.py L35](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L35) — `self.get_access_token(user, data.remember_me)`
 
-**注意**：OIDC 的 remember_me 由 `OIDC_REMEMBER_ME` 配置项全局控制，而密码登录由前端表单的 `remember_me` 字段控制。
+初始登录 Token 的载荷：
+- `sub`: 用户 ID（UUID 字符串）
+- `exp`: 过期时间戳（remember_me 时为 14 天，否则为 `TOKEN_TIME` 小时）
+- `iss`: `"mealie"`（**始终存在**）
+
+#### 4.1.2 刷新 Token：`security.create_access_token` — [security.py L31-L40](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/security.py#L31-L40) + [auth.py L147-L151](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/routes/auth/auth.py#L147-L151)
+
+`GET /api/auth/refresh` 端点直接调用 **独立的** `security.create_access_token()`（注意不是基类的静态方法）：
+
+```python
+# auth.py L147-L151
+@user_router.get("/refresh")
+async def refresh_token(current_user: PrivateUser = Depends(get_current_user)):
+    """Use a valid token to get another token"""
+    access_token = security.create_access_token(data={"sub": str(current_user.id)})
+    return MealieAuthToken.respond(access_token)
+
+# security.py L31-L40
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    settings = get_app_settings()
+    to_encode = data.copy()
+    expires_delta = expires_delta or timedelta(hours=settings.TOKEN_TIME)
+    expire = datetime.now(UTC) + expires_delta
+    to_encode["exp"] = expire
+    # ← 没有 iss 字段！
+    return jwt.encode(to_encode, settings.SECRET, algorithm=ALGORITHM)
+```
+
+刷新 Token 的载荷：
+- `sub`: 用户 ID（UUID 字符串）
+- `exp`: 过期时间戳（固定为 `TOKEN_TIME` 小时，不支持 remember_me 长有效期）
+- `iss`: **不存在**（`security.create_access_token` 未设置此字段）
+
+#### 4.1.3 两种 Token 的载荷对比表
+
+| 字段 / 特性 | 初始登录 Token（`AuthProvider.create_access_token`） | 刷新 Token（`security.create_access_token`） |
+|------------|--------------------------------------------------|------------------------------------------|
+| `sub` | ✅ 用户 ID（UUID） | ✅ 用户 ID（UUID） |
+| `exp` | ✅ 过期时间；remember_me 时取 `max(14天, TOKEN_TIME)` | ✅ 过期时间；固定为 `TOKEN_TIME` 小时 |
+| `iss` | ✅ 固定值 `"mealie"` | ❌ **不存在**（函数未写入） |
+| `algorithm` | HS256 | HS256 |
+| 返回值 | `tuple[str, timedelta]` (token, duration) | `str` (仅 token) |
+| 调用方 | OIDC / 密码 / LDAP Provider 首次认证成功后 | `GET /api/auth/refresh` 端点 |
+
+#### 4.1.4 设计差异的影响
+
+1. **刷新 Token 没有 `iss` 字段**：两个函数重复实现了 JWT 生成逻辑，但 `security.create_access_token` 遗漏了 `iss`。由于后端鉴权 `get_current_user()` 中 `jwt.decode()` 未指定 `issuer="mealie"` 参数验证 issuer，因此缺少 `iss` 在当前代码中不会导致功能问题，但违反了 JWT 最佳实践，且两个实现不一致。
+
+2. **刷新 Token 不支持 remember_me 长有效期**：`security.create_access_token` 的 `expires_delta` 默认 `TOKEN_TIME` 小时，且 `refresh_token` 端点调用时未传 remember_me 相关参数，因此刷新后的 token 始终是短有效期，即使用户首次登录时勾选了 remember_me，每次刷新都会重置为短时效。
+
+3. **remember_me 的触发方式不同**：
+   - OIDC：由后端配置 `OIDC_REMEMBER_ME` 全局控制
+   - 密码 / LDAP：由前端登录表单的 `remember_me` 字段控制
+   - 刷新：无 remember_me，固定短时效
+
+4. **`get_current_user` 不校验 iss**：[dependencies.py L88-L123](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/dependencies/dependencies.py#L88-L123) 中 `jwt.decode(token, settings.SECRET, algorithms=[ALGORITHM])` 未指定 `issuer` 参数，意味着即使未来某版本刷新 token 补上了 `iss` 字段，只要签名正确就能通过鉴权。
 
 ### 4.2 前端 Token 存储 — [use-auth-backend.ts](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/frontend/app/composables/use-auth-backend.ts#L27-L40)
 
