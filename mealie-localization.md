@@ -40,7 +40,7 @@ mealie/
 
 ### 2.2 语言配置元数据
 
-[locale_config.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/lang/locale_config.py)
+[locale_config.py](mealie/lang/locale_config.py)
 
 使用 `LocaleConfig` dataclass 定义每个语言的元数据：
 
@@ -57,7 +57,7 @@ class LocaleConfig:
 
 ### 2.3 JSON 翻译提供器
 
-[json_provider.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/pkgs/i18n/json_provider.py)
+[json_provider.py](mealie/pkgs/i18n/json_provider.py)
 
 核心类 `JsonProvider`：
 
@@ -72,7 +72,7 @@ class LocaleConfig:
 
 ### 2.4 提供器工厂与缓存
 
-[provider_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/pkgs/i18n/provider_factory.py)
+[provider_factory.py](mealie/pkgs/i18n/provider_factory.py)
 
 `ProviderFactory` 负责：
 
@@ -82,7 +82,7 @@ class LocaleConfig:
 
 ### 2.5 翻译器获取与依赖注入
 
-[providers.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/lang/providers.py)
+[providers.py](mealie/lang/providers.py)
 
 关键函数：
 
@@ -93,7 +93,7 @@ class LocaleConfig:
 
 ### 2.6 HTTP 中间件
 
-[locale_context.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/middleware/locale_context.py)
+[locale_context.py](mealie/middleware/locale_context.py)
 
 `LocaleContextMiddleware` 在每个请求进入时：
 
@@ -106,7 +106,7 @@ class LocaleConfig:
 
 ### 2.7 路由层使用方式
 
-[base_controllers.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/routes/_base/base_controllers.py)
+[base_controllers.py](mealie/routes/_base/base_controllers.py)
 
 所有控制器基类 `_BaseController` 通过 FastAPI `Depends` 注入：
 
@@ -131,7 +131,7 @@ class _BaseController(ABC):
 
 #### 3.1.1 axios 实例的全局单例生命周期
 
-[axios.ts#L10-L63](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/plugins/axios.ts#L10-L63)
+[axios.ts#L10-L63](frontend/app/plugins/axios.ts#L10-L63)
 
 ```ts
 export default defineNuxtPlugin(() => {
@@ -167,7 +167,7 @@ export default defineNuxtPlugin(() => {
 
 #### 3.1.2 useRequests 的设置逻辑
 
-[api-client.ts#L57-L66](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/api/api-client.ts#L57-L66)
+[api-client.ts#L57-L66](frontend/app/composables/api/api-client.ts#L57-L66)
 
 ```ts
 export const useRequests = function (i18n?: Composer): ApiRequestInstance {
@@ -205,21 +205,21 @@ export const usePublicApi = function (i18n?: Composer): PublicApi { /* 同理 */
 
 **典型模式：在 setup 顶层一次性持有 API 客户端引用**
 
-绝大多数页面（如 [edit.vue#L256](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/pages/user/profile/edit.vue#L256)、[index.vue#L315](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/pages/user/profile/index.vue#L315)、[shopping-lists/index.vue#L138](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/pages/shopping-lists/index.vue#L138)、[api-tokens.vue#L131](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/pages/user/profile/api-tokens.vue#L131)、[reset-password.vue#L119](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/pages/reset-password.vue#L119)、[register/index.vue#L466](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/pages/register/index.vue#L466)）都采用：
+绝大多数页面（如 [edit.vue#L256](frontend/app/pages/user/profile/edit.vue#L256)、[index.vue#L315](frontend/app/pages/user/profile/index.vue#L315)、[shopping-lists/index.vue#L138](frontend/app/pages/shopping-lists/index.vue#L138)、[api-tokens.vue#L131](frontend/app/pages/user/profile/api-tokens.vue#L131)、[reset-password.vue#L119](frontend/app/pages/reset-password.vue#L119)、[register/index.vue#L466](frontend/app/pages/register/index.vue#L466)）都采用：
 
 ```ts
 const api = useUserApi();  // 只在 setup 时执行一次
 ```
 
-Composable 层（如 [use-user.ts#L11](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/use-user.ts#L11)、[use-user.ts#L27](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/use-user.ts#L27)）也在函数体内调用，但每次调用该 composable 时才会重新执行。
+Composable 层（如 [use-user.ts#L11](frontend/app/composables/use-user.ts#L11)、[use-user.ts#L27](frontend/app/composables/use-user.ts#L27)）也在函数体内调用，但每次调用该 composable 时才会重新执行。
 
 **例外：useAuthBackend 不经过 useRequests**
 
-[use-auth-backend.ts](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/use-auth-backend.ts) 中的所有请求（`$axios.get("/api/users/self")`、`$axios.post("/api/auth/token")` 等）直接使用全局 `$axios`，**从不调用 `useRequests()`**。这些请求的 Accept-Language 完全依赖于 defaults 中已有的值。
+[use-auth-backend.ts](frontend/app/composables/use-auth-backend.ts) 中的所有请求（`$axios.get("/api/users/self")`、`$axios.post("/api/auth/token")` 等）直接使用全局 `$axios`，**从不调用 `useRequests()`**。这些请求的 Accept-Language 完全依赖于 defaults 中已有的值。
 
 ### 3.2 ⭐ use-locales 切换语言时的同步机制
 
-[use-locales.ts](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/use-locales/use-locales.ts)
+[use-locales.ts](frontend/app/composables/use-locales/use-locales.ts)
 
 ```ts
 export const useLocales = () => {
@@ -343,7 +343,7 @@ useRequests() 被调用 → $axios.defaults.headers.common["Accept-Language"] = 
 
 ### 3.4 浏览器语言检测与 Cookie 持久化
 
-`@nuxtjs/i18n` 的 `detectBrowserLanguage` 配置（[nuxt.config.ts#L204-L208](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/nuxt.config.ts#L204-L208)）：
+`@nuxtjs/i18n` 的 `detectBrowserLanguage` 配置（[nuxt.config.ts#L204-L208](frontend/nuxt.config.ts#L204-L208)）：
 
 ```ts
 detectBrowserLanguage: {
@@ -383,7 +383,7 @@ alert.error(i18n.t("user.please-enter-your-email-and-password"));
 
 ### 4.1 seed_labels / MultiPurposeLabelSeeder 实现
 
-[seeders.py#L18-L53](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L18-L53)
+[seeders.py#L18-L53](mealie/repos/seed/seeders.py#L18-L53)
 
 **关键发现：`MultiPurposeLabelSeeder` 实际上读取的是 `foods/locales/{locale}.json`，而非 `labels/locales/{locale}.json`！**
 
@@ -406,13 +406,13 @@ class MultiPurposeLabelSeeder(AbstractSeeder):
 ```
 
 **调用链**：
-1. 注册服务：[registration_service.py#L118](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/services/user_services/registration_service.py#L118) → `seeder_service.seed_labels(registration.locale)`
-2. SeederService：[seeder_service.py#L15-L17](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/services/seeder/seeder_service.py#L15-L17)
-3. 路由接口：[controller_seeder.py#L32-L34](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/routes/groups/controller_seeder.py#L32-L34)
+1. 注册服务：[registration_service.py#L118](mealie/services/user_services/registration_service.py#L118) → `seeder_service.seed_labels(registration.locale)`
+2. SeederService：[seeder_service.py#L15-L17](mealie/services/seeder/seeder_service.py#L15-L17)
+3. 路由接口：[controller_seeder.py#L32-L34](mealie/routes/groups/controller_seeder.py#L32-L34)
 
 ### 4.2 foods locale 与 labels locale 的实际关联
 
-foods JSON 文件结构（[en-US.json](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/resources/foods/locales/en-US.json)）：
+foods JSON 文件结构（[en-US.json](mealie/repos/seed/resources/foods/locales/en-US.json)）：
 
 ```json
 {
@@ -433,10 +433,10 @@ foods JSON 文件结构（[en-US.json](file:///d:/fz/0601/solo-dogfeeding/code/1
 | 读取文件 | `foods/locales/{locale}.json` | `foods/locales/{locale}.json`（同一份） |
 | 解析方式 | `self.load_file(file).keys()` → 取所有顶级 keys 作为标签名 | `for label, values in self.load_file(file).items()` → 遍历每个 key-value |
 | 数据用途 | 创建 `MultiPurposeLabelSave` 标签记录 | 按标签名查找已有 Label，关联 `label_id` 后创建食材记录 |
-| 代码位置 | [seeders.py#L32-L44](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L32-L44) | [seeders.py#L103-L122](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L103-L122) |
+| 代码位置 | [seeders.py#L32-L44](mealie/repos/seed/seeders.py#L32-L44) | [seeders.py#L103-L122](mealie/repos/seed/seeders.py#L103-L122) |
 | 理想执行顺序 | **先执行**（创建标签） | **后执行**（引用已存在的 label_id） |
 
-注册服务中的实际执行顺序（[registration_service.py#L115-L119](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/services/user_services/registration_service.py#L115-L119)）：
+注册服务中的实际执行顺序（[registration_service.py#L115-L119](mealie/services/user_services/registration_service.py#L115-L119)）：
 
 ```python
 seeder_service.seed_foods(registration.locale)   # ① foods 在前
@@ -444,7 +444,7 @@ seeder_service.seed_labels(registration.locale)  # ② labels 在后
 seeder_service.seed_units(registration.locale)   # ③
 ```
 
-⚠️ 注意：实际代码顺序 foods 在前、labels 在后。当 foods 找不到对应 label 时，`label_id` 设为 `None`（[seeders.py#L121](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L121)），后续可手动编辑关联。
+⚠️ 注意：实际代码顺序 foods 在前、labels 在后。当 foods 找不到对应 label 时，`label_id` 设为 `None`（[seeders.py#L121](mealie/repos/seed/seeders.py#L121)），后续可手动编辑关联。
 
 ### 4.3 Crowdin labels 资源是否在运行时加载？—— 否，已废弃
 
@@ -453,8 +453,8 @@ seeder_service.seed_units(registration.locale)   # ③
 证据：
 
 1. **代码层面零引用**：全局搜索 `resources/labels` 或 `labels/locales`，仅两个位置：
-   - [crowdin.yml#L15-L16](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/crowdin.yml#L15-L16) —— Crowdin 同步配置
-   - [convert_seed_files_to_new_format.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/dev/scripts/convert_seed_files_to_new_format.py) —— 一次性历史迁移脚本
+   - [crowdin.yml#L15-L16](crowdin.yml#L15-L16) —— Crowdin 同步配置
+   - [convert_seed_files_to_new_format.py](dev/scripts/convert_seed_files_to_new_format.py) —— 一次性历史迁移脚本
 
 2. **迁移脚本说明格式变更**：旧版本 foods 文件是 `{food_name: attrs}` 扁平字典，labels 单独一个数组文件 `[{"name": "Produce"}, ...]`；新版本将 label 名作为 foods 文件的顶级 key，因此 labels 文件不再需要。
 
@@ -523,23 +523,23 @@ RegistrationService.register_user()
 
 | 层级 | 场景 | 回退行为 | 代码位置 |
 |------|------|----------|---------|
-| ProviderFactory | locale JSON 文件不存在于 `mealie/lang/messages/` | 加载 `en-US.json` | [provider_factory.py#L30-L34](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/pkgs/i18n/provider_factory.py#L30-L34) |
-| JsonProvider.t() | key 在翻译字典中不存在 | 返回 `default` 参数；未指定则返回 key 本身 | [json_provider.py#L58](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/pkgs/i18n/json_provider.py#L58) |
-| get_locale_config() | locale 不在 LOCALE_CONFIG | 返回 `en-US` 的 LocaleConfig | [providers.py#L49-L53](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/lang/providers.py#L49-L53) |
-| get_locale_provider() | Accept-Language Header 为空 | 默认为 `"en-US"` | [providers.py#L43-L46](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/lang/providers.py#L43-L46) |
-| CreateUserRegistration Schema | 前端未传 locale 字段 | 默认为 `"en-US"` | [registration.py#L23](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/schema/user/registration.py#L23) |
-| MultiPurposeLabelSeeder.get_file() | foods locale 文件不存在 | 回退到 `foods.en_US` | [seeders.py#L26-L27](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L26-L27) |
-| IngredientFoodsSeeder.get_file() | foods locale 文件不存在 | 回退到 `foods.en_US` | [seeders.py#L94-L95](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L94-L95) |
-| IngredientUnitsSeeder.get_file() | units locale 文件不存在 | 回退到 `units.en_US` | [seeders.py#L58-L59](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L58-L59) |
-| IngredientFoodsSeeder.load_data() | 食材找不到对应 label | `label_id` 设为 `None` | [seeders.py#L121](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L121) |
+| ProviderFactory | locale JSON 文件不存在于 `mealie/lang/messages/` | 加载 `en-US.json` | [provider_factory.py#L30-L34](mealie/pkgs/i18n/provider_factory.py#L30-L34) |
+| JsonProvider.t() | key 在翻译字典中不存在 | 返回 `default` 参数；未指定则返回 key 本身 | [json_provider.py#L58](mealie/pkgs/i18n/json_provider.py#L58) |
+| get_locale_config() | locale 不在 LOCALE_CONFIG | 返回 `en-US` 的 LocaleConfig | [providers.py#L49-L53](mealie/lang/providers.py#L49-L53) |
+| get_locale_provider() | Accept-Language Header 为空 | 默认为 `"en-US"` | [providers.py#L43-L46](mealie/lang/providers.py#L43-L46) |
+| CreateUserRegistration Schema | 前端未传 locale 字段 | 默认为 `"en-US"` | [registration.py#L23](mealie/schema/user/registration.py#L23) |
+| MultiPurposeLabelSeeder.get_file() | foods locale 文件不存在 | 回退到 `foods.en_US` | [seeders.py#L26-L27](mealie/repos/seed/seeders.py#L26-L27) |
+| IngredientFoodsSeeder.get_file() | foods locale 文件不存在 | 回退到 `foods.en_US` | [seeders.py#L94-L95](mealie/repos/seed/seeders.py#L94-L95) |
+| IngredientUnitsSeeder.get_file() | units locale 文件不存在 | 回退到 `units.en_US` | [seeders.py#L58-L59](mealie/repos/seed/seeders.py#L58-L59) |
+| IngredientFoodsSeeder.load_data() | 食材找不到对应 label | `label_id` 设为 `None` | [seeders.py#L121](mealie/repos/seed/seeders.py#L121) |
 
 **前端回退链**：
 
 | 层级 | 场景 | 回退行为 | 代码位置 |
 |------|------|----------|---------|
-| @nuxtjs/i18n detectBrowserLanguage | 浏览器语言不匹配 / cookie 不存在 | `fallbackLocale: "en-US"` | [nuxt.config.ts#L207](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/nuxt.config.ts#L207) |
-| vue-i18n | key 不存在于当前语言文件 | `fallbackLocale: "en-US"`（控制台输出警告） | [i18n.config.ts#L97-L98](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/i18n.config.ts#L97-L98) |
-| Vuetify locale | locale 切换 | 同步切换，默认 fallback `"en-US"` | [nuxt.config.ts#L250-L253](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/nuxt.config.ts#L250-L253) |
+| @nuxtjs/i18n detectBrowserLanguage | 浏览器语言不匹配 / cookie 不存在 | `fallbackLocale: "en-US"` | [nuxt.config.ts#L207](frontend/nuxt.config.ts#L207) |
+| vue-i18n | key 不存在于当前语言文件 | `fallbackLocale: "en-US"`（控制台输出警告） | [i18n.config.ts#L97-L98](frontend/app/i18n.config.ts#L97-L98) |
+| Vuetify locale | locale 切换 | 同步切换，默认 fallback `"en-US"` | [nuxt.config.ts#L250-L253](frontend/nuxt.config.ts#L250-L253) |
 
 ### 5.3 界面文本选择的完整决策流
 
@@ -589,7 +589,7 @@ RegistrationService.register_user()
 
 ### 6.1 Crowdin 配置中的 5 组资源（含已废弃的 labels）
 
-[crowdin.yml](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/crowdin.yml)
+[crowdin.yml](crowdin.yml)
 
 ```yaml
 files:
@@ -607,7 +607,7 @@ files:
 
 ### 6.2 代码生成器
 
-[gen_ts_locales.py](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/dev/code-generation/gen_ts_locales.py) 是关键的前后端协作工具：
+[gen_ts_locales.py](dev/code-generation/gen_ts_locales.py) 是关键的前后端协作工具：
 
 1. 从 Crowdin API 获取所有目标语言的元数据和翻译进度
 2. 合并 `LOCALE_CONFIG` 的语言名称、方向、复数策略
@@ -622,10 +622,10 @@ files:
 
 | 问题 | 结论 |
 |------|------|
-| useRequests 中 Accept-Language 的设置时机？ | 每次调用 `useUserApi()` / `useAdminApi()` / `useRequests()` 时，向**全局共享的 `$axios` 单例**的 `defaults.headers.common["Accept-Language"]` 写入当前 `i18n.locale.value`。设置仅发生在调用时刻，不动态跟随 locale 变化。代码位置：[api-client.ts#L63](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/api/api-client.ts#L63) |
-| use-locales 切换语言时是否同步请求头？ | **不同步**。`watch(locale, ...)` 只同步更新 Vuetify locale，没有任何逻辑更新 `$axios.defaults.headers.common["Accept-Language"]`。切换语言后，只有当新页面 setup 重新调用了 `useUserApi()`，Accept-Language 才会被间接更新。代码位置：[use-locales.ts#L21-L23](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/frontend/app/composables/use-locales/use-locales.ts#L21-L23) |
+| useRequests 中 Accept-Language 的设置时机？ | 每次调用 `useUserApi()` / `useAdminApi()` / `useRequests()` 时，向**全局共享的 `$axios` 单例**的 `defaults.headers.common["Accept-Language"]` 写入当前 `i18n.locale.value`。设置仅发生在调用时刻，不动态跟随 locale 变化。代码位置：[api-client.ts#L63](frontend/app/composables/api/api-client.ts#L63) |
+| use-locales 切换语言时是否同步请求头？ | **不同步**。`watch(locale, ...)` 只同步更新 Vuetify locale，没有任何逻辑更新 `$axios.defaults.headers.common["Accept-Language"]`。切换语言后，只有当新页面 setup 重新调用了 `useUserApi()`，Accept-Language 才会被间接更新。代码位置：[use-locales.ts#L21-L23](frontend/app/composables/use-locales/use-locales.ts#L21-L23) |
 | 复用 API 客户端可能出现什么旧 locale 问题？ | ①单页内切换语言后立即发请求 → Accept-Language 可能仍是旧值；②`useAuthBackend` 的认证请求从不经过 useRequests → Accept-Language 完全依赖 defaults 是否被其他组件设置过；③根本原因是"设置点（useRequests）与变更点（use-locales set）"分离，且未使用请求拦截器动态读取。 |
-| seed_labels / MultiPurposeLabelSeeder 读取哪个文件？ | **读取 `foods/locales/{locale}.json`**，取 JSON 顶级 keys 作为标签名。代码注释明确写着 "Get the labels from the foods seed file now"。代码位置：[seeders.py#L24-L27](file:///d:/fz/0601/solo-dogfeeding/code/123-mealie/mealie/repos/seed/seeders.py#L24-L27) |
+| seed_labels / MultiPurposeLabelSeeder 读取哪个文件？ | **读取 `foods/locales/{locale}.json`**，取 JSON 顶级 keys 作为标签名。代码注释明确写着 "Get the labels from the foods seed file now"。代码位置：[seeders.py#L24-L27](mealie/repos/seed/seeders.py#L24-L27) |
 | foods locale 与 labels locale 的实际关联？ | **两者共享同一份 foods JSON 文件**。labels seeder 取 `keys()` 创建标签记录；foods seeder 遍历 `items()`，通过标签名查找对应记录并关联 `label_id` 后创建食材。 |
 | Crowdin 的 labels 资源是否在运行时加载？ | **否**。`mealie/repos/seed/resources/labels/locales/*.json` 是旧格式遗留，完全不被运行时代码使用。仅 Crowdin 配置和一次性迁移脚本引用它。新增标签名应直接修改 foods JSON 的顶级 keys。 |
 | 注册 locale 与普通接口语言来源是否相同？ | **不同**。前者来自 Request Body 的 `locale` 字段（用户显式选择，持久化到数据库的食材/标签/单位名）；后者来自 HTTP Header 的 `Accept-Language`（跟随当前 UI 语言，用于翻译响应消息/邮件，不持久化）。 |
