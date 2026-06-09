@@ -401,59 +401,136 @@ def try_get_user(self, username: str) -> PrivateUser | None:
 
 只要某条记录的 username 或 email 与 IdP 返回的 claim 相等，就会被命中——**不管这条用户原本以什么方式注册**。
 
-### 3.9 三种 Provider 的登录方式隔离矩阵
+### 3.9 Provider 分发路由（入口级选择）
 
-综合 `OpenIDProvider`、`CredentialsProvider`、`LDAPProvider` 三者的 auth_method 检查逻辑，整理隔离矩阵如下：
+不同登录方式从 HTTP 路由层就走不同的代码路径，不是在同一个 Provider 内部按 auth_method 分发：
 
-| 用户 DB 中 auth_method | OIDC 登录 | 密码登录 (Credentials) | LDAP 登录 (LDAP 启用) |
-|------------------------|-----------|------------------------|-----------------------|
-| **MEALIE**             | ✅ 登录成功；若配置了 `OIDC_ADMIN_GROUP` 还会被同步 admin 权限 | ✅ 校验本地密码 | ✅ 回退到 CredentialsProvider，校验密码成功 |
-| **LDAP**               | ✅ 登录成功；admin 可能被同步 | ❌ 被 CredentialsProvider 拒绝（auth_method != MEALIE），执行假密码哈希抗时序攻击 | ✅ 走 LDAP BIND，成功则登录（必要时创建/更新用户） |
-| **OIDC**               | ✅ 登录成功；admin 可能被同步 | ❌ 被 CredentialsProvider 拒绝（auth_method != MEALIE） | ❌ LDAPProvider 分支 `not user or auth_method==LDAP` 不命中 → 回退 CredentialsProvider → 被拒绝 |
+| 登录方式 | 入口路由 | Provider 选择逻辑 | 涉及代码 |
+|---------|---------|------------------|---------|
+| 密码登录（账号密码表单） | `POST /api/auth/token` | `get_auth_provider()`：`LDAP_ENABLED=True` 时返回 `LDAPProvider`，否则返回 `CredentialsProvider` | [security.py L21-L28](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/security.py#L21-L28) + [auth.py L64-L88](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/routes/auth/auth.py#L64-L88) |
+| OIDC 登录 | `GET /api/auth/oauth/callback` | **不经过** `get_auth_provider()`，直接 `OpenIDProvider(session, token["userinfo"])` | [auth.py L115-L144](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/routes/auth/auth.py#L115-L144) |
 
-#### 3.9.1 LDAPProvider 的混合策略 — [ldap_provider.py L25-L37](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L25-L37)
+**关键点**：LDAP 启用后，**所有**密码形式的登录请求（`/api/auth/token`）都会被路由到 `LDAPProvider.authenticate()`，再由其内部决定是否真正发起 LDAP BIND。
+
+```python
+# security.py L21-L28
+def get_auth_provider(session: Session, data: CredentialsRequestForm) -> AuthProvider:
+    credentials_request = CredentialsRequest(**data.__dict__)
+    if settings.LDAP_ENABLED:
+        return LDAPProvider(session, credentials_request)   # LDAP 启用时，所有密码登录都走这里
+    return CredentialsProvider(session, credentials_request)
+```
+
+### 3.10 三种 Provider 的登录方式隔离矩阵（修正版）
+
+综合路由分发 + 各 Provider 内部 auth_method 检查，完整隔离矩阵如下：
+
+| 用户 DB 中 auth_method | OIDC 登录 | 密码登录（LDAP 未启用） | 密码登录（LDAP 已启用） |
+|------------------------|-----------|------------------------|------------------------|
+| **MEALIE**             | ✅ 登录成功；若配置 `OIDC_ADMIN_GROUP` 还会同步 admin 权限 | ✅ `CredentialsProvider` 校验本地密码 | ✅ **LDAP BIND 完全不执行**；因 `auth_method != LDAP`，直接回退到 `CredentialsProvider` 校验本地密码（输入的密码按本地哈希校验，LDAP 服务器凭证无关） |
+| **LDAP**               | ✅ 登录成功；admin 可能被同步 | ❌ `CredentialsProvider` 拒绝（auth_method != MEALIE），执行假哈希抗时序 | ✅ 因 `auth_method == LDAP`，走 `get_user()` 发起 LDAP BIND；BIND 成功则登录（可能同步 admin） |
+| **OIDC**               | ✅ 登录成功；admin 可能被同步 | ❌ `CredentialsProvider` 拒绝（auth_method != MEALIE） | ❌ 因 `auth_method != LDAP`，回退到 `CredentialsProvider` → 再被拒绝（auth_method != MEALIE），执行假哈希抗时序 |
+
+### 3.10.1 LDAPProvider.authenticate 控制流深度分析 — [ldap_provider.py L25-L37](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L25-L37)
 
 ```python
 def authenticate(self) -> tuple[str, timedelta] | None:
     user = self.try_get_user(self.data.username)
-    if not user or user.auth_method == AuthMethod.LDAP:
-        # 用户不存在或已标记为 LDAP → 走 LDAP BIND + 自动建号
+    if not user or user.auth_method == AuthMethod.LDAP:    # ← 关键条件
+        # 分支 A：本地不存在 或 已标记为 LDAP → 走 LDAP BIND
         user = self.get_user()
         if user:
             return self.get_access_token(user, self.data.remember_me)
-
-    return super().authenticate()  # 否则回退到 CredentialsProvider（只接受 MEALIE 用户）
+    # 分支 B：已存在且 auth_method != LDAP → 回退本地密码
+    return super().authenticate()
 ```
 
-LDAP 登录的行为：
-- 找不到用户 **或** 用户已被标记为 `AuthMethod.LDAP` → 向 LDAP 服务器 BIND，BIND 成功则登录（必要时在 Mealie 侧创建用户）
-- 找到了用户且 `auth_method != LDAP`（即 MEALIE 或 OIDC）→ 回退到 `CredentialsProvider.authenticate()`
-  - 对 MEALIE 用户：密码校验通过则登录 ✅
-  - 对 OIDC 用户：`auth_method != MEALIE` 被拒绝 ❌
+按 `try_get_user` 结果和用户 auth_method 展开三种情况：
 
-### 3.10 典型边界场景与实际行为
+#### 情况 1：本地完全没有该用户（`not user == True`）
+- 条件满足 → 进入分支 A → 调用 `get_user()`：
+  1. 服务账号 `LDAP_QUERY_BIND` 连接 LDAP
+  2. 按 `LDAP_ID_ATTRIBUTE` / `LDAP_MAIL_ATTRIBUTE` 搜索用户 DN
+  3. 用搜索到的 DN + 用户输入密码执行 `simple_bind_s`（真正的用户认证）
+  4. BIND 成功 → `try_get_user` 再查一次（还是 None）→ 创建本地新用户 `auth_method=AuthMethod.LDAP`
+  5. 若配置了 `LDAP_ADMIN_FILTER`，同步 admin 标志
+  6. 返回 token
+
+#### 情况 2：本地有该用户且 `auth_method == AuthMethod.LDAP`
+- 条件满足 → 进入分支 A → 调用 `get_user()`：
+  1. 同情况 1，完整执行 LDAP query bind + 用户 DN BIND（**每次登录都重新校验 LDAP 凭证**，不信任本地）
+  2. BIND 成功 → `try_get_user` 再查一次（能找到）→ **不创建新用户，不修改 auth_method**
+  3. 仅根据 `LDAP_ADMIN_FILTER` 同步 admin 标志
+  4. 返回 token
+
+#### 情况 3：本地有该用户且 `auth_method != AuthMethod.LDAP`（即 MEALIE 或 OIDC）
+- 条件 **不满足** → **完全跳过 LDAP BIND**，不建立 LDAP 连接 → 进入分支 B
+- `return super().authenticate()` 即 `CredentialsProvider.authenticate()`
+  - 对 **MEALIE 用户**：`auth_method == AuthMethod.MEALIE` 校验通过 → 按本地密码哈希校验（用户输入的密码直接与本地 bcrypt 比对，**LDAP 服务器凭证完全不参与**）
+  - 对 **OIDC 用户**：`auth_method != AuthMethod.MEALIE` → 被拒绝，执行 `verify_fake_password()` 假哈希抗时序攻击
+
+### 3.10.2 LDAPProvider.get_user() 对已有用户的处理 — [ldap_provider.py L96-L195](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L96-L195)
+
+```python
+def get_user(self) -> PrivateUser | None:
+    # ... LDAP query bind、搜索用户、用户 DN BIND（已成功）...
+
+    user = self.try_get_user(data.username)   # L146：二次查询本地
+
+    if user is None:
+        # L148-L176：仅当本地完全没有该用户时创建新账号
+        user = db.users.create({
+            "auth_method": AuthMethod.LDAP,   # 新建用户 auth_method 固定为 LDAP
+            # ...
+        })
+
+    # L178-L192：无论新老用户，仅可能同步 admin 标志，绝不修改 auth_method
+    if settings.LDAP_ADMIN_FILTER:
+        should_be_admin = len(conn.search_s(user_dn, ...)) > 0
+        if user.admin != should_be_admin:
+            user.admin = should_be_admin
+            db.users.update(user.id, user)
+
+    return user
+```
+
+关键结论：
+- **`get_user()` 不会修改已有用户的 `auth_method`**。即使本地已有一个 auth_method=MEALIE 的用户由于某种原因（例如 if 条件被改写）进入了 `get_user()`，也只会同步 admin，不会将其改成 LDAP。
+- 只有本地完全不存在用户时才会创建 `auth_method=LDAP` 的新用户。
+
+测试侧证：[test_security.py L314-L346](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/tests/unit_tests/test_security.py#L314-L346) `test_user_login_ldap_auth_method` 直接调用 `provider.get_user()` 对一个已存在的 `auth_method=LDAP` 用户操作，断言返回结果 `auth_method == AuthMethod.LDAP`。
+
+### 3.11 典型边界场景与实际行为（修正版）
 
 | 场景 | 实际行为 | 涉及代码 |
 |------|---------|----------|
-| **已有 MEALIE 用户，用相同 email 通过 OIDC 登录** | 直接登录成功；若 IdP 中该用户在 admin group，本地用户的 `admin` 会被提升 | [openid_provider.py L109-L114](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L109-L114) |
-| **已有 LDAP 用户，用相同 email 通过 OIDC 登录** | 直接登录成功；admin 可能被同步修改 | [openid_provider.py L77-L114](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L77-L114) |
-| **已有 OIDC 用户，尝试用密码登录** | 被 CredentialsProvider 拒绝（auth_method != MEALIE），执行假哈希抗时序 | [credentials_provider.py L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/credentials_provider.py#L34-L39) |
+| **已有 MEALIE 用户，用相同 email 通过 OIDC 登录** | 直接登录成功；若 IdP 中该用户在 admin group，本地 `admin` 会被提升（auth_method 仍保持 MEALIE） | [openid_provider.py L109-L114](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L109-L114) |
+| **已有 LDAP 用户，用相同 email 通过 OIDC 登录** | 直接登录成功；admin 可能被同步（auth_method 仍保持 LDAP） | [openid_provider.py L77-L114](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L77-L114) |
+| **已有 OIDC 用户，尝试用密码登录（LDAP 未启用）** | `CredentialsProvider` 检测 `auth_method != MEALIE` → 拒绝，执行假哈希抗时序 | [credentials_provider.py L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/credentials_provider.py#L34-L39) |
 | **已有 LDAP 用户，尝试用密码登录（LDAP 未启用）** | 同上，被拒绝 | 同上 |
-| **已有 LDAP 用户，尝试用密码登录（LDAP 启用）** | 先走 LDAP 分支（auth_method==LDAP），向 LDAP BIND；BIND 成功则登录 | [ldap_provider.py L25-L35](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L25-L35) |
-| **已有 MEALIE 用户，LDAP 启用，用 LDAP 凭证登录** | LDAP BIND 成功 → 不会覆盖原 MEALIE 用户（因为 auth_method != LDAP，回退到 CredentialsProvider，走本地密码校验） | [ldap_provider.py L32-L37](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L32-L37) |
+| **已有 LDAP 用户，尝试用密码登录（LDAP 启用）** | 路由到 `LDAPProvider` → `auth_method == LDAP` → 进入 `get_user()` 发起 LDAP BIND；BIND 成功则登录（同步 admin） | [ldap_provider.py L32-L35](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L32-L35) + [ldap_provider.py L96-L195](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L96-L195) |
+| **已有 MEALIE 用户，LDAP 启用，输入 LDAP 服务器的密码登录** | 路由到 `LDAPProvider` → `user` 存在且 `auth_method != LDAP` → **不执行 LDAP BIND** → 回退 `CredentialsProvider` → 按本地 MEALIE 密码哈希校验。若输入的是 LDAP 密码（与本地不同）则校验失败 401；若恰好两个系统密码一致则登录成功。**LDAP 服务器全程不参与认证。** | [ldap_provider.py L32-L37](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L32-L37) + [credentials_provider.py L44-L56](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/credentials_provider.py#L44-L56) |
+| **已有 MEALIE 用户，LDAP 启用，输入本地 Mealie 密码登录** | 同上路径，本地密码哈希校验成功 → 正常登录 | 同上 |
+| **已有 OIDC 用户，LDAP 启用，尝试用密码登录** | 路由到 `LDAPProvider` → `auth_method != LDAP` → 回退 `CredentialsProvider` → `auth_method != MEALIE` → 拒绝，假哈希抗时序 | [ldap_provider.py L37](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L37) + [credentials_provider.py L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/credentials_provider.py#L34-L39) |
+| **本地无用户，LDAP 启用，用合法 LDAP 凭证登录** | `not user` → 进入 `get_user()` → LDAP BIND 成功 → 自动创建 `auth_method=LDAP` 的本地用户 → 登录成功 | [ldap_provider.py L32-L35](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L32-L35) + [ldap_provider.py L148-L176](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/ldap_provider.py#L148-L176) |
 | **IdP 的 groups claim 缺失（如 Keycloak）** | Level 1 id_token claims 校验抛 `MissingClaimException` → 回退 Level 2 userinfo endpoint，`use_default_groups=True`（允许 groups claim 缺失），再做校验 | [auth.py L126-L138](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/routes/auth/auth.py#L126-L138) |
 | **OIDC_SIGNUP_ENABLED=False，IdP 返回一个从未见过的 email** | try_get_user 返回 None → `OIDC_SIGNUP_ENABLED=False` → 认证失败 return None | [openid_provider.py L78-L81](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L78-L81) |
-| **OIDC_SIGNUP_ENABLED=True，但 DEFAULT_GROUP/DEFAULT_HOUSEHOLD 配置错误** | `repos.users.create()` 内部 User 构造抛 `ValueError` → 被 L103 `except Exception` 捕获 → return None，用户不会被创建 | [openid_provider.py L103-L105](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L103-L105) + [users.py L161-L167](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/db/models/users/users.py#L161-L167) |
+| **OIDC_SIGNUP_ENABLED=True / LDAP 启用，但 DEFAULT_GROUP/DEFAULT_HOUSEHOLD 配置错误** | `repos.users.create()` 内部 User 构造抛 `ValueError`（找不到 group/household）→ OIDC 侧被 `except Exception` 捕获 → return None；LDAP 侧未捕获异常会冒泡 | [openid_provider.py L103-L105](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/core/security/providers/openid_provider.py#L103-L105) + [users.py L161-L167](file:///d:/fz/0601/solo-dogfeeding/code/118-mealie/mealie/db/models/users/users.py#L161-L167) |
 
-### 3.11 设计风险提示
+### 3.12 设计风险提示（修正版）
 
-1. **OIDC 可接管任意 auth_method 用户**：`OpenIDProvider` 缺少 `user.auth_method == AuthMethod.OIDC` 的检查（死代码问题），意味着只要 IdP 返回的 email/username 命中数据库中任何现有账号（MEALIE/LDAP/OIDC），OIDC 登录都会成功。若管理员启用了 OIDC 但对 IdP 组配置不谨慎，可能出现外部身份提升本地 MEALIE 用户为管理员的情况。
+1. **OIDC 可接管任意 auth_method 用户**：`OpenIDProvider` 中 L116-L117 的 `auth_method` 检查是死代码（`if not user` 和 `if user` 两分支穷尽 return），只要 IdP 返回的 email/username 命中数据库中任何现有账号（MEALIE/LDAP/OIDC），OIDC 登录都会成功并可能同步 admin。若 IdP 组配置不谨慎，外部身份可提升本地 MEALIE/LDAP 用户为管理员。
 
-2. **auth_method 迁移单向不可逆**：
-   - OIDC 方式可以登录 MEALIE/LDAP 用户，但不会自动把 `auth_method` 改成 `OIDC`
-   - 这些用户仍然保留原来的 `auth_method`，下次用原方式（密码/LDAP）能否登录取决于原 Provider 的校验规则
+2. **LDAP 启用不影响本地 MEALIE 用户的密码校验路径**：LDAP 启用后，MEALIE 用户的密码登录不经过 LDAP 服务器，仍然走本地 bcrypt 校验。若企业期望 LDAP 启用后所有账号都通过 LDAP 认证，需要手动将存量 MEALIE 用户的 `auth_method` 迁移为 LDAP（数据库层面修改），否则这些用户的密码不受 LDAP 策略管控。
 
-3. **try_get_user 两阶段匹配的冲突风险**：由于先按 username 再按 email 模糊匹配，若一个 IdP 用户的 claim 值恰好等于另一个 Mealie 用户的 username（而非 email），可能出现错配登录。
+3. **auth_method 迁移单向不可逆**：
+   - OIDC 方式登录 MEALIE/LDAP 用户成功，但不会自动把 `auth_method` 改成 `OIDC`
+   - LDAP 方式 `get_user()` 对已有用户只同步 admin，不修改 auth_method
+   - 这些用户保留原有 `auth_method`，下次用原方式能否登录完全取决于原 Provider 的校验规则
+
+4. **try_get_user 两阶段匹配的冲突风险**：所有 Provider 共用基类 `try_get_user`（先 username 后 email，大小写不敏感，无 auth_method 过滤）。若 IdP 或 LDAP 返回的身份字段恰好匹配另一个用户的 username（而非 email），可能发生跨用户错配登录。
+
+5. **Provider 入口级路由不感知用户 auth_method**：`get_auth_provider()` 只看全局 `LDAP_ENABLED` 开关，不看用户本身是什么 auth_method。这意味着 OIDC 用户在 LDAP 启用时输入密码会先经过 LDAPProvider（虽然后续会被回退拒绝），但 MEALIE 用户在 LDAP 启用时完全绕开了 LDAP 认证。
 
 ---
 
