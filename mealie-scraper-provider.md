@@ -373,7 +373,7 @@ extras.set_categories(
 | RecipeScraperOpenAITranscription | `[]` | `[]` | 返回空 ScrapedExtras() |
 | RecipeScraperOpenGraph | `[]` | `[]` | 返回空 ScrapedExtras() |
 
-### 4.3 汇合点：_finish_recipe_from_web()
+### 4.3 汇合点：_finish_recipe_from_web() —— 无条件覆盖
 
 位于 [recipe_crud_routes.py#L250-L274](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/routes/recipe/recipe_crud_routes.py#L250-L274)：
 
@@ -381,26 +381,86 @@ extras.set_categories(
 def _finish_recipe_from_web(self, req, recipe, extras):
     if req.include_tags:                        # 请求参数开关，默认 False
         ctx = ScraperContext(self.repos)
-        recipe.tags = extras.use_tags(ctx)      # ← 通道 B 覆盖通道 A！
+        recipe.tags = extras.use_tags(ctx)      # ← 无条件覆盖！不管 extras 是不是空
 
     if req.include_categories:                  # 请求参数开关，默认 False
         ctx = ScraperContext(self.repos)
-        recipe.recipe_category = extras.use_categories(ctx)  # ← 通道 B 覆盖通道 A！
+        recipe.recipe_category = extras.use_categories(ctx)  # ← 无条件覆盖！不管 extras 是不是空
 
     new_recipe = self.service.create_one(recipe)
     ...
 ```
 
-**汇合逻辑总结：**
+**关键代码事实**：`if` 判断的是**请求开关**，不是 `extras` 是否有数据。只要开关为 True，就一定执行赋值覆盖——哪怕 `extras.use_tags()` 返回空列表。
 
-| 请求参数 | 结果来源 | 说明 |
-|----------|---------|------|
-| `include_tags=True` | **通道 B**（ScrapedExtras） | extras.use_tags() 查库或创建 → 覆盖 recipe.tags |
-| `include_tags=False`（默认） | **通道 A**（Recipe 对象） | 保留 cleaner.clean() 处理后的结果 |
-| `include_categories=True` | **通道 B**（ScrapedExtras） | extras.use_categories() 查库或创建 → 覆盖 recipe.recipe_category |
-| `include_categories=False`（默认） | **通道 A**（Recipe 对象） | 保留 cleaner.clean() 处理后的结果 |
+而 `ScrapedExtras.use_tags()` / `use_categories()` 的实现（[scraped_extras.py#L30-L32](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraped_extras.py#L30-L32) 和 [L57-L59](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraped_extras.py#L57-L59)）：
 
-### 4.4 ScrapedExtras.use_tags()/use_categories() 的数据库操作
+```python
+def use_tags(self, ctx: ScraperContext) -> list[TagOut]:
+    if not self._tags:
+        return []   # ← 空列表直接返回 []，不会抛出异常
+    ...
+```
+
+### 4.4 3 种策略 × 2 个开关 = 12 种组合的完整矩阵
+
+基于各策略双通道产出 + 无条件覆盖逻辑，最终落库结果如下：
+
+#### 策略 1：RecipeScraperPackage / RecipeScraperOpenAI
+
+| 双通道产出 | 通道 A：Recipe 对象 | 通道 B：ScrapedExtras |
+|-----------|-------------------|----------------------|
+| tags | `[]`（空列表） | `["Dinner", "Vegan"]`（schema keywords，有值） |
+| recipe_category | `[]`（空列表） | `["Main Course"]`（schema recipeCategory，有值） |
+
+| 开关组合 | 最终 tags | 最终 recipe_category | 说明 |
+|---------|----------|---------------------|------|
+| include_tags=False | `[]`（保留 A） | - | 通道 A 空列表，无标签 |
+| include_tags=True | `[TagOut]`（B 覆盖 A） | - | 从 schema keywords 查库/创建，**有值** |
+| include_categories=False | - | `[]`（保留 A） | 通道 A 空列表，无分类 |
+| include_categories=True | - | `[TagOut]`（B 覆盖 A） | 从 schema recipeCategory 查库/创建，**有值** |
+
+#### 策略 2：RecipeScraperOpenAITranscription（视频转录）
+
+| 双通道产出 | 通道 A：Recipe 对象 | 通道 B：ScrapedExtras（空对象） |
+|-----------|-------------------|-------------------------------|
+| tags | `[]`（空列表） | `[]`（空对象 → 返回 `[]`） |
+| recipe_category | `[]`（空列表） | `[]`（空对象 → 返回 `[]`） |
+
+| 开关组合 | 最终 tags | 最终 recipe_category | 说明 |
+|---------|----------|---------------------|------|
+| include_tags=False | `[]`（保留 A） | - | 空列表，结果与开关 True 相同 |
+| include_tags=True | `[]`（B 覆盖 A） | - | 空 ScrapedExtras 返回 `[]`，覆盖后仍为空 |
+| include_categories=False | - | `[]`（保留 A） | 空列表，结果与开关 True 相同 |
+| include_categories=True | - | `[]`（B 覆盖 A） | 空 ScrapedExtras 返回 `[]`，覆盖后仍为空 |
+
+**视频策略下，两个开关 True/False 结果完全相同**——因为通道 A 和通道 B 都是空。
+
+#### 策略 3：RecipeScraperOpenGraph（OG 元数据保底）
+
+| 双通道产出 | 通道 A：Recipe 对象 | 通道 B：ScrapedExtras（空对象） |
+|-----------|-------------------|-------------------------------|
+| tags | `[RecipeTag("Easy"), RecipeTag("Quick")]`（og:article:tag，**有值**） | `[]`（空对象 → 返回 `[]`） |
+| recipe_category | `[]`（og_data["categories"] key 不匹配 alias，被忽略） | `[]`（空对象 → 返回 `[]`） |
+
+| 开关组合 | 最终 tags | 最终 recipe_category | 说明 |
+|---------|----------|---------------------|------|
+| include_tags=False | `[RecipeTag]`（保留 A） | - | 保留 OpenGraph 提取的标签，**有值** |
+| include_tags=True | `[]`（B 覆盖 A）⚠️ | - | **空 ScrapedExtras 覆盖了通道 A，原本有值的标签被丢弃为空** |
+| include_categories=False | - | `[]`（保留 A） | 空列表，结果与开关 True 相同 |
+| include_categories=True | - | `[]`（B 覆盖 A） | 空 ScrapedExtras 返回 `[]`，覆盖后仍为空 |
+
+**⚠️ OpenGraph 策略的隐藏陷阱：include_tags=True 会把原本从 og:article:tag 提取到的标签清空为 `[]`。** 因为 OpenGraph 返回的是空 `ScrapedExtras()`，而开关 True 触发无条件覆盖。
+
+### 4.5 覆盖行为汇总表
+
+| 策略 | include_tags=False | include_tags=True | include_categories=False | include_categories=True |
+|------|--------------------|--------------------|--------------------------|--------------------------|
+| Package / OpenAI | `[]`（空） | `[TagOut]`（有值）✅ | `[]`（空） | `[TagOut]`（有值）✅ |
+| 视频转录 | `[]`（空） | `[]`（空，无变化） | `[]`（空） | `[]`（空，无变化） |
+| OpenGraph | `[RecipeTag]`（有值）✅ | `[]`（空，覆盖丢值）⚠️ | `[]`（空） | `[]`（空，无变化） |
+
+### 4.6 ScrapedExtras.use_tags()/use_categories() 的数据库操作
 
 [scraped_extras.py#L30-L82](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraped_extras.py#L30-L82)
 
@@ -415,7 +475,7 @@ def _finish_recipe_from_web(self, req, recipe, extras):
 
 **此时**：返回的 tags 和 recipe_category 已经是完整的数据库对象列表（带 id、slug、group_id），被赋值到 recipe 对象上，**覆盖**通道 A 的临时 uuid 对象。
 
-### 4.5 最终落库：RecipeService.create_one()
+### 4.7 最终落库：RecipeService.create_one()
 
 位于 [recipe_service.py#L202-L245](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L202-L245)
 
@@ -429,11 +489,11 @@ def _finish_recipe_from_web(self, req, recipe, extras):
 
 2. **self.repos.recipes.create(data)**：SQLAlchemy ORM 执行 INSERT。Recipe 模型上 tags 和 recipe_category 定义为关系字段，ORM 自动处理关联表级联写入。
 
-### 4.6 注意：_process_recipe_data 不在抓取落库链路上
+### 4.8 注意：_process_recipe_data 不在抓取落库链路上
 
 `RecipeService` 中还有 `_transform_category_or_tag()` 和 `_process_recipe_data()` 方法（[recipe_service.py#L255-L297](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L255-L297)），但它们是给 `create_from_zip()`（zip 导入）等其他入口使用的。**URL/HTML/JSON 抓取落库不走这条路径**。
 
-### 4.7 批量导入场景的第三来源
+### 4.9 批量导入场景的第三来源
 
 批量 URL 导入（[recipe_bulk_scraper.py#L104-L108](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/recipe_bulk_scraper.py#L104-L108)）还有第三个来源——用户在请求中直接指定：
 
