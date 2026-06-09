@@ -363,7 +363,7 @@ return init(self, *args, **kwargs)
 
 **结论**：`@auto_init()` 只遍历调用者显式传入的 `kwargs`，对**未传入的字段完全不做任何赋值**（既不设 `None`，也不读 ORM default）。未被触碰的字段交给 SQLAlchemy ORM 自己的机制在 `session.flush()` 时处理。
 
-#### 6.1.3 三种写入路径下的实际值
+#### 6.1.3 所有写入路径详解——区分 ORM 默认值触发与各直接 SQL 写法
 
 结合 Repository 的 `create()` 方法（[repository_generic.py#L181-L193](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/repos/repository_generic.py#L181-L193)）：
 
@@ -376,16 +376,35 @@ def create(self, data: Schema | BaseModel | dict) -> Schema:
     ...
 ```
 
-三种写入路径的结果：
+写入路径需要从三个维度区分：**是否经过 Pydantic Schema**、**是否经过 SQLAlchemy ORM**、**是否直接在数据库服务端执行 SQL**。完整的 6 条路径分析如下：
 
-| 写入路径 | 过程 | `entry_type` 最终值 |
-|---------|------|--------------------|
-| **路径 A：正常 API 调用（最常见）** | ① Pydantic `PlanRulesCreate` 未传 → 填 `"unset"` → ② `data.model_dump()` 带 `"unset"` → ③ `@auto_init()` 设为 `"unset"` → ④ flush 时已赋值，不触发 ORM default | **`"unset"`** ✅ |
-| **路径 B：绕过 Pydantic，直接调 ORM 构造且不传 entry_type** | ① 无 Schema 层 → ② data dict 中无 entry_type → ③ `@auto_init()` 跳过该字段 → ④ flush 时触发 ORM `default=""` | **`""`（空字符串）** ❌ |
-| **路径 C：直接 SQL `INSERT` 不写 entry_type 列** | 绕过 ORM，数据库服务端处理 → 由于 DDL 无 `server_default` 且字段 `NOT NULL` | **数据库报错 `NOT NULL constraint failed`** |
-| **路径 D：直接 SQL `INSERT` 显式写 entry_type=NULL** | 绕过 ORM，数据库服务端处理 → 字段 `NOT NULL` | **数据库报错 `NOT NULL constraint failed`** |
+| 路径 | 写入方式 | `entry_type` 最终值 | 写入是否成功 |
+|------|---------|----------------------|-------------|
+| **A. 正常 API 调用（最常见）** | ① Pydantic `PlanRulesCreate` 未传 → Schema 默认填 `"unset"` → ② `data.model_dump()` 带 `"unset"` → ③ `@auto_init()` 设属性 → ④ ORM flush（属性已赋值，不触发 ORM default） | **`"unset"`** | ✅ 成功 |
+| **B. 绕过 Pydantic，直接 ORM 构造不传 `entry_type`** | ① 无 Schema 层 → ② data dict 中无 entry_type → ③ `@auto_init()` 跳过 → ④ ORM flush 触发 ORM `default=""` → SQLAlchemy 生成 `INSERT ... VALUES (?, '', ...)` | **`""`（空字符串）** | ✅ 成功 |
+| **C. 直接 SQL，省略 `entry_type` 列** | 示例：`INSERT INTO group_meal_plan_rules (id, group_id, day) VALUES (...)` — 完全不写 entry_type 列，由数据库服务端处理 | — | ❌ **失败**：`NOT NULL constraint failed` — 无 server_default |
+| **D. 直接 SQL，显式写 `entry_type = NULL`** | 示例：`INSERT INTO group_meal_plan_rules (id, group_id, entry_type) VALUES (..., NULL)` | — | ❌ **失败**：`NOT NULL constraint failed` |
+| **E. 直接 SQL，显式写 `entry_type = ''`** | 示例：`INSERT INTO group_meal_plan_rules (id, group_id, entry_type) VALUES (..., '')` | **`""`（空字符串）** | ✅ 成功 |
+| **F. 直接 SQL，显式写具体值** | 示例：`INSERT INTO ... VALUES (..., 'dinner')` | **`"dinner"` 等具体值** | ✅ 成功 |
 
-#### 6.1.4 规则匹配逻辑与各分支可达性
+**路径 B 与路径 E 的关键区别**：两者在数据库层面最终存储的值**完全相同**（都是 `""`），但触发机制不同：
+- 路径 B 的 `""` 由 SQLAlchemy ORM 在 **Python 侧** flush 时通过 ORM `default=""` 填入，最终生成的 SQL 中 `''` 是 SQLAlchemy 作为参数绑定写入的
+- 路径 E 的 `""` 是调用者在 **SQL 语句中直接写出**，由数据库服务端接收并写入
+
+#### 6.1.4 规则匹配逻辑与各分支可达性——两个维度区分
+
+需要严格区分「**写入可达性**」（某个值能否存入数据库）与「**匹配可达性**」（该值能否被 `get_rules()` 的查询条件命中）：
+
+| 值 | 写入可达性（能否写入数据库） | 匹配可达性（能否被 get_rules() 命中） | 可通过哪些路径产生 |
+|----|--------------------------|-------------------------------------|------------------|
+| `"unset"` | ✅ 可达 | ✅ 可达（分支③通配匹配） | 路径 A |
+| `"dinner"` 等具体值 | ✅ 可达 | ✅ 可达（分支①精确匹配） | 路径 A 显式指定 / 路径 F |
+| `""`（空字符串） | ✅ **完全可达** | ❌ **完全不可达**（三条分支均不命中） | 路径 B + 路径 E |
+| `NULL` | ❌ 不可达（数据库 NOT NULL） | — | 无法产生 |
+
+**关键修正**：之前的"半可达"说法不准确。实际情况是：
+- **写入层面**：空字符串 `""` **完全可达**——路径 B（ORM flush 填 `""`）和路径 E（直接 SQL 显式写 `''`）均能成功将 `""` 写入数据库
+- **匹配层面**：空字符串 `""` **完全不可达**——三条匹配分支均不识别，导致规则静默失效
 
 在 [repository_meal_plan_rules.py#L17-L21](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/repos/repository_meal_plan_rules.py#L17-L21) 中：
 
@@ -397,28 +416,28 @@ or_(
 )
 ```
 
-逐条分析各分支的可达性：
+逐条分析各匹配分支：
 
-| 匹配分支 | SQL 条件 | 在当前代码+数据库约束下是否可达 | 原因 |
-|---------|---------|-------------------------------|------|
-| ① 精确匹配 | `entry_type == ?`（绑定 `"dinner"` 等具体值） | ✅ **可达** | 用户在 API 中显式指定了餐次类型 |
-| ② NULL 通配 | `entry_type IS NULL` | ❌ **不可达** | 初始迁移定义 `nullable=False`（DDL `NOT NULL`），路径 D 会直接报错，任何合法写入都不可能产生 NULL |
-| ③ `"unset"` 通配 | `entry_type == 'unset'` | ✅ **可达** | 路径 A（正常 API）用户不传值时 Pydantic 默认值填充 |
-| — 空字符串 `""` — | 不命中以上任何一条 | ⚠️ **半可达** | 路径 B（绕过 Pydantic 直接 ORM 构造）可产生 `""`，但**不被任何分支命中**，导致规则静默失效 |
+| 匹配分支 | SQL 条件 | 匹配可达性 | 原因 |
+|---------|---------|-----------|------|
+| ① 精确匹配 | `entry_type == ?`（绑定 `"dinner"` 等） | ✅ 可达 | 路径 A 显式传值或路径 F |
+| ② NULL 通配 | `entry_type IS NULL` | ❌ 不可达 | 初始迁移 `nullable=False`（DDL `NOT NULL`），任何合法写入都不可能产生 NULL |
+| ③ "unset" 通配 | `entry_type == 'unset'` | ✅ 可达 | 路径 A（正常 API 未传值，Pydantic 默认值填充） |
+| — `""` 空字符串 — | 不命中以上任何一条 | ❌ 完全不可达 | 路径 B / 路径 E 可写入 `""`，但三条分支均不识别 |
 
 #### 6.1.5 ⚠️ 静默失效风险总结
 
 | 值 | 写入路径 | 是否被规则匹配 | 风险等级 |
 |----|---------|--------------|---------|
 | `"unset"` | 正常 API（路径 A） | ✅ 被分支③通配匹配 | 无风险，正确行为 |
-| `"dinner"` 等 | 正常 API 指定 | ✅ 被分支①精确匹配 | 无风险，正确行为 |
-| `""` | 绕过 Pydantic 直接用 ORM（路径 B） | ❌ 不被任何分支匹配 | **高风险**：规则存在但永远不生效，无报错无日志 |
-| `NULL` | 直接 SQL 写 NULL（路径 D） | — | **无法写入**：数据库 NOT NULL 约束直接报错 |
+| `"dinner"` 等 | 正常 API 指定 / 路径 F | ✅ 被分支①精确匹配 | 无风险，正确行为 |
+| `""` | 路径 B（绕过 Pydantic 直接 ORM 构造不传值）<br>路径 E（直接 SQL 显式写 `''`） | ❌ 不被任何分支匹配 | **高风险**：规则存在但永远不生效，无报错无日志 |
+| `NULL` | 路径 C / D（直接 SQL 省略列或写 NULL） | — | **无法写入**：数据库 NOT NULL 约束直接报错 |
 
 **结论**：
-- 分支② `entry_type IS NULL` 是**防御性代码**，在当前数据库约束下永远不会被触发（与 `day` 字段同理）
-- 空字符串 `""` 才是真正的"陷阱值"：能被写入（通过路径 B），但匹配逻辑不认，导致规则静默失效
-- 正常 API 调用（路径 A）由于 Pydantic Schema 的默认值兜底，永远不会产生 `""` 或 `NULL`，风险仅存在于绕过 API 直接操作 ORM/SQL 的场景
+- 分支② `entry_type IS NULL` 是**防御性代码**，在当前数据库约束下永远不会被触发（`day` 字段同理）
+- 空字符串 `""` 是真正的"陷阱值"：路径 B 和路径 E 均能成功写入 `""`，但匹配逻辑不认，导致规则静默失效
+- 正常 API 调用（路径 A）由于 Pydantic Schema 的默认值兜底，永远不会产生 `""` 或 `NULL`，风险仅存在于绕过 API 直接操作 ORM / SQL 的场景
 
 ---
 
