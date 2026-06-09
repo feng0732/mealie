@@ -665,13 +665,51 @@ def _query_one(self, match_value, match_key=None):
 
 这意味着即使用户通过 API Key 直接传入一个其他 Group 的资源 ID，查询也会因 `filter_by(group_id=...)` 条件不匹配而返回空。
 
-### 8.4 典型 Repository 的范围分类
+### 8.4 完整 Repository 范围分类（依据 [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py) 逐行核对）
 
-| Repository 类型 | 示例资源 | 代码位置 |
-|-----------------|----------|----------|
-| `GroupRepositoryGeneric` | API Token、用户、分类、标签、通知器、Webhook | [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L190-L192) |
-| `HouseholdRepositoryGeneric` | 食谱、购物清单、餐计划、Cookbook、家庭偏好 | [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L240-L243) |
-| `RepositoryGeneric`（无范围） | 仅限 `get_current_user` 内部调用、管理员路由 | — |
+#### 8.4.1 `GroupRepositoryGeneric` — 仅按 `group_id` 过滤（同 Group 内跨 Household 可见）
+
+| 资源 | 属性名 | 代码位置 | 数据库模型外键 |
+|------|--------|----------|---------------|
+| 食谱原料（Food） | `ingredient_foods` | [repository_factory.py:L140-L141](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L140-L141) | 仅 group_id |
+| 食谱单位（Unit） | `ingredient_units` | [repository_factory.py:L143-L145](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L143-L145) | 仅 group_id |
+| 食谱工具（Tool） | `tools` | [repository_factory.py:L148-L149](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L148-L149) | 仅 group_id |
+| 食谱评论（Comment） | `comments` | [repository_factory.py:L152-L155](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L152-L155) | 仅 group_id（注释：用户可评论其他家庭食谱） |
+| 分类（Category） | `categories` | [repository_factory.py:L158-L159](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L158-L159) | 仅 group_id |
+| 标签（Tag） | `tags` | [repository_factory.py:L162-L163](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L162-L163) | 仅 group_id |
+| 食谱分享令牌 | `recipe_share_tokens` | [repository_factory.py:L166-L169](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L166-L169) | 仅 group_id |
+| 食谱时间线事件 | `recipe_timeline_events` | [repository_factory.py:L172-L177](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L172-L177) | 仅 group_id（注释：用户可在其他家庭食谱上发帖） |
+| 用户（User） | `users` | [repository_factory.py:L183-L184](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L183-L184) | 仅 group_id |
+| 用户评分（Rating） | `user_ratings` | [repository_factory.py:L187-L188](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L187-L188) | 仅 group_id |
+| **API Key（长生命周期 Token）** | `api_tokens` | [repository_factory.py:L191-L192](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L191-L192) | 仅 group_id（关联 user_id） |
+| 密码重置令牌 | `tokens_pw_reset` | [repository_factory.py:L195-L198](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L195-L198) | 仅 group_id |
+| 组偏好设置 | `group_preferences` | [repository_factory.py:L208-L211](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L208-L211) | 仅 group_id |
+| 组数据导出 | `group_exports` | [repository_factory.py:L214-L217](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L214-L217) | 仅 group_id |
+| 组报告/报告条目 | `group_reports`, `group_report_entries` | [repository_factory.py:L220-L225](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L220-L225) | 仅 group_id |
+| AI 提供商配置 | `group_ai_provider_settings`, `group_ai_providers` | [repository_factory.py:L228-L235](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L228-L235) | 仅 group_id |
+| 家庭元数据（Household） | `households` | [repository_factory.py:L241-L242](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L241-L242) | 仅 group_id（Household 从属于 Group） |
+| 多用途标签（Label） | `group_multi_purpose_labels` | [repository_factory.py:L374-L377](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L374-L377) | 仅 group_id |
+
+#### 8.4.2 `HouseholdRepositoryGeneric` — 按 `group_id` + `household_id` 双重过滤（仅本 Household 可见）
+
+| 资源 | 属性名 | 代码位置 | 数据库模型外键 |
+|------|--------|----------|---------------|
+| **食谱（Recipe）** | `recipes` | [repository_factory.py:L134-L137](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L134-L137) | group_id + household_id |
+| 家庭偏好设置 | `household_preferences` | [repository_factory.py:L245-L253](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L245-L253) | group_id + household_id |
+| 家庭-食谱关联记录 | `household_recipes` | [repository_factory.py:L256-L264](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L256-L264) | group_id + household_id |
+| **Cookbook（食谱书）** | `cookbooks` | [repository_factory.py:L267-L270](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L267-L270) | group_id + household_id（[cookbook.py:L27-L30](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/cookbook.py#L27-L30)） |
+| **邀请令牌（Invite Token）** | `group_invite_tokens` | [repository_factory.py:L273-L281](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L273-L281) | group_id + household_id（[invite_tokens.py:L20-L23](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/invite_tokens.py#L20-L23)） |
+| 组食谱操作 | `group_recipe_actions` | [repository_factory.py:L284-L292](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L284-L292) | group_id + household_id |
+| 餐计划条目（Meal） | `meals` | [repository_factory.py:L298-L301](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L298-L301) | group_id + household_id |
+| 餐计划规则 | `group_meal_plan_rules` | [repository_factory.py:L304-L312](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L304-L312) | group_id + household_id |
+| 购物清单（Shopping List） | `group_shopping_lists` | [repository_factory.py:L318-L321](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L318-L321) | group_id + household_id |
+| 购物清单项及子资源 | `group_shopping_list_item` 等 4 个 | [repository_factory.py:L324-L371](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L324-L371) | group_id + household_id |
+| **事件通知器（Notifier/Apprise）** | `group_event_notifier` | [repository_factory.py:L383-L391](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L383-L391) | group_id + household_id（[events.py:L71-L75](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/events.py#L71-L75)） |
+| **Webhook 配置** | `webhooks` | [repository_factory.py:L394-L397](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L394-L397) | group_id + household_id（[webhooks.py:L21-L25](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/webhooks.py#L21-L25)） |
+
+#### 8.4.3 `RepositoryGeneric`（无范围约束）— 仅限内部系统/管理员
+
+- `groups`（[repository_factory.py:L204-L205](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L204-L205)）：跨 Group 操作，仅 `BaseAdminController` 及 `get_current_user` 内部在无 group_id 范围下使用
 
 ### 8.5 控制器基类决定 Repository 的范围
 
@@ -682,13 +720,19 @@ def _query_one(self, match_value, match_key=None):
 @property
 def repos(self):
     if not self._repos:
-        # 使用当前用户的 group_id 和 household_id
+        # 使用当前用户的 group_id 和 household_id 构造 AllRepositories
         self._repos = AllRepositories(self.session, group_id=self.group_id, household_id=self.household_id)
     return self._repos
 ```
 
-- `BaseUserController`：`self.group_id = user.group_id`, `self.household_id = user.household_id` → **仅能访问本家庭数据**
-- `BaseAdminController`：`self._repos = AllRepositories(session, group_id=None, household_id=None)` → **管理员无范围限制**
+**两种控制器基类的实际可达范围差异**：
+
+| 控制器基类 | 传入的范围参数 | GroupRepositoryGeneric 资源 | HouseholdRepositoryGeneric 资源 |
+|-----------|--------------|---------------------------|-------------------------------|
+| `BaseUserController` | `group_id=user.group_id`, `household_id=user.household_id` | **本组内所有 Household 可见**（如标签、分类、API Key 列表、评论） | **仅本 Household 可见**（如食谱、通知器、Webhook、Cookbook、购物清单、邀请令牌） |
+| `BaseAdminController` | `group_id=None`, `household_id=None` | 全系统可见（无过滤） | 全系统可见（无过滤） |
+
+> ⚠️ 理解要点：`BaseUserController` 并非"仅能访问本家庭数据"——Group 级资源（标签、分类、用户、API Key 等）在同 Group 内跨 Household 共享，只有 Household 级资源才被严格限制在当前家庭内。这个差异对 API Key 集成尤为关键：同组内其他家庭的 API Key 持有者可以看到本组的标签/分类/用户列表，但看不到其他家庭的食谱、Webhook、通知器。
 
 ### 8.6 Router 级别的强制认证
 
@@ -1051,26 +1095,43 @@ export default defineNuxtRouteMiddleware(() => {
 
 **关键不对称**：后端 `routes/households/` 下所有控制器代码中**完全没有**对 `user.advanced` 的校验（对全项目 grep `self.user.advanced` 结果为空）。这意味着持有普通成员 API Key 的外部应用可以绕过前端，直接调用后端 API 创建/修改/删除通知器和 Webhook。
 
-### 12.6 与其他 Household/Group 级资源的权限对比
+### 12.6 两层权限控制：Repository 范围过滤 + OperationChecks 功能检查
 
-将通知器、Webhook 与相邻资源的权限模式并置，可以看出 Mealie 在 Household 级资源上的权限设计并不统一：
+Mealie 的权限控制由**两层独立机制**叠加构成，两者互不替代：
+- **Layer 1**：Repository 范围过滤（由 `_filter_builder` 自动注入 `group_id` / `household_id`）→ 决定"能看到哪些数据"
+- **Layer 2**：OperationChecks 功能检查（由控制器显式调用 `self.checks.can_xxx()`）→ 决定"能不能做写操作"
 
-| 资源 | Repository 类型 | 写操作是否需要 OperationChecks | 具体检查 | 控制器文件 |
-|------|----------------|-------------------------------|----------|-----------|
-| 通知器（Notifiers） | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_group_notifications.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_group_notifications.py) |
-| Webhook | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_webhooks.py) |
-| Cookbook | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_cookbooks.py) |
-| 购物清单（Shopping List） | HouseholdRepositoryGeneric | ❌ 无 | — | [controller_shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_shopping_lists.py) |
-| 家庭偏好设置 | HouseholdRepositoryGeneric | ✅ 有 | `can_manage_household` | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L58-L62) |
-| 用户权限分配 | HouseholdRepositoryGeneric | ✅ 有 | `can_manage` + 多层范围校验 | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L64-L87) |
-| 邀请链接/邮件 | GroupRepositoryGeneric | ✅ 有 | `can_invite` + 跨组限制 | [controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L33-L55) |
-| 标签（Tag） | GroupRepositoryGeneric | ✅ 有 | `can_organize` | [controller_tags.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_tags.py#L51-L54) |
-| 分类（Category） | GroupRepositoryGeneric | ✅ 有 | `can_organize` | [controller_categories.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_categories.py) |
+#### 12.6.1 通知器/Webhook 与其他资源的权限模式全景对比
 
-**规律总结**：
-- **Group 级资源**（标签、分类、邀请）：统一使用 `can_organize` / `can_invite` 检查
-- **Household 级高敏感配置**（用户权限、家庭偏好）：使用 `can_manage` / `can_manage_household` 检查
-- **Household 级常规业务资源**（Cookbook、购物清单、通知器、Webhook）：**纯范围隔离，无功能权限检查**
+下表将 Repository 类型和 OperationChecks 分两列呈现，清晰展示每种资源的两层权限：
+
+| 资源 | Repository 类型（Layer 1：数据范围） | 写操作 OperationChecks（Layer 2：功能权限） | 具体检查 | 控制器文件 |
+|------|------------------------------------|----------------------------------------|----------|-----------|
+| 通知器（Notifiers/Apprise） | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id | ❌ 无 | — | [controller_group_notifications.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_group_notifications.py) |
+| Webhook 配置 | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id | ❌ 无 | — | [controller_webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_webhooks.py) |
+| Cookbook（食谱书） | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id（[cookbook.py:L27-L30](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/cookbook.py#L27-L30)） | ❌ 无 | — | [controller_cookbooks.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_cookbooks.py) |
+| 购物清单（Shopping List） | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id | ❌ 无 | — | [controller_shopping_lists.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_shopping_lists.py) |
+| 食谱（Recipe） | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id | ⚠️ 间接检查 | 依赖 `can_organize` 的调用方判断 | — |
+| 家庭偏好设置 | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id | ✅ 有 | `can_manage_household` | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L58-L62) |
+| 用户权限分配 | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id | ✅ 有 | `can_manage` + 3 层额外范围校验（同 Group / 同 Household / 非本人） | [controller_household_self_service.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_household_self_service.py#L64-L87) |
+| 邀请链接/邮件 | **HouseholdRepositoryGeneric**<br>过滤：group_id + household_id（[invite_tokens.py:L20-L23](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/db/models/household/invite_tokens.py#L20-L23)） | ✅ 有 | `can_invite` + 跨组限制（admin 可跨 Group/Household） | [controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L33-L55) |
+| API Key（长生命周期 Token） | **GroupRepositoryGeneric**<br>过滤：仅 group_id（[repository_factory.py:L191-L192](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L191-L192)） | ✅ 有（删除时） | 删除时校验 `token.user.email == self.user.email`（仅本人可删） | [api_tokens.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/users/api_tokens.py#L49-L61) |
+| 标签（Tag） | **GroupRepositoryGeneric**<br>过滤：仅 group_id | ✅ 有 | `can_organize` | [controller_tags.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_tags.py#L51-L54) |
+| 分类（Category） | **GroupRepositoryGeneric**<br>过滤：仅 group_id | ✅ 有 | `can_organize` | [controller_categories.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/organizers/controller_categories.py) |
+
+#### 12.6.2 权限设计规律总结
+
+按**Repository 类型 × 是否有 OperationChecks** 做二维切片：
+
+| | 无 OperationChecks（纯范围隔离） | 有 OperationChecks（范围 + 功能双重控制） |
+|---|---|---|
+| **GroupRepositoryGeneric**<br>（同组跨家庭可见） | 无（所有 Group 级写操作均需 `can_organize` / `can_invite`） | 标签、分类（`can_organize`）<br>邀请令牌（`can_invite`）<br>API Key 删除（本人校验） |
+| **HouseholdRepositoryGeneric**<br>（仅本家庭可见） | **通知器、Webhook、Cookbook、购物清单**<br>（所有 Household 成员均可 CRUD） | 家庭偏好（`can_manage_household`）<br>用户权限（`can_manage` + 额外范围）<br>邀请令牌创建（`can_invite`） |
+
+**对 API Key 集成的启示**：
+- 如果外部应用需要"只读 + 不触达敏感配置"，给 Household 普通成员的 API Key 已经足够访问通知器、Webhook、Cookbook、购物清单
+- 如果需要操作 Group 级资源（标签、分类、邀请），则必须给 API Key 对应用户授予 `can_organize` / `can_invite` 权限
+- 如果需要修改家庭偏好或调整用户权限，则必须授予 `can_manage_household` / `can_manage`（仅管理员可授予）
 
 ### 12.7 API Key 持有者对通知器/Webhook 的实际可达能力
 
