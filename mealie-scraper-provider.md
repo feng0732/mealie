@@ -6,8 +6,21 @@ Mealie 的食谱抓取系统采用 **策略模式 + 责任链** 的组合设计�
 
 ```
 用户请求 → API路由层(URL预处理分支) → 服务入口层(调度器前置网页抓取)
-    → 策略执行层(责任链) → 字段清理层 → 标签分类独立处理 → 数据落库层
+    → 策略执行层(责任链) → 字段清理层 → 标签分类双通道汇合 → 数据落库层
 ```
+
+**前置知识：MealieModel 的 alias 机制**
+
+所有 Recipe 相关模型继承自 [MealieModel](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/schema/_mealie/mealie_model.py#L45-L53)：
+
+```python
+model_config = ConfigDict(alias_generator=camelize, populate_by_name=True)
+```
+
+- `alias_generator=camelize`：所有蛇形字段名**自动生成驼峰别名**，如 `recipe_category` → `recipeCategory`，`org_url` → `orgURL`
+- `populate_by_name=True`：构造对象时字段名和别名都可使用
+
+这个机制是理解字段清理层和 Recipe 对象构造的关键前提。
 
 ---
 
@@ -98,7 +111,7 @@ if not html:
 - **URL 入口**（`html=None`）：无论最终命中哪个策略，**必先执行一次 `safe_scrape_html(url)` 抓取网页**，抓不到直接返回失败
 - **HTML/JSON 入口**（`html` 已有值）：跳过此步，直接进入策略遍历
 
-这是之前容易被忽略的重要事实——即使是视频转录策略，在 URL 入口下也已经先做了一次网页抓取。
+即使是视频转录策略，在 URL 入口下也已经先做了一次网页抓取。
 
 ### 2.2 策略优先级与责任链遍历
 
@@ -129,7 +142,9 @@ DEFAULT_SCRAPER_STRATEGIES = [
 - **get_html()**：返回 `self.raw_html`（前置抓取的结果，或用户传入的 HTML/JSON），不再发网络请求
 - **scrape_url()**：调用第三方库 `recipe-scrapers` 的 `scrape_html()` 解析 schema.org 数据
 - **clean_scraper()**：双层兜底取值（先调库方法，失败则直接读原始 schema dict），然后构造 Recipe 对象
-- **tags/categories 处理**：不写入 Recipe 对象，而是存入 `ScrapedExtras.set_tags()` / `set_categories()`，延迟到落库前再处理
+- **tags/categories 处理**：
+  - 在构造 Recipe **之前**先存入 `ScrapedExtras`（见下文「标签分类双通道」）
+  - 构造 Recipe 对象时**不传** `tags` 和 `recipe_category` 参数，取默认值空列表
 
 #### 策略 2：RecipeScraperOpenAITranscription（视频转录）
 
@@ -145,7 +160,8 @@ DEFAULT_SCRAPER_STRATEGIES = [
   2. 有字幕则解析 VTT 文本，无字幕则调用 OpenAI `transcribe_audio()` 语音转文字
   3. 将标题 + 描述 + 转录文本发送给 AI（prompt: `recipes.parse-recipe-video`），按 `OpenAIRecipe` schema 返回结构化数据
   4. 手动构造 Recipe 对象，图片取视频缩略图 URL
-- **重要澄清**：此策略**不依赖 HTML 内容**做解析，但在 **URL 入口场景下，调度器已经在策略遍历之前执行了 `safe_scrape_html(url)`**（即已经发过一次网页 GET 请求），只是这个策略忽略了那个 HTML 结果。HTML/JSON 入口则不会有这次额外请求。
+  5. 返回空的 `ScrapedExtras()`（视频策略不提取标签分类）
+- **重要澄清**：此策略**不依赖 HTML 内容**做解析，但在 **URL 入口场景下，调度器已经在策略遍历之前执行了 `safe_scrape_html(url)`**，只是这个策略忽略了那个 HTML 结果。
 
 #### 策略 3：RecipeScraperOpenAI（AI 解析网页全文）
 
@@ -158,15 +174,25 @@ DEFAULT_SCRAPER_STRATEGIES = [
   2. 用 BeautifulSoup 提取纯文本 + JSON-LD 数据 + 最大尺寸图片 URL
   3. 调用 AI（prompt: `recipes.scrape-recipe`）要求返回 JSON 格式的 schema.org Recipe
   4. 将 AI 返回的 JSON 用 `ld_json_to_html()` 包装成假 HTML
-  5. 后续父类 `parse()` 流程与策略 1 完全一致
+  5. 后续父类 `parse()` 流程与策略 1 完全一致（含 ScrapedExtras 标签分类处理）
 
 #### 策略 4：RecipeScraperOpenGraph（OG 元数据保底）
 
 位置：[scraper_strategies.py#L613-L672](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraper_strategies.py#L613-L672)
 
 - **can_scrape()**：`bool(self.url or self.raw_html)` → 几乎总是 True
-- **get_html()**：返回 `self.raw_html` 或抓取
-- **get_recipe_fields()**：用 `extruct` 库提取 Open Graph 属性，填充最基本字段（name、description、image、tags），ingredients 和 instructions 写死为占位文本
+- **get_recipe_fields()**（[scraper_strategies.py#L620-L652](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraper_strategies.py#L620-L652)）：提取 Open Graph 属性，返回 dict：
+  ```python
+  {
+      "name": ..., "description": ..., "image": ...,
+      "categories": [],                       # 注意：key 是 "categories"，不是 "recipeCategory"
+      "tags": og_fields(properties, "og:article:tag"),  # tags 有值
+      ...
+  }
+  ```
+- **parse()**：直接 `return Recipe(**og_data), ScrapedExtras()`
+  - 返回空的 `ScrapedExtras()`，不走 ScrapedExtras 通道
+  - 但 **tags 和 categories 直接传入 Recipe 构造器**
 
 ### 2.4 反爬处理：safe_scrape_html
 
@@ -179,97 +205,219 @@ DEFAULT_SCRAPER_STRATEGIES = [
 
 ---
 
-## 三、字段清理层（cleaner.py）
+## 三、字段清理层（cleaner.py）对分类的真实处理
 
-位于 [cleaner.py](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/cleaner.py)。
+### 3.1 前置知识：Recipe 模型的字段与别名
 
-### 3.1 总入口：clean()
+[RecipeSummary](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/schema/recipe/recipe.py#L116-L144) 中定义：
 
-[cleaner.py#L39-L75](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/cleaner.py#L39-L75)
+```python
+recipe_category: Annotated[list[RecipeCategory] | None, Field(validate_default=True)] = []
+tags: Annotated[list[RecipeTag] | None, Field(validate_default=True)] = []
+org_url: str | None = Field(None, alias="orgURL")
+```
 
-无论哪个策略返回的 Recipe，都要经过统一清理：
+由于 `alias_generator=camelize`：
+- `recipe_category` 的别名是自动生成的 **`recipeCategory`**（驼峰）
+- `tags` 的别名就是 **`tags`**（已是单字）
+- `org_url` 同时也显式指定了 alias="orgURL"
+
+此外，Recipe 模型有两个 field_validator（[recipe.py#L258-L268](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/schema/recipe/recipe.py#L258-L268)）：
+
+```python
+@field_validator("tags", mode="before")
+def validate_tags(cats: list[Any]):
+    if isinstance(cats, list) and cats and isinstance(cats[0], str):
+        return [RecipeTag(id=uuid4(), name=c, slug=slugify(c)) for c in cats]
+    return cats
+
+@field_validator("recipe_category", mode="before")
+def validate_categories(cats: list[Any]):
+    if isinstance(cats, list) and cats and isinstance(cats[0], str):
+        return [RecipeCategory(id=uuid4(), name=c, slug=slugify(c)) for c in cats]
+    return cats
+```
+
+**当传入 `list[str]` 时，自动构造临时 `RecipeTag`/`RecipeCategory` 对象**（生成临时 uuid，没有 group_id）。
+
+### 3.2 cleaner.clean() 的分类字段处理
+
+[cleaner.py#L39-L75](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/cleaner.py#L39-L75) 总入口：
 
 ```python
 def clean(recipe_data: Recipe | dict, translator: Translator, url=None) -> Recipe:
-    # 转为 dict → 各字段 clean_* → 重新构造 Recipe
+    if not isinstance(recipe_data, dict):
+        recipe_data_dict = recipe_data.model_dump(by_alias=True)   # 用别名导出 dict
+        recipe_data_dict["recipeIngredient"] = [ing.display for ing in recipe_data.recipe_ingredient]
+        recipe_data = recipe_data_dict
+
+    recipe_data["slug"] = slugify(recipe_data.get("name", ""))
+    recipe_data["description"] = clean_string(recipe_data.get("description", ""))
+    recipe_data["prepTime"] = clean_time(recipe_data.get("prepTime"), translator)
+    recipe_data["performTime"] = clean_time(recipe_data.get("performTime"), translator)
+    recipe_data["totalTime"] = clean_time(recipe_data.get("totalTime"), translator)
+    recipe_data["recipeServings"], recipe_data["recipeYieldQuantity"], recipe_data["recipeYield"] = clean_yield(...)
+    recipe_data["recipeCategory"] = clean_categories(recipe_data.get("recipeCategory", []))  # ← 用别名！
+    recipe_data["recipeIngredient"] = clean_ingredients(recipe_data.get("recipeIngredient", []))
+    recipe_data["recipeInstructions"] = clean_instructions(recipe_data.get("recipeInstructions", []))
+    recipe_data["image"] = clean_image(recipe_data.get("image"))[0]
+    recipe_data["orgURL"] = url or recipe_data.get("orgURL")
+    recipe_data["notes"] = clean_notes(recipe_data.get("notes"))
+    recipe_data["rating"] = clean_int(recipe_data.get("rating"))
+
+    return Recipe(**recipe_data)   # ← 关键字参数可用别名（populate_by_name=True）
 ```
 
-**重要**：`clean()` **不处理 tags 和 recipe_category**——这两个字段在策略层被存到了独立的 `ScrapedExtras` 对象中，不在 Recipe 对象上流转，延迟到落库前的 `_finish_recipe_from_web()` 中才处理。
+**关键修正：cleaner.clean() 明确处理了 recipeCategory，而且处理方式非常精巧：**
 
-### 3.2 各字段清理函数的多态处理
+1. `model_dump(by_alias=True)`：将 Recipe 对象转为 dict 时，**所有 key 用驼峰别名**，如 `recipe_category` → key 变为 `"recipeCategory"`
+2. `recipe_data.get("recipeCategory", [])`：读取时也用别名 key
+3. `clean_categories()` 返回 `list[str]`（清理后的分类名）
+4. `recipe_data["recipeCategory"] = ...`：写回时也用别名 key
+5. `Recipe(**recipe_data)`：因为 `populate_by_name=True`，`recipeCategory` 关键字参数能正确匹配到 `recipe_category` 字段
+6. field_validator `validate_categories` 自动将 `list[str]` 转为 `list[RecipeCategory]`（临时 uuid 对象）
 
-每个清理函数都使用 Python `match` 语句处理多种可能的输入格式：
+**标签 tags 的处理类似**：cleaner.clean() 总入口中没有专门的 `recipe_data["tags"] = ...` 行，是因为 `model_dump(by_alias=True)` 已经把 tags 作为 key `"tags"` 带入了 dict，而 `Recipe(**recipe_data)` 构造时 field_validator `validate_tags` 会自动处理。
 
-| 清理函数 | 支持的输入格式 |
-|----------|---------------|
-| `clean_string()` | str / list / int / float / None |
-| `clean_image()` | str / list[str] / list[dict{url}] / dict{url} / list[dict{@id}] |
-| `clean_instructions()` | list[dict{text}] / dict（数字索引）/ str（含换行或 JSON）/ list[str] / list[HowToSection] |
-| `clean_ingredients()` | list[str] / list[dict] / str / None |
-| `clean_time()` | ISO 8601 字符串(PT1H30M) / timedelta / int(分钟) / dict{minValue} / list[str] / datetime |
-| `clean_yield()` | str（如 "4 servings"）/ list[str] |
-| `clean_categories()` | str（逗号分隔）/ list[str] / list[dict{name,slug}] |
-| `clean_nutrition()` | dict（提取数字，钠/胆固醇自动处理克→毫克转换） |
+### 3.3 clean_categories() 与 clean_tags() 的实现
 
-**关键点**：`clean_instructions()` 会递归调用自身处理嵌套结构（如 HowToSection → HowToStep），并循环调用 `clean_string()` 直到稳定（处理多级 HTML 转义）。
+[cleaner.py#L516-L559](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/cleaner.py#L516-L559)
+
+两个函数签名和行为一致：输入 `str | list` → 输出 `list[str]`（每个元素 `.title()` 首字母大写）。
+
+```python
+def clean_categories(category: str | list) -> list[str]:
+    match category:
+        case str(category):      # "Dinner, Vegan" → ["Dinner", "Vegan"]
+            return [cat.strip().title() for cat in category.split(",") if cat.strip()]
+        case [str(), *_]:        # ["dinner", "vegan"] → ["Dinner", "Vegan"]
+            return [cat.strip().title() for cat in category if cat.strip()]
+        case [{"name": str(), "slug": str()}, *_]:   # 迁移专用格式
+            return [cat["name"] for cat in category if "name" in cat]
+        case int() | float():
+            return []
+        case _:
+            raise TypeError(...)
+
+def clean_tags(data: str | list[str]) -> list[str]:
+    match data:
+        case [str(), *_]:
+            return [tag.strip().title() for tag in data if tag.strip()]
+        case str(data):
+            return clean_tags(data.split(","))
+        case _:
+            return []
+```
 
 ---
 
-## 四、标签与分类到食谱落库的完整链路
+## 四、标签与分类的双通道汇合机制
 
-标签（tags）和分类（recipe_category）是唯一**不经过 cleaner.clean()** 的字段，它们走一条独立链路，涉及三个阶段：
+标签（tags）和分类（recipe_category）存在**两条完全独立的数据流**，它们在 `_finish_recipe_from_web()` 中才最终汇合。
 
-### 阶段 1：策略层 → 暂存到 ScrapedExtras
+### 4.1 通道 A：Recipe 对象内置通道
 
-以 `RecipeScraperPackage.clean_scraper()` 为例（[scraper_strategies.py#L264-L268](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraper_strategies.py#L264-L268)）：
+数据跟随 Recipe 对象本身流转，经过 cleaner.clean() 统一清理。
+
+**各策略在通道 A 中的产出：**
+
+| 策略 | Recipe.tags | Recipe.recipe_category | 说明 |
+|------|-------------|----------------------|------|
+| RecipeScraperPackage | `[]`（空列表） | `[]`（空列表） | 构造 Recipe 时不传这两个参数，取默认值 |
+| RecipeScraperOpenAI | `[]` | `[]` | 复用 Package 的 clean_scraper() |
+| RecipeScraperOpenAITranscription | `[]` | `[]` | 手动构造 Recipe 时不传 |
+| RecipeScraperOpenGraph | `list[str]`（og:article:tag） | `[]`（空列表） | og_data 里的 key 是 `"tags"`（匹配字段名），但 key `"categories"` **不匹配** `recipeCategory` 别名，被 Pydantic 忽略 |
+
+**通道 A 在 cleaner.clean() 中的处理：**
+- `model_dump(by_alias=True)` 导出 → `clean_categories()` 清理字符串 → `Recipe(**recipe_data)` 重新构造
+- field_validator 自动将 `list[str]` 转为 `list[RecipeTag/RecipeCategory]`（临时 uuid 对象，无 group_id）
+
+### 4.2 通道 B：ScrapedExtras 独立通道
+
+数据存储在独立的 `ScrapedExtras` 对象中，**不跟随 Recipe 对象流转**，也**不经过 cleaner.clean() 总入口**。
+
+**接管时机：策略层构造 Recipe 之前**
+
+以 RecipeScraperPackage.clean_scraper() 为例（[scraper_strategies.py#L264-L268](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraper_strategies.py#L264-L268)）：
 
 ```python
 extras = ScrapedExtras()
-extras.set_tags(try_get_default(scraped_data.keywords, "keywords", "", cleaner.clean_tags))
-extras.set_categories(try_get_default(scraped_data.category, "recipeCategory", "", cleaner.clean_categories))
+
+extras.set_tags(
+    try_get_default(
+        scraped_data.keywords,   # 先调用 recipe-scrapers 库的 keywords()
+        "keywords",              # 失败则从 schema dict 读取 keywords 字段
+        "",                      # 默认值
+        cleaner.clean_tags       # ← 字符串清理在这里就做了！不是在 cleaner.clean() 总入口
+    )
+)
+
+extras.set_categories(
+    try_get_default(
+        scraped_data.category,   # 先调用 recipe-scrapers 库的 category()
+        "recipeCategory",        # 失败则从 schema dict 读取 recipeCategory 字段
+        "",                      # 默认值
+        cleaner.clean_categories # ← 字符串清理在这里就做了！
+    )
+)
 ```
 
-- 从 schema.org 数据提取 keywords 和 recipeCategory 原始字符串
-- 分别经过 `cleaner.clean_tags()` 和 `cleaner.clean_categories()` 转为 `list[str]`
-- 存入 `ScrapedExtras._tags` 和 `ScrapedExtras._categories` 私有属性
-- **此时：未写数据库，也未赋值给 Recipe 对象**，Recipe 对象上的 tags 和 recipe_category 字段是空的
+**关键修正：标签分类的字符串清理（clean_tags/clean_categories）在策略层存入 ScrapedExtras 时就已执行**，输出为 `list[str]`。之后 `ScrapedExtras._tags` 和 `ScrapedExtras._categories` 存储的就是清理好的字符串列表。
 
-### 阶段 2：路由层 → 按需查库或创建，并赋值到 Recipe
+**各策略在通道 B 中的产出：**
 
-在 `_finish_recipe_from_web()`（[recipe_crud_routes.py#L250-L274](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/routes/recipe/recipe_crud_routes.py#L250-L274)）：
+| 策略 | extras._tags | extras._categories | 说明 |
+|------|-------------|------------------|------|
+| RecipeScraperPackage | `list[str]`（schema keywords） | `list[str]`（schema recipeCategory） | 有值 |
+| RecipeScraperOpenAI | `list[str]` | `list[str]` | 复用 Package，有值 |
+| RecipeScraperOpenAITranscription | `[]` | `[]` | 返回空 ScrapedExtras() |
+| RecipeScraperOpenGraph | `[]` | `[]` | 返回空 ScrapedExtras() |
+
+### 4.3 汇合点：_finish_recipe_from_web()
+
+位于 [recipe_crud_routes.py#L250-L274](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/routes/recipe/recipe_crud_routes.py#L250-L274)：
 
 ```python
 def _finish_recipe_from_web(self, req, recipe, extras):
     if req.include_tags:                        # 请求参数开关，默认 False
         ctx = ScraperContext(self.repos)
-        recipe.tags = extras.use_tags(ctx)      # type: ignore
+        recipe.tags = extras.use_tags(ctx)      # ← 通道 B 覆盖通道 A！
 
     if req.include_categories:                  # 请求参数开关，默认 False
         ctx = ScraperContext(self.repos)
-        recipe.recipe_category = extras.use_categories(ctx)  # type: ignore
+        recipe.recipe_category = extras.use_categories(ctx)  # ← 通道 B 覆盖通道 A！
 
     new_recipe = self.service.create_one(recipe)
     ...
 ```
 
-`ScrapedExtras.use_tags()` 的逻辑（[scraped_extras.py#L30-L55](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraped_extras.py#L30-L55)）：
+**汇合逻辑总结：**
+
+| 请求参数 | 结果来源 | 说明 |
+|----------|---------|------|
+| `include_tags=True` | **通道 B**（ScrapedExtras） | extras.use_tags() 查库或创建 → 覆盖 recipe.tags |
+| `include_tags=False`（默认） | **通道 A**（Recipe 对象） | 保留 cleaner.clean() 处理后的结果 |
+| `include_categories=True` | **通道 B**（ScrapedExtras） | extras.use_categories() 查库或创建 → 覆盖 recipe.recipe_category |
+| `include_categories=False`（默认） | **通道 A**（Recipe 对象） | 保留 cleaner.clean() 处理后的结果 |
+
+### 4.4 ScrapedExtras.use_tags()/use_categories() 的数据库操作
+
+[scraped_extras.py#L30-L82](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/scraped_extras.py#L30-L82)
 
 ```
-对每个标签名：
+对每个标签/分类名（list[str]）：
   1. slugify 后去重（seen_tag_slugs 集合）
   2. repo.get_one(slugify_tag, "slug") 查数据库是否已存在
-     ├─ 存在 → 直接用返回的 TagOut
-     └─ 不存在 → TagSave(name=tag, group_id=...) → repo.create() → 返回新建的 TagOut
+     ├─ 存在 → 直接用返回的 TagOut（带 id、group_id）
+     └─ 不存在 → TagSave/CategorySave(name=tag, group_id=...) → repo.create() → 返回新建的 TagOut
   3. 汇总为 list[TagOut] 返回
 ```
 
-`use_categories()` 逻辑完全相同，只是操作 `self.repos.categories` 表。
+**此时**：返回的 tags 和 recipe_category 已经是完整的数据库对象列表（带 id、slug、group_id），被赋值到 recipe 对象上，**覆盖**通道 A 的临时 uuid 对象。
 
-**此时**：tags 和 recipe_category 已经是完整的数据库对象列表（带 id、slug、group_id），被赋值到 recipe 对象上。
+### 4.5 最终落库：RecipeService.create_one()
 
-### 阶段 3：RecipeService.create_one() → ORM 级联写入
-
-在 `RecipeService.create_one()`（[recipe_service.py#L202-L245](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L202-L245)）：
+位于 [recipe_service.py#L202-L245](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L202-L245)
 
 1. **_recipe_creation_factory()**（[recipe_service.py#L163-L187](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L163-L187)）：
    ```python
@@ -277,22 +425,33 @@ def _finish_recipe_from_web(self, req, recipe, extras):
        for i in range(len(additional_attrs.get("tags", []))):
            additional_attrs["tags"][i]["group_id"] = self.user.group_id
    ```
-   给每个 tag 补上 group_id，确保归属正确的群组。categories 则不需要这一步（因为 `CategorySave` 创建时已经带了 group_id）。
+   给每个 tag dict 补上 group_id。**注意：这里处理的是通道 A 的临时对象（没有 group_id）；通道 B 的对象在 ScrapedExtras.create() 时已经带了 group_id。**
 
-2. **self.repos.recipes.create(data)**：SQLAlchemy ORM 执行 INSERT。由于 Recipe 模型上 tags 和 recipe_category 定义为关系字段（`list[RecipeTag] | None` 和 `list[RecipeCategory] | None`，见 [recipe.py#L105](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/schema/recipe/recipe.py#L105) 和 [recipe.py#L137-L138](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/schema/recipe/recipe.py#L137-L138)），ORM 会自动处理关联表的级联写入。
+2. **self.repos.recipes.create(data)**：SQLAlchemy ORM 执行 INSERT。Recipe 模型上 tags 和 recipe_category 定义为关系字段，ORM 自动处理关联表级联写入。
 
-3. 之后写入用户评分、创建时间线事件等附属数据。
+### 4.6 注意：_process_recipe_data 不在抓取落库链路上
 
-### 注意：_process_recipe_data 不在抓取落库链路上
+`RecipeService` 中还有 `_transform_category_or_tag()` 和 `_process_recipe_data()` 方法（[recipe_service.py#L255-L297](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L255-L297)），但它们是给 `create_from_zip()`（zip 导入）等其他入口使用的。**URL/HTML/JSON 抓取落库不走这条路径**。
 
-`RecipeService` 中还有 `_transform_category_or_tag()` 和 `_process_recipe_data()` 方法（[recipe_service.py#L255-L297](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/recipe/recipe_service.py#L255-L297)），但它们是给 `create_from_zip()`（zip 导入）等其他入口使用的。**URL/HTML/JSON 抓取落库不走这条路径**——标签分类的查库或创建逻辑在 ScrapedExtras 中已经完成了。
+### 4.7 批量导入场景的第三来源
+
+批量 URL 导入（[recipe_bulk_scraper.py#L104-L108](file:///d:/fz/0601/solo-dogfeeding/code/119-mealie/mealie/services/scraper/recipe_bulk_scraper.py#L104-L108)）还有第三个来源——用户在请求中直接指定：
+
+```python
+if b.tags:
+    recipe.tags = b.tags         # 直接覆盖
+if b.categories:
+    recipe.recipe_category = b.categories  # 直接覆盖
+```
+
+批量场景不走 `_finish_recipe_from_web()`，也不使用 ScrapedExtras，直接用请求参数覆盖通道 A 的结果。
 
 ---
 
-## 五、完整链路时序图（以 URL 入口 + 命中视频策略为例）
+## 五、完整链路时序图（以 URL 入口 + RecipeScraperPackage + include_categories=True 为例）
 
 ```
-用户 POST /recipes/create/url {url: "https://youtube.com/...", includeTags: true}
+用户 POST /recipes/create/url {url: "...", includeCategories: true}
   │
   ▼
 [recipe_crud_routes.py] parse_recipe_url()
@@ -308,48 +467,49 @@ def _finish_recipe_from_web(self, req, recipe, extras):
               └─► [recipe_scraper.py] RecipeScraper.scrape(url, html=None)
                     │
                     ├─► html is None → safe_scrape_html(url)
-                    │     └─► 【关键】即使是视频 URL，这里也先抓取了一次网页！
-                    │         （TLS 指纹模拟 → 超时保护 → 编码自适应）
                     │
-                    ├─► 遍历策略（raw_html=刚才抓到的网页内容）
-                    │     ├─► RecipeScraperPackage.can_scrape() → True
-                    │     │     parse() → recipe-scrapers 库解析失败 → 返回 None
-                    │     │
-                    │     ├─► RecipeScraperOpenAITranscription.can_scrape()
-                    │     │     ├─► 检查 audio_provider_enabled ✓
-                    │     │     └─► yt-dlp extractor.suitable(url) ✓
-                    │     │
+                    ├─► 遍历策略，命中 RecipeScraperPackage
                     │     └─► parse()
-                    │           ├─► get_html() → 返回空字符串（完全忽略前置抓取的 HTML）
-                    │           ├─► yt-dlp 下载音频+字幕
-                    │           ├─► 解析字幕 / 调用 AI 转写
-                    │           ├─► AI 结构化解析 → OpenAIRecipe
-                    │           └─► 构造 Recipe(name, ingredients, instructions, ...)
-                    │                 构造 ScrapedExtras（tags=[], categories=[]）← 视频策略不提取标签
+                    │           ├─► clean_scraper()
+                    │           │     ├─► extras = ScrapedExtras()
+                    │           │     ├─► extras.set_tags(clean_tags(keywords))
+                    │           │     │     └─ 通道 B: _tags = ["Dinner", "Vegan"]
+                    │           │     ├─► extras.set_categories(clean_categories(recipeCategory))
+                    │           │     │     └─ 通道 B: _categories = ["Main Course"]
+                    │           │     └─► Recipe(name=..., ...)
+                    │           │           └─ 通道 A: tags=[], recipe_category=[] (默认值)
+                    │           └─► return (recipe, extras)
                     │
                     └─► cleaner.clean(recipe_result, translator)
-                          └─► 字段标准化（注意：tags/categories 不在 Recipe 上，不经过这里）
+                          ├─► model_dump(by_alias=True) → {"recipeCategory": [], "tags": [], ...}
+                          ├─► recipe_data["recipeCategory"] = clean_categories([]) → []
+                          └─► Recipe(**recipe_data)
+                                └─ 通道 A: tags=[], recipe_category=[] (field_validator 生效但空)
               │
-              ├─► RecipeDataService.scrape_image(thumbnail_url) → 下载视频封面
-              ├─► 生成 uuid4() id
-              ├─► slugify(name) → slug
-              └─► return (new_recipe, extras)
+              ├─► 下载图片、生成 id/slug
+              └─► return (recipe, extras)
         │
         └─► _finish_recipe_from_web(req, recipe, extras)
               │
-              ├─► req.include_tags == True
-              │     └─► extras.use_tags(ScraperContext(repos))
-              │           └─► 视频策略 tags 为空列表，不操作数据库
+              ├─► req.include_tags == False → 保留通道 A: recipe.tags = []
               │
-              ├─► recipe.recipe_category = ...（同样为空）
+              ├─► req.include_categories == True
+              │     └─► extras.use_categories(ScraperContext(repos))
+              │           ├─► "Main Course" → slugify → "main-course"
+              │           ├─► repo.categories.get_one("main-course", "slug")
+              │           │     ├─ 存在 → 返回 TagOut
+              │           │     └─ 不存在 → CategorySave → create() → 返回 TagOut
+              │           └─► return [TagOut(id=..., name="Main Course", slug="main-course", group_id=...)]
+              │
+              ├─► recipe.recipe_category = 上述列表（通道 B 覆盖通道 A）
               │
               └─► [recipe_service.py] RecipeService.create_one(recipe)
-                    ├─► _recipe_creation_factory() → 补 group_id 等默认值
-                    ├─► repos.recipes.create(data) → ORM INSERT Recipe + 关联表
+                    ├─► _recipe_creation_factory() → 给 tag dict 补 group_id
+                    ├─► repos.recipes.create(data) → ORM INSERT Recipe + RecipeCategory 关联表
                     ├─► 创建 timeline 事件
                     └─► 返回 new_recipe
   │
-  └─► publish_event(recipe_created) → 通知系统
+  └─► publish_event(recipe_created)
 
 返回 new_recipe.slug
 ```
@@ -364,4 +524,5 @@ def _finish_recipe_from_web(self, req, recipe, extras):
 | **责任链模式** | `RecipeScraper.scrape()` 遍历策略列表 | 按优先级降级尝试，首个成功即终止 |
 | **模板方法模式** | `RecipeScraperOpenAI` 继承 `RecipeScraperPackage`，只重写 `get_html()` | 复用解析流程，只差异化 HTML 获取方式 |
 | **多态匹配** | `cleaner.py` 中大量 `match` 语句 | 统一处理异构输入格式 |
-| **数据传输对象（延迟处理）** | `ScrapedExtras` 暂存标签/分类字符串，与 Recipe 主体分离 | ① 标签分类不经过 cleaner 清理；② 由请求参数 `include_tags`/`include_categories` 决定是否真正落库；③ 落库前做 get_or_create 避免重复 |
+| **别名自动生成** | `MealieModel.config alias_generator=camelize` | 让 snake_case 字段天然兼容 schema.org 的 camelCase 命名 |
+| **双通道数据流** | Recipe 对象通道 A + ScrapedExtras 独立通道 B | ① 不同策略可选择不同通道传递标签分类；② 由请求参数决定最终使用哪一通道数据；③ 通道 B 延迟到落库前做 get_or_create 避免重复写入 |
