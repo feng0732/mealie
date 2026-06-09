@@ -328,46 +328,97 @@ GroupMealplanController.create_random_meal(CreateRandomEntry{date, entry_type})
 
 ## 6. 边界问题详解
 
-### 6.1 餐次类型（entry_type）未设置值与空值的区别
+### 6.1 餐次类型（entry_type）默认值来源与各分支可达性分析
 
-餐次类型的"未设置"在代码中存在两种不同的表示，它们在数据库存储和规则匹配时行为**截然不同**，这是最容易混淆的边界点。
+餐次类型字段的默认值在代码中存在**四层独立的定义**（Pydantic 枚举、Pydantic Schema、SQLAlchemy ORM default、数据库服务端），它们在不同写入路径下生效时机完全不同，这是理解该边界问题的关键。
 
-#### 6.1.1 三层定义对比
+#### 6.1.1 四层默认值定义对比
 
-| 层级 | 定义位置 | 默认值 / 可选值 | 说明 |
-|------|---------|----------------|------|
-| **枚举 Schema** | [plan_rules.py#L36-L44](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/schema/meal_plan/plan_rules.py#L36-L44) | `PlanRulesType.unset = "unset"` | Pydantic 枚举，API 输入层使用 |
-| **Create Schema** | [plan_rules.py#L47-L50](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/schema/meal_plan/plan_rules.py#L47-L50) | `entry_type: PlanRulesType = PlanRulesType.unset` | 创建规则时若不指定，默认为 `"unset"` |
-| **数据库模型** | [mealplan.py#L40-L42](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/db/models/household/mealplan.py#L40-L42) | `mapped_column(String, nullable=False, default="")` | 数据库字段默认值是**空字符串 `""`**，且 NOT NULL |
+| 层级 | 定义位置 | 默认值 | 生效时机 | 说明 |
+|------|---------|--------|---------|------|
+| ① Pydantic 枚举 | [plan_rules.py#L36-L44](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/schema/meal_plan/plan_rules.py#L36-L44) | `PlanRulesType.unset = "unset"` | API 输入解析 | 枚举值，仅在 Schema 层使用 |
+| ② Pydantic Create Schema | [plan_rules.py#L47-L50](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/schema/meal_plan/plan_rules.py#L47-L50) | `entry_type: PlanRulesType = PlanRulesType.unset` | JSON → Pydantic 对象时 | API 调用者不传 `entry_type` 时填充 `"unset"` |
+| ③ SQLAlchemy ORM `default` | [mealplan.py#L40-L42](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/db/models/household/mealplan.py#L40-L42) | `mapped_column(String, nullable=False, default="")` | ORM `session.flush()` 前，Python 侧赋值 | 当 ORM 对象该属性未被显式设置过，INSERT 前 Python 填入 `""` |
+| ④ 数据库服务端 `server_default` | [初始迁移#L118-L119](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/alembic/versions/2022-02-21-19.56.24_6b0f5f32d602_initial_tables.py#L118-L119) | **未设置** | SQL `INSERT` 不指定该列时 | 初始建表 DDL 中 `day` 和 `entry_type` 均无 `DEFAULT` 子句 |
 
-#### 6.1.2 规则匹配逻辑对各值的处理
+**关键区别**：层③的 `default` 是 SQLAlchemy 在**Python 侧** flush 时填充，不影响数据库 DDL；层④的 `server_default` 才会真正写入 DDL 让**数据库服务端**处理。本模型**只设置了层③，没有设置层④**。
+
+同时 `day` 字段的 ORM default 是 `"unset"`（[mealplan.py#L37-L39](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/db/models/household/mealplan.py#L37-L39)），与枚举一致，不存在 `entry_type` 这种不一致问题。
+
+#### 6.1.2 `@auto_init()` 装饰器的行为——它不触碰默认值
+
+`GroupMealPlanRules` 模型继承自 `SqlAlchemyBase`，其 `__init__` 被 `@auto_init()` 装饰器包装（[auto_init.py#L104-L198](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/db/models/_model_utils/auto_init.py#L104-L198)）。核心逻辑：
+
+```python
+for key, val in kwargs.items():
+    if key in exclude:
+        continue
+    if not hasattr(cls, key):
+        continue                    # ← 未传入的 key，直接跳过
+    if key in model_columns:
+        setattr(self, key, val)     # ← 只处理传入了值的字段
+    ...
+return init(self, *args, **kwargs)
+```
+
+**结论**：`@auto_init()` 只遍历调用者显式传入的 `kwargs`，对**未传入的字段完全不做任何赋值**（既不设 `None`，也不读 ORM default）。未被触碰的字段交给 SQLAlchemy ORM 自己的机制在 `session.flush()` 时处理。
+
+#### 6.1.3 三种写入路径下的实际值
+
+结合 Repository 的 `create()` 方法（[repository_generic.py#L181-L193](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/repos/repository_generic.py#L181-L193)）：
+
+```python
+def create(self, data: Schema | BaseModel | dict) -> Schema:
+    data = data if isinstance(data, dict) else data.model_dump()
+    new_document = self.model(session=self.session, **data)  # ← @auto_init() + **data
+    self.session.add(new_document)
+    self.session.commit()                                    # ← SQLAlchemy flush，应用 ORM default
+    ...
+```
+
+三种写入路径的结果：
+
+| 写入路径 | 过程 | `entry_type` 最终值 |
+|---------|------|--------------------|
+| **路径 A：正常 API 调用（最常见）** | ① Pydantic `PlanRulesCreate` 未传 → 填 `"unset"` → ② `data.model_dump()` 带 `"unset"` → ③ `@auto_init()` 设为 `"unset"` → ④ flush 时已赋值，不触发 ORM default | **`"unset"`** ✅ |
+| **路径 B：绕过 Pydantic，直接调 ORM 构造且不传 entry_type** | ① 无 Schema 层 → ② data dict 中无 entry_type → ③ `@auto_init()` 跳过该字段 → ④ flush 时触发 ORM `default=""` | **`""`（空字符串）** ❌ |
+| **路径 C：直接 SQL `INSERT` 不写 entry_type 列** | 绕过 ORM，数据库服务端处理 → 由于 DDL 无 `server_default` 且字段 `NOT NULL` | **数据库报错 `NOT NULL constraint failed`** |
+| **路径 D：直接 SQL `INSERT` 显式写 entry_type=NULL** | 绕过 ORM，数据库服务端处理 → 字段 `NOT NULL` | **数据库报错 `NOT NULL constraint failed`** |
+
+#### 6.1.4 规则匹配逻辑与各分支可达性
 
 在 [repository_meal_plan_rules.py#L17-L21](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/repos/repository_meal_plan_rules.py#L17-L21) 中：
 
 ```python
 or_(
-    GroupMealPlanRules.entry_type == entry_type,       # ① 精确匹配目标餐次
-    GroupMealPlanRules.entry_type.is_(None),           # ② NULL 视为通配
-    GroupMealPlanRules.entry_type == PlanRulesType.unset.value,  # ③ "unset" 视为通配
+    GroupMealPlanRules.entry_type == entry_type,                    # ① 精确匹配
+    GroupMealPlanRules.entry_type.is_(None),                        # ② NULL 通配
+    GroupMealPlanRules.entry_type == PlanRulesType.unset.value,     # ③ "unset" 通配
 )
 ```
 
-三种 `entry_type` 存储值的匹配行为：
+逐条分析各分支的可达性：
 
-| 存储值 | 是否匹配任意餐次 | 是否匹配具体餐次（如 dinner） | 产生方式 |
-|--------|-----------------|------------------------------|---------|
-| `"unset"` | ✅ 是（条件③） | ✅ 是（通配） | 通过 API 正常创建规则且未指定 entry_type |
-| `NULL` | ✅ 是（条件②） | ✅ 是（通配） | 数据库直接操作且字段允许 NULL（但模型定义了 NOT NULL，实际不应出现） |
-| `""`（空字符串） | ❌ 否 | ❌ 否（三条均不满足） | **绕过 API 直接写库**且使用了 DB 层默认值 |
-| `"dinner"` 等具体值 | ❌ 否 | ✅ 仅匹配 dinner（条件①） | 通过 API 显式指定 |
+| 匹配分支 | SQL 条件 | 在当前代码+数据库约束下是否可达 | 原因 |
+|---------|---------|-------------------------------|------|
+| ① 精确匹配 | `entry_type == ?`（绑定 `"dinner"` 等具体值） | ✅ **可达** | 用户在 API 中显式指定了餐次类型 |
+| ② NULL 通配 | `entry_type IS NULL` | ❌ **不可达** | 初始迁移定义 `nullable=False`（DDL `NOT NULL`），路径 D 会直接报错，任何合法写入都不可能产生 NULL |
+| ③ `"unset"` 通配 | `entry_type == 'unset'` | ✅ **可达** | 路径 A（正常 API）用户不传值时 Pydantic 默认值填充 |
+| — 空字符串 `""` — | 不命中以上任何一条 | ⚠️ **半可达** | 路径 B（绕过 Pydantic 直接 ORM 构造）可产生 `""`，但**不被任何分支命中**，导致规则静默失效 |
 
-#### 6.1.3 ⚠️ 关键风险：空字符串 `""` 导致规则"静默失效"
+#### 6.1.5 ⚠️ 静默失效风险总结
 
-由于数据库模型的 `default=""` 与匹配逻辑**不一致**，若数据行的 `entry_type` 存的是空字符串 `""`，则该规则在 `get_rules()` 查询时**不会被任何餐次匹配到**——既不满足精确匹配，也不满足 NULL，也不等于 `"unset"`。
+| 值 | 写入路径 | 是否被规则匹配 | 风险等级 |
+|----|---------|--------------|---------|
+| `"unset"` | 正常 API（路径 A） | ✅ 被分支③通配匹配 | 无风险，正确行为 |
+| `"dinner"` 等 | 正常 API 指定 | ✅ 被分支①精确匹配 | 无风险，正确行为 |
+| `""` | 绕过 Pydantic 直接用 ORM（路径 B） | ❌ 不被任何分支匹配 | **高风险**：规则存在但永远不生效，无报错无日志 |
+| `NULL` | 直接 SQL 写 NULL（路径 D） | — | **无法写入**：数据库 NOT NULL 约束直接报错 |
 
-**正常流程下不会出现此问题**：因为通过 API 创建规则时，Pydantic Schema 的默认值是 `PlanRulesType.unset`（值为 `"unset"`），写入数据库的值也是 `"unset"`。只有绕过 API 直接操作数据库且未显式指定 entry_type 时，才会触发 DB 默认值 `""`，导致规则失效。
-
-`day` 字段的模型定义是 `default="unset"`（[mealplan.py#L37-L39](file:///d:/fz/0601/solo-dogfeeding/code/120-mealie/mealie/db/models/household/mealplan.py#L37-L39)），与枚举一致，不存在此问题。只有 `entry_type` 的 DB 默认值是 `""`，存在不一致。
+**结论**：
+- 分支② `entry_type IS NULL` 是**防御性代码**，在当前数据库约束下永远不会被触发（与 `day` 字段同理）
+- 空字符串 `""` 才是真正的"陷阱值"：能被写入（通过路径 B），但匹配逻辑不认，导致规则静默失效
+- 正常 API 调用（路径 A）由于 Pydantic Schema 的默认值兜底，永远不会产生 `""` 或 `NULL`，风险仅存在于绕过 API 直接操作 ORM/SQL 的场景
 
 ---
 
