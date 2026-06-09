@@ -2,6 +2,8 @@
 
 本文档按照代码执行顺序，系统梳理 Mealie 系统中的备份触发、文件生成、恢复写入和异常处理逻辑。
 
+> **路径说明：本文档中所有代码定位均使用仓库相对路径，仓库根为项目根目录。**
+
 ---
 
 ## 一、整体架构概览
@@ -10,13 +12,13 @@
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| 调度服务 | [scheduler_service.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_service.py) | 管理定时任务的触发与执行 |
-| 调度注册 | [scheduler_registry.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_registry.py) | 任务注册与回调管理 |
-| 备份核心 | [backup_v2.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py) | 备份创建与恢复的主流程控制 |
-| 备份文件处理 | [backup_file.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_file.py) | ZIP 解压与备份内容解析 |
-| 数据库导入导出 | [alchemy_exporter.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py) | SQLAlchemy 数据库的序列化与反序列化 |
-| API 路由 | [admin_backups.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py) | 备份管理的 REST API 接口 |
-| 数据模型 | [backup.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/schema/admin/backup.py) | 备份相关的 Pydantic Schema |
+| 调度服务 | `mealie/services/scheduler/scheduler_service.py` | 管理定时任务的触发与执行 |
+| 调度注册 | `mealie/services/scheduler/scheduler_registry.py` | 任务注册与回调管理 |
+| 备份核心 | `mealie/services/backups_v2/backup_v2.py` | 备份创建与恢复的主流程控制 |
+| 备份文件处理 | `mealie/services/backups_v2/backup_file.py` | ZIP 解压与备份内容解析 |
+| 数据库导入导出 | `mealie/services/backups_v2/alchemy_exporter.py` | SQLAlchemy 数据库的序列化与反序列化 |
+| API 路由 | `mealie/routes/admin/admin_backups.py` | 备份管理的 REST API 接口 |
+| 数据模型 | `mealie/schema/admin/backup.py` | 备份相关的 Pydantic Schema |
 
 ---
 
@@ -24,7 +26,7 @@
 
 ### 2.1 调度启动入口
 
-调度服务在应用启动时通过 `start_scheduler()` 函数初始化，定义于 [app.py#L124-L144](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/app.py#L124-L144)：
+调度服务在应用启动时通过 `start_scheduler()` 函数初始化，定义于 `mealie/app.py#L124-L144`：
 
 ```python
 async def start_scheduler():
@@ -53,7 +55,7 @@ async def start_scheduler():
 
 ### 2.2 调度任务注册表
 
-[SchedulerRegistry](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_registry.py#L8-L59) 是一个静态容器类，管理三类调度任务：
+`SchedulerRegistry`（`mealie/services/scheduler/scheduler_registry.py#L8-L59`）是一个静态容器类，管理三类调度任务：
 
 ```python
 class SchedulerRegistry:
@@ -69,7 +71,7 @@ class SchedulerRegistry:
 
 ### 2.3 调度服务执行
 
-[SchedulerService.start()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_service.py#L20-L27) 启动三个调度循环：
+`SchedulerService.start()`（`mealie/services/scheduler/scheduler_service.py#L20-L27`）启动三个调度循环：
 
 ```python
 class SchedulerService:
@@ -82,18 +84,18 @@ class SchedulerService:
 
 #### 2.3.1 每日任务调度时间计算
 
-[schedule_daily()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_service.py#L30-L53) 根据配置的 `DAILY_SCHEDULE_TIME`（默认 `23:45`）计算下一次执行时间：
+`schedule_daily()`（`mealie/services/scheduler/scheduler_service.py#L30-L53`）根据配置的 `DAILY_SCHEDULE_TIME`（默认 `23:45`）计算下一次执行时间：
 
 1. 解析配置的本地时间，转换为 UTC 时间
 2. 计算距离下次执行的时间差
 3. 使用 `asyncio.sleep()` 等待到目标时间
 4. 触发 `run_daily()` 执行
 
-配置定义见 [settings.py#L176-L200](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/core/settings/settings.py#L176-L200)。
+配置定义见 `mealie/core/settings/settings.py#L176-L200`。
 
 #### 2.3.2 装饰器驱动的循环执行
 
-三个调度函数均使用 `@repeat_every` 装饰器，定义于 [runner.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/runner.py#L19-L83)：
+三个调度函数均使用 `@repeat_every` 装饰器，定义于 `mealie/services/scheduler/runner.py#L19-L83`：
 
 - `run_daily()` - `@repeat_every(minutes=1440, wait_first=False)` - 立即执行，之后每24小时
 - `run_hourly()` - `@repeat_every(minutes=60, wait_first=True)` - 先等待1小时再执行
@@ -101,7 +103,7 @@ class SchedulerService:
 
 #### 2.3.3 任务执行包装器
 
-[_scheduled_task_wrapper()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_service.py#L56-L60) 确保单个任务异常不会影响整个调度：
+`_scheduled_task_wrapper()`（`mealie/services/scheduler/scheduler_service.py#L56-L60`）确保单个任务异常不会影响整个调度：
 
 ```python
 def _scheduled_task_wrapper(callable):
@@ -117,7 +119,7 @@ def _scheduled_task_wrapper(callable):
 
 ### 3.1 API 触发入口
 
-备份通过管理员 API 手动触发，入口位于 [admin_backups.py#L44-L54](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py#L44-L54)：
+备份通过管理员 API 手动触发，入口位于 `mealie/routes/admin/admin_backups.py#L44-L54`：
 
 ```python
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=SuccessResponse)
@@ -135,7 +137,7 @@ def create_one(self):
 
 ### 3.2 BackupV2 初始化
 
-[BackupV2.__init__()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L26-L32) 创建核心实例：
+`BackupV2.__init__()`（`mealie/services/backups_v2/backup_v2.py#L26-L32`）创建核心实例：
 
 ```python
 def __init__(self, db_url: str | None = None) -> None:
@@ -156,7 +158,7 @@ def __init__(self, db_url: str | None = None) -> None:
 
 ### 4.1 主流程：backup() 方法
 
-[BackupV2.backup()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L44-L76) 执行完整备份：
+`BackupV2.backup()`（`mealie/services/backups_v2/backup_v2.py#L44-L76`）执行完整备份：
 
 #### 步骤 1：生成备份文件名
 
@@ -174,7 +176,7 @@ else:
 backup_file = self.directories.BACKUP_DIR / backup_name
 ```
 
-备份目录由 [directories.py#L7](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/core/settings/directories.py#L7) 定义：`{DATA_DIR}/backups`。
+备份目录由 `mealie/core/settings/directories.py#L7` 定义：`{DATA_DIR}/backups`。
 
 #### 步骤 2：导出数据库数据
 
@@ -182,7 +184,7 @@ backup_file = self.directories.BACKUP_DIR / backup_name
 database_json = self.db_exporter.dump()
 ```
 
-数据库导出由 [AlchemyExporter.dump()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L166-L187) 完成，详见 4.2 节。
+数据库导出由 `AlchemyExporter.dump()`（`mealie/services/backups_v2/alchemy_exporter.py#L166-L187`）完成，详见 4.2 节。
 
 #### 步骤 3：创建 ZIP 归档
 
@@ -215,7 +217,7 @@ backup.zip
 
 ### 4.2 数据库导出详解
 
-[AlchemyExporter.dump()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L166-L187) 的执行流程：
+`AlchemyExporter.dump()`（`mealie/services/backups_v2/alchemy_exporter.py#L166-L187`）的执行流程：
 
 #### 步骤 1：修复迁移数据
 
@@ -267,7 +269,7 @@ result = {
 
 ### 5.1 API 触发入口
 
-恢复操作通过 [admin_backups.py#L103-L120](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py#L103-L120) 触发：
+恢复操作通过 `mealie/routes/admin/admin_backups.py#L103-L120` 触发：
 
 ```python
 @router.post("/{file_name}/restore", response_model=SuccessResponse)
@@ -289,13 +291,13 @@ def import_one(self, file_name: str):
     return SuccessResponse.respond("Restore successful")
 ```
 
-路径安全校验由 [_backup_path()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py#L22-L27) 确保：
+路径安全校验由 `_backup_path()`（`mealie/routes/admin/admin_backups.py#L22-L27`）确保：
 - 校验路径不超出 BACKUP_DIR 范围（防止路径遍历攻击）
 - 使用 `resolve()` 获取绝对路径后比较
 
 ### 5.2 主流程：restore() 方法
 
-[BackupV2.restore()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L95-L133) 执行完整恢复：
+`BackupV2.restore()`（`mealie/services/backups_v2/backup_v2.py#L95-L133`）执行完整恢复：
 
 ```python
 def restore(self, backup_path: Path) -> None:
@@ -335,14 +337,14 @@ def restore(self, backup_path: Path) -> None:
 
 ### 5.3 步骤 1：数据库预备份
 
-- **SQLite**：[_sqlite()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L34-L39) 将当前数据库文件复制为 `mealie_{YYYY.MM.DD}.bak.db`
-- **PostgreSQL**：[_postgres()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L41-L42) 当前为空实现（无操作）
+- **SQLite**：`_sqlite()`（`mealie/services/backups_v2/backup_v2.py#L34-L39`）将当前数据库文件复制为 `mealie_{YYYY.MM.DD}.bak.db`
+- **PostgreSQL**：`_postgres()`（`mealie/services/backups_v2/backup_v2.py#L41-L42`）当前为空实现（无操作）
 
 ### 5.4 步骤 2：备份文件解压与验证
 
 #### 5.4.1 BackupFile 上下文管理器
 
-[BackupFile](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_file.py#L75-L90) 使用上下文协议：
+`BackupFile`（`mealie/services/backups_v2/backup_file.py#L75-L90`）使用上下文协议：
 
 ```python
 def __enter__(self) -> BackupContents:
@@ -361,21 +363,21 @@ def __exit__(self, exc_type, exc_val, exc_tb):
 
 #### 5.4.2 Safari ZIP 兼容处理
 
-[BackupContents._find_base()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_file.py#L15-L35) 处理 Safari 浏览器解压 ZIP 时添加的 `__MACOSX` 目录：
+`BackupContents._find_base()`（`mealie/services/backups_v2/backup_file.py#L15-L35`）处理 Safari 浏览器解压 ZIP 时添加的 `__MACOSX` 目录：
 
 1. 检查是否存在 `__` 开头的目录
 2. 若存在且 `database.json` 不在根目录，则进入第一个非 dunder 子目录
 
 #### 5.4.3 备份有效性验证
 
-[BackupContents.validate()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_file.py#L45-L55) 检查：
+`BackupContents.validate()`（`mealie/services/backups_v2/backup_file.py#L45-L55`）检查：
 - 基础路径是目录
 - `data/` 子目录存在
 - `database.json` 文件存在
 
 ### 5.5 步骤 3：清空数据库
 
-[AlchemyExporter.drop_all()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L249-L287)：
+`AlchemyExporter.drop_all()`（`mealie/services/backups_v2/alchemy_exporter.py#L249-L287`）：
 
 **PostgreSQL**：
 1. 获取所有表及其外键约束
@@ -389,7 +391,7 @@ def __exit__(self, exc_type, exc_val, exc_tb):
 
 ### 5.6 步骤 4：恢复数据库数据
 
-[AlchemyExporter.restore()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L189-L247) 执行流程：
+`AlchemyExporter.restore()`（`mealie/services/backups_v2/alchemy_exporter.py#L189-L247`）执行流程：
 
 #### 步骤 4.1：运行 Alembic 迁移到备份版本
 
@@ -404,7 +406,7 @@ command.upgrade(alembic_cfg, alembic_version)
 
 #### 步骤 4.2：禁用外键约束
 
-使用 [ForeignKeyDisabler](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L24-L51) 上下文管理器：
+使用 `ForeignKeyDisabler`（`mealie/services/backups_v2/alchemy_exporter.py#L24-L51`）上下文管理器：
 
 - **PostgreSQL**：`SET session_replication_role = 'replica'`
 - **SQLite**：`PRAGMA foreign_keys = OFF`
@@ -413,7 +415,7 @@ command.upgrade(alembic_cfg, alembic_version)
 
 #### 步骤 4.3：数据类型转换
 
-[convert_types()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L98-L118) 递归遍历数据：
+`convert_types()`（`mealie/services/backups_v2/alchemy_exporter.py#L98-L118`）递归遍历数据：
 - UUID 字符串 → 数据库原生 GUID 类型
 - 日期时间字段名匹配 → `datetime.datetime`
 - 日期字段名匹配 → `datetime.date`
@@ -426,7 +428,7 @@ command.upgrade(alembic_cfg, alembic_version)
 
 #### 步骤 4.4：外键完整性清理
 
-[clean_rows()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L120-L145) 移除会违反外键约束的行：
+`clean_rows()`（`mealie/services/backups_v2/alchemy_exporter.py#L120-L145`）移除会违反外键约束的行：
 - 逐行检查每个外键引用是否在目标表中存在
 - 无效行被记录 warning 并移除
 
@@ -467,7 +469,7 @@ init_db.main()          # 重新初始化数据库（运行剩余迁移等）
 
 ### 5.7 步骤 5：恢复数据目录
 
-[_copy_data()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L78-L93)：
+`_copy_data()`（`mealie/services/backups_v2/backup_v2.py#L78-L93`）：
 
 ```python
 def _copy_data(self, data_path: Path) -> None:
@@ -496,33 +498,50 @@ def _copy_data(self, data_path: Path) -> None:
 
 | 位置 | 异常类型 | 处理方式 |
 |------|----------|----------|
-| [admin_backups.py#L48-L52](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py#L48-L52) | `Exception`（备份过程中任意异常） | 记录日志 + 返回 500 HTTP 错误 |
-| [alchemy_exporter.py#L174-L177](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L174-L177) | `Exception`（迁移数据修复失败） | 记录 error 日志 + **忽略继续** |
+| `mealie/routes/admin/admin_backups.py#L48-L52` | `Exception`（备份过程中任意异常） | 记录日志 + 返回 500 HTTP 错误 |
+| `mealie/services/backups_v2/alchemy_exporter.py#L174-L177` | `Exception`（迁移数据修复失败） | 记录 error 日志 + **忽略继续** |
 
 ### 6.2 恢复阶段异常
 
 | 位置 | 异常类型 | 处理方式 |
 |------|----------|----------|
-| [admin_backups.py#L109-L118](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py#L109-L118) | `BackupSchemaMismatch` | 返回 400 + "database backup schema version does not match" |
-| [admin_backups.py#L116-L118](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py#L116-L118) | `Exception`（恢复过程中任意异常） | 记录日志 + 返回 500 HTTP 错误 |
-| [backup_v2.py#L108-L112](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_v2.py#L108-L112) | 备份文件验证失败 | 记录 error 日志 + 抛出 `ValueError("Invalid backup file")` |
-| [alchemy_exporter.py#L40-L51](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L40-L51) | 外键约束恢复失败 | 记录 exception 日志 + 重新抛出异常 |
-| [alchemy_exporter.py#L136-L139](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L136-L139) | 外键引用无效 | 记录 warning 日志 + **移除无效行继续** |
+| `mealie/routes/admin/admin_backups.py#L109-L118` | `BackupSchemaMismatch` | 返回 400 + "database backup schema version does not match" |
+| `mealie/routes/admin/admin_backups.py#L116-L118` | `Exception`（恢复过程中任意异常） | 记录日志 + 返回 500 HTTP 错误 |
+| `mealie/services/backups_v2/backup_v2.py#L108-L112` | 备份文件验证失败 | 记录 error 日志 + 抛出 `ValueError("Invalid backup file")` |
+| `mealie/services/backups_v2/alchemy_exporter.py#L40-L51` | 外键约束恢复失败 | 记录 exception 日志 + 重新抛出异常 |
+| `mealie/services/backups_v2/alchemy_exporter.py#L136-L139` | 外键引用无效 | 记录 warning 日志 + **移除无效行继续** |
+
+#### 6.2.1 BackupSchemaMismatch 异常的特殊说明
+
+`BackupSchemaMismatch` 定义于 `mealie/services/backups_v2/backup_v2.py#L15`：
+
+```python
+class BackupSchemaMismatch(Exception): ...
+```
+
+**经全仓库代码搜索确认：该异常类在当前代码库中没有任何 `raise` 抛出点，仅在 `mealie/routes/admin/admin_backups.py#L111` 处有 `except` 捕获。**
+
+这意味着：
+- 这是一处**死代码（Dead Code）**，当前恢复流程中永远不会触发该异常分支
+- 该异常原本设计意图可能是用于校验备份文件的数据库 schema 版本与当前数据库是否匹配，但相关校验逻辑尚未实现（或已被移除）
+- 实际的 schema 版本兼容由 Alembic 迁移机制处理（`mealie/services/backups_v2/alchemy_exporter.py#L189-L201` 中的 `command.upgrade(alembic_cfg, alembic_version)`），通过将数据库迁移到备份版本完成，而不是抛出 `BackupSchemaMismatch`
+
+若迁移失败会由 alembic 自行抛出异常，最终被 `except Exception` 分支捕获并返回 500
 
 ### 6.3 调度阶段异常
 
 | 位置 | 异常类型 | 处理方式 |
 |------|----------|----------|
-| [scheduler_service.py#L56-L60](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/scheduler_service.py#L56-L60) | 单个调度任务异常 | 记录 error 日志 + **继续执行其他任务** |
-| [runner.py#L71-L76](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/scheduler/runner.py#L71-L76) | `repeat_every` 装饰器内异常 | 可选记录日志 + 可选继续重复执行（默认不抛出） |
+| `mealie/services/scheduler/scheduler_service.py#L56-L60` | 单个调度任务异常 | 记录 error 日志 + **继续执行其他任务** |
+| `mealie/services/scheduler/runner.py#L71-L76` | `repeat_every` 装饰器内异常 | 可选记录日志 + 可选继续重复执行（默认不抛出） |
 
 ### 6.4 资源清理保证
 
 | 资源 | 清理机制 |
 |------|----------|
-| 备份解压临时目录 | [BackupFile.__exit__()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/backup_file.py#L86-L89) 上下文管理器，异常时也会删除 |
-| 外键约束设置 | [ForeignKeyDisabler.__exit__()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L40-L51) 上下文管理器 |
-| 数据库连接 | [AlchemyExporter.restore()](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/services/backups_v2/alchemy_exporter.py#L242-L244) 中显式 `engine.dispose()` |
+| 备份解压临时目录 | `BackupFile.__exit__()`（`mealie/services/backups_v2/backup_file.py#L86-L89`）上下文管理器，异常时也会删除 |
+| 外键约束设置 | `ForeignKeyDisabler.__exit__()`（`mealie/services/backups_v2/alchemy_exporter.py#L40-L51`）上下文管理器 |
+| 数据库连接 | `AlchemyExporter.restore()`（`mealie/services/backups_v2/alchemy_exporter.py#L242-L244`）中显式 `engine.dispose()` |
 | SQLite 预备份文件 | 保留在 `DATA_DIR/mealie_{date}.bak.db`，**不自动清理** |
 
 ---
@@ -531,7 +550,7 @@ def _copy_data(self, data_path: Path) -> None:
 
 ### 7.1 备份 Schema
 
-定义于 [backup.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/schema/admin/backup.py)：
+定义于 `mealie/schema/admin/backup.py`：
 
 - `BackupOptions` - 备份选项（recipes/settings/themes/groups/users/notifications）
 - `CreateBackup` - 创建备份请求（tag, options, templates）
@@ -540,7 +559,7 @@ def _copy_data(self, data_path: Path) -> None:
 
 ### 7.2 恢复 Schema
 
-定义于 [restore.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/schema/admin/restore.py)：
+定义于 `mealie/schema/admin/restore.py`：
 
 - `ImportBase` - 导入基础（name, status, exception）
 - `RecipeImport` / `CommentImport` / `SettingsImport` / `GroupImport` / `UserImport` - 各类型导入结果
@@ -549,7 +568,7 @@ def _copy_data(self, data_path: Path) -> None:
 
 ## 八、备份 API 端点一览
 
-所有端点位于 [admin_backups.py](file:///d:/fz/0601/solo-dogfeeding/code/122-mealie/mealie/routes/admin/admin_backups.py)，前缀 `/api/admin/backups`：
+所有端点位于 `mealie/routes/admin/admin_backups.py`，前缀 `/api/admin/backups`：
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
@@ -571,3 +590,4 @@ def _copy_data(self, data_path: Path) -> None:
 5. **类型重建**：JSON 中的字符串 UUID/日期/时间自动转换为数据库原生类型
 6. **PostgreSQL 序列恢复**：手动恢复自增 ID 序列值
 7. **分级异常策略**：修复/清理类异常忽略继续，核心流程异常终止并报告
+8. **BackupSchemaMismatch 死代码**：异常已定义并捕获但从未抛出，schema 版本兼容由 Alembic 迁移机制实际处理
