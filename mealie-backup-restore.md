@@ -22,9 +22,201 @@
 
 ---
 
-## 二、调度系统详解
+## 二、管理员鉴权边界
 
-### 2.1 调度启动入口
+备份/恢复系统属于最高权限操作（可清空数据库、覆盖全量数据），因此所有备份相关 API 均受到管理员权限的双重保护。本节阐述鉴权链的实现机制和覆盖范围。
+
+### 2.1 后端鉴权的核心组成
+
+备份 API 的管理员鉴权由三层机制共同保障：
+
+#### (1) AdminAPIRouter：路由级全局依赖
+
+**定义**：`mealie/routes/_base/routers.py#L13-L17`
+
+```python
+class AdminAPIRouter(APIRouter):
+    def __init__(self, tags=None, prefix="", **kwargs):
+        super().__init__(
+            tags=tags, prefix=prefix,
+            dependencies=[Depends(get_admin_user)],
+            **kwargs
+        )
+```
+
+所有挂载在 `AdminAPIRouter` 下的子路由，都会自动注入 `Depends(get_admin_user)` 作为全局依赖。
+
+**注册位置**：`mealie/routes/admin/__init__.py#L15`
+
+```python
+router = AdminAPIRouter(prefix="/admin")
+router.include_router(admin_backups.router, tags=["Admin: Backups"])
+```
+
+`admin_backups.router` 的前缀是 `/backups`，因此完整路径为 `/api/admin/backups/*`，自动携带管理员依赖。
+
+#### (2) BaseAdminController：Controller 级用户注入
+
+**定义**：`mealie/routes/_base/base_controllers.py#L175-L189`
+
+```python
+class BaseAdminController(BaseUserController):
+    user: PrivateUser = Depends(get_admin_user)
+
+    @property
+    def repos(self):
+        if not self._repos:
+            # Admin 权限不受 group/household 过滤，可访问所有数据
+            self._repos = AllRepositories(self.session, group_id=None, household_id=None)
+        return self._repos
+```
+
+- 通过 FastAPI 的 CBV（Class-Based View）机制，`user` 字段被标记为 `Depends(get_admin_user)`
+- `@controller(router)` 装饰器会扫描类的类型注解，将依赖注入转换为 FastAPI 路由参数
+- Admin 的 `repos` 不设置 `group_id` 和 `household_id` 过滤，拥有跨组数据访问权限
+
+#### (3) get_admin_user：最终权限校验
+
+**定义**：`mealie/core/dependencies/dependencies.py#L135-L138`
+
+```python
+async def get_admin_user(current_user: PrivateUser = Depends(get_current_user)) -> PrivateUser:
+    if not current_user.admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN)
+    return current_user
+```
+
+执行逻辑：
+1. 先通过 `get_current_user` 完成 JWT 认证，获取当前登录用户（确保已登录）
+2. 检查 `current_user.admin` 布尔字段是否为 `True`
+3. 非管理员直接返回 **403 Forbidden**
+
+`admin` 字段的来源链：
+- 数据库模型：`mealie/db/models/users/users.py#L60` — `admin: Mapped[bool | None] = mapped_column(Boolean, default=False)`
+- Pydantic Schema：`mealie/schema/user/user.py#L115` — `class UserBase` 中 `admin: bool = False`，由 `UserOut` 继承，再由 `PrivateUser` 继承
+
+### 2.2 controller 装饰器的注入机制
+
+`@controller(router)` 装饰器（`mealie/routes/_base/controller.py`）是连接 Controller 类和 FastAPI 路由的桥梁：
+
+1. `_init_cbv(cls)` 扫描类的类型注解（如 `user: PrivateUser = Depends(get_admin_user)`），生成新的 `__init__` 签名
+2. `_register_endpoints()` 将路由方法（如 `@router.get`）的 endpoint 签名改造，第一个参数 `self` 的 default 设为 `Depends(cls)`
+3. FastAPI 在处理请求时，会递归解析依赖树：`Depends(cls)` → 解析 `__init__` 参数 → 执行 `Depends(get_admin_user)`
+
+这样 `BaseAdminController` 上的 `user: PrivateUser = Depends(get_admin_user)` 就会被应用到该类的所有路由方法上。
+
+### 2.3 备份接口鉴权保护情况一览
+
+备份相关的 6 个 API 端点全部处于 `AdminAPIRouter(prefix="/admin")` + `AdminBackupController(BaseAdminController)` 的双重保护之下：
+
+| 方法 | 路径 | 功能 | 路由级保护（AdminAPIRouter） | Controller 级保护（BaseAdminController） | 结果 |
+|------|------|------|------|------|------|
+| GET | `/api/admin/backups` | 备份列表 | ✅ `Depends(get_admin_user)` | ✅ `Depends(get_admin_user)` | 双重保护 |
+| POST | `/api/admin/backups` | 创建备份 | ✅ | ✅ | 双重保护 |
+| GET | `/api/admin/backups/{file_name}` | **签发 fileToken** | ✅ | ✅ | 双重保护 |
+| DELETE | `/api/admin/backups/{file_name}` | 删除备份 | ✅ | ✅ | 双重保护 |
+| POST | `/api/admin/backups/upload` | 上传备份 | ✅ | ✅ | 双重保护 |
+| POST | `/api/admin/backups/{file_name}/restore` | 恢复备份 | ✅ | ✅ | 双重保护 |
+
+**关键安全点**：fileToken 签发接口（`GET /api/admin/backups/{file_name}`）同样受管理员保护。普通用户即使知道文件名，也无法通过 API 获取下载令牌，确保备份文件不能被未授权下载。
+
+### 2.4 下载链路中的鉴权分层
+
+下载流程涉及两个端点，权限模型不同：
+
+| 端点 | 鉴权方式 | 说明 |
+|------|---------|------|
+| `GET /api/admin/backups/{name}` | 必须管理员（双重保护） | 签发 fileToken，仅管理员可调用 |
+| `GET /api/utils/download?token=xxx` | **无用户鉴权**，仅校验 JWT 签名+白名单 | 拿到有效 token 即可下载 |
+
+**设计意图**：fileToken 本身是一个自包含的授权凭证（JWT，30 分钟过期，路径白名单），因此 `/api/utils/download` 不需要再次校验用户身份。只要能拿到管理员签发的有效 token，就被视为已授权。这是常见的"短期令牌授权下载"模式。
+
+**安全边界**：
+- token 的签发权牢牢掌握在管理员手中（第一步必须管理员）
+- token 有效期仅 30 分钟，降低泄露风险
+- token 中绑定了具体文件路径，且后端额外校验 BACKUP_DIR/GROUPS_DIR 白名单，无法被重用于下载任意文件
+
+### 2.5 前端 Admin Layout 与后端鉴权的联系
+
+前端防护为 UI 层可见性控制，真正的权限保障完全由后端提供。两者的对应关系如下：
+
+#### (1) 路由与 Layout 绑定
+
+`frontend/app/pages/admin/backups.vue#L159-L161`：
+
+```typescript
+definePageMeta({
+  layout: "admin",
+});
+```
+
+所有 `/admin/*` 页面通过 `definePageMeta` 声明使用 `admin.vue` 布局。但注意：**`backups.vue` 没有显式配置 `middleware: ["admin-only"]`**（对比 `admin/setup.vue#L306-L308` 显式声明了 middleware）。
+
+#### (2) admin-only 中间件
+
+`frontend/app/middleware/admin-only.ts#L1-L7`：
+
+```typescript
+export default defineNuxtRouteMiddleware(() => {
+  const { user } = useMealieAuth();
+  if (!user.value?.admin) {
+    navigateTo("/");
+  }
+});
+```
+
+检查 `user.admin` 字段（由后端 JWT 解码后存入前端状态），非管理员重定向到首页。
+
+**实际生效情况**：由于 `backups.vue` 未显式声明 middleware，前端路由层面的重定向保护依赖其他机制（如 layout 内部检查或 `useMealieAuth` 的守卫）。这属于 UI 层的便利性防护，非管理员即便绕过前端直接访问 URL，也会因后端 API 返回 403 而无法执行任何操作。
+
+#### (3) Sidebar 链接可见性过滤
+
+`frontend/app/layouts/admin.vue` 中所有菜单项均标记 `restricted: true`，备份菜单见 `#L80-L85`：
+
+```typescript
+{
+  icon: $globals.icons.database,
+  to: "/admin/backups",
+  title: i18n.t("sidebar.backups"),
+  restricted: true,
+}
+```
+
+`frontend/app/components/Layout/LayoutParts/AppSidebar.vue#L35` 和 `#L81` 控制渲染：
+
+```html
+<div v-if="!nav.restricted || isOwnGroup" :key="nav.key || nav.title">
+```
+
+**注意**：这里的条件是 `!restricted || isOwnGroup`，而非 `!restricted || isAdmin`。`isOwnGroup` 来自 `useLoggedInState()`，表示"当前用户所在组"，并不等价于管理员权限。因此侧边栏的可见性过滤逻辑对管理员权限的判断存在**不确定性**，最终仍以后端返回的 403 为准。
+
+#### (4) 底部设置菜单
+
+`frontend/app/components/Layout/LayoutParts/AppSidebar.vue#L149-L150` 明确使用 `isAdmin` 判断：
+
+```html
+<v-divider v-if="isAdmin" class="my-2" />
+<v-list-item v-if="isAdmin" :prepend-icon="$globals.icons.wrench" :title="$t('settings.admin-settings')" to="/admin/site-settings" />
+```
+
+`isAdmin` 定义在 `frontend/app/components/Layout/LayoutParts/AppSidebar.vue#L187`，直接读取用户对象的 `admin` 字段。
+
+### 2.6 鉴权边界小结
+
+| 层级 | 机制 | 是否能独立保障安全 |
+|------|------|------------------|
+| 后端路由级 | `AdminAPIRouter` 注入 `Depends(get_admin_user)` | ✅ 是 |
+| 后端 Controller 级 | `BaseAdminController` 的 `user = Depends(get_admin_user)` | ✅ 是（双重保障） |
+| 前端 middleware | `admin-only.ts` 检查 `user.admin` | ❌ 仅 UI 便利，可被绕过 |
+| 前端 Sidebar 过滤 | `restricted` 字段 + `isOwnGroup`/`isAdmin` | ❌ 仅控制可见性 |
+
+**结论**：备份系统的管理员权限保护由后端 `AdminAPIRouter` 和 `BaseAdminController` 构成的双重 `get_admin_user` 依赖提供，是完整且强制的。前端的 layout、sidebar、middleware 仅作为用户体验层面的可见性控制，即便被绕过也无法突破后端权限校验。
+
+---
+
+## 三、调度系统详解
+
+### 3.1 调度启动入口
 
 调度服务在应用启动时通过 `start_scheduler()` 函数初始化，定义于 `mealie/app.py#L124-L144`：
 
@@ -115,9 +307,9 @@ def _scheduled_task_wrapper(callable):
 
 ---
 
-## 三、备份触发流程
+## 四、备份触发流程
 
-### 3.1 API 触发入口
+### 4.1 API 触发入口
 
 备份通过管理员 API 手动触发，入口位于 `mealie/routes/admin/admin_backups.py#L44-L54`：
 
@@ -135,7 +327,7 @@ def create_one(self):
     return SuccessResponse.respond("Backup created successfully")
 ```
 
-### 3.2 BackupV2 初始化
+### 4.2 BackupV2 初始化
 
 `BackupV2.__init__()`（`mealie/services/backups_v2/backup_v2.py#L26-L32`）创建核心实例：
 
@@ -154,9 +346,9 @@ def __init__(self, db_url: str | None = None) -> None:
 
 ---
 
-## 四、备份文件生成流程
+## 五、备份文件生成流程
 
-### 4.1 主流程：backup() 方法
+### 5.1 主流程：backup() 方法
 
 `BackupV2.backup()`（`mealie/services/backups_v2/backup_v2.py#L44-L76`）执行完整备份：
 
@@ -215,7 +407,7 @@ backup.zip
     └── ...
 ```
 
-### 4.2 数据库导出详解
+### 5.2 数据库导出详解
 
 `AlchemyExporter.dump()`（`mealie/services/backups_v2/alchemy_exporter.py#L166-L187`）的执行流程：
 
@@ -265,9 +457,9 @@ result = {
 
 ---
 
-## 五、恢复写入流程
+## 六、恢复写入流程
 
-### 5.1 API 触发入口
+### 6.1 API 触发入口
 
 恢复操作通过 `mealie/routes/admin/admin_backups.py#L103-L120` 触发：
 
@@ -295,7 +487,7 @@ def import_one(self, file_name: str):
 - 校验路径不超出 BACKUP_DIR 范围（防止路径遍历攻击）
 - 使用 `resolve()` 获取绝对路径后比较
 
-### 5.2 主流程：restore() 方法
+### 6.2 主流程：restore() 方法
 
 `BackupV2.restore()`（`mealie/services/backups_v2/backup_v2.py#L95-L133`）执行完整恢复：
 
@@ -335,14 +527,14 @@ def restore(self, backup_path: Path) -> None:
     self.logger.info("backup restore complete")
 ```
 
-### 5.3 步骤 1：数据库预备份
+### 6.3 步骤 1：数据库预备份
 
 - **SQLite**：`_sqlite()`（`mealie/services/backups_v2/backup_v2.py#L34-L39`）将当前数据库文件复制为 `mealie_{YYYY.MM.DD}.bak.db`
 - **PostgreSQL**：`_postgres()`（`mealie/services/backups_v2/backup_v2.py#L41-L42`）当前为空实现（无操作）
 
-### 5.4 步骤 2：备份文件解压与验证
+### 6.4 步骤 2：备份文件解压与验证
 
-#### 5.4.1 BackupFile 上下文管理器
+#### 6.4.1 BackupFile 上下文管理器
 
 `BackupFile`（`mealie/services/backups_v2/backup_file.py#L75-L90`）使用上下文协议：
 
@@ -361,21 +553,21 @@ def __exit__(self, exc_type, exc_val, exc_tb):
 - **进入**：创建临时目录，解压 ZIP
 - **退出**：无论是否异常，均清理临时目录
 
-#### 5.4.2 Safari ZIP 兼容处理
+#### 6.4.2 Safari ZIP 兼容处理
 
 `BackupContents._find_base()`（`mealie/services/backups_v2/backup_file.py#L15-L35`）处理 Safari 浏览器解压 ZIP 时添加的 `__MACOSX` 目录：
 
 1. 检查是否存在 `__` 开头的目录
 2. 若存在且 `database.json` 不在根目录，则进入第一个非 dunder 子目录
 
-#### 5.4.3 备份有效性验证
+#### 6.4.3 备份有效性验证
 
 `BackupContents.validate()`（`mealie/services/backups_v2/backup_file.py#L45-L55`）检查：
 - 基础路径是目录
 - `data/` 子目录存在
 - `database.json` 文件存在
 
-### 5.5 步骤 3：清空数据库
+### 6.5 步骤 3：清空数据库
 
 `AlchemyExporter.drop_all()`（`mealie/services/backups_v2/alchemy_exporter.py#L249-L287`）：
 
@@ -389,7 +581,7 @@ def __exit__(self, exc_type, exc_val, exc_tb):
 1. 逐表删除（DROP TABLE）
 2. SQLite 会级联删除外键约束
 
-### 5.6 步骤 4：恢复数据库数据
+### 6.6 步骤 4：恢复数据库数据
 
 `AlchemyExporter.restore()`（`mealie/services/backups_v2/alchemy_exporter.py#L189-L247`）执行流程：
 
@@ -467,7 +659,7 @@ self.engine.dispose()  # 释放连接
 init_db.main()          # 重新初始化数据库（运行剩余迁移等）
 ```
 
-### 5.7 步骤 5：恢复数据目录
+### 6.7 步骤 5：恢复数据目录
 
 `_copy_data()`（`mealie/services/backups_v2/backup_v2.py#L78-L93`）：
 
@@ -492,16 +684,16 @@ def _copy_data(self, data_path: Path) -> None:
 
 ---
 
-## 六、异常处理梳理
+## 七、异常处理梳理
 
-### 6.1 备份阶段异常
+### 7.1 备份阶段异常
 
 | 位置 | 异常类型 | 处理方式 |
 |------|----------|----------|
 | `mealie/routes/admin/admin_backups.py#L48-L52` | `Exception`（备份过程中任意异常） | 记录日志 + 返回 500 HTTP 错误 |
 | `mealie/services/backups_v2/alchemy_exporter.py#L174-L177` | `Exception`（迁移数据修复失败） | 记录 error 日志 + **忽略继续** |
 
-### 6.2 恢复阶段异常
+### 7.2 恢复阶段异常
 
 | 位置 | 异常类型 | 处理方式 |
 |------|----------|----------|
@@ -511,7 +703,7 @@ def _copy_data(self, data_path: Path) -> None:
 | `mealie/services/backups_v2/alchemy_exporter.py#L40-L51` | 外键约束恢复失败 | 记录 exception 日志 + 重新抛出异常 |
 | `mealie/services/backups_v2/alchemy_exporter.py#L136-L139` | 外键引用无效 | 记录 warning 日志 + **移除无效行继续** |
 
-#### 6.2.1 BackupSchemaMismatch 异常的特殊说明
+#### 7.2.1 BackupSchemaMismatch 异常的特殊说明
 
 `BackupSchemaMismatch` 定义于 `mealie/services/backups_v2/backup_v2.py#L15`：
 
@@ -528,14 +720,14 @@ class BackupSchemaMismatch(Exception): ...
 
 若迁移失败会由 alembic 自行抛出异常，最终被 `except Exception` 分支捕获并返回 500
 
-### 6.3 调度阶段异常
+### 7.3 调度阶段异常
 
 | 位置 | 异常类型 | 处理方式 |
 |------|----------|----------|
 | `mealie/services/scheduler/scheduler_service.py#L56-L60` | 单个调度任务异常 | 记录 error 日志 + **继续执行其他任务** |
 | `mealie/services/scheduler/runner.py#L71-L76` | `repeat_every` 装饰器内异常 | 可选记录日志 + 可选继续重复执行（默认不抛出） |
 
-### 6.4 资源清理保证
+### 7.4 资源清理保证
 
 | 资源 | 清理机制 |
 |------|----------|
@@ -546,9 +738,9 @@ class BackupSchemaMismatch(Exception): ...
 
 ---
 
-## 七、数据模型定义
+## 八、数据模型定义
 
-### 7.1 备份 Schema
+### 8.1 备份 Schema
 
 定义于 `mealie/schema/admin/backup.py`：
 
@@ -557,7 +749,7 @@ class BackupSchemaMismatch(Exception): ...
 - `BackupFile` - 单个备份文件信息（name, date, size）
 - `AllBackups` - 备份列表响应（imports 列表 + templates 列表）
 
-### 7.2 恢复 Schema
+### 8.2 恢复 Schema
 
 定义于 `mealie/schema/admin/restore.py`：
 
@@ -566,7 +758,7 @@ class BackupSchemaMismatch(Exception): ...
 
 ---
 
-## 八、备份 API 端点一览
+## 九、备份 API 端点一览
 
 所有端点位于 `mealie/routes/admin/admin_backups.py`，前缀 `/api/admin/backups`：
 
@@ -581,11 +773,11 @@ class BackupSchemaMismatch(Exception): ...
 
 ---
 
-## 九、上传备份进入恢复列表的输入链路
+## 十、上传备份进入恢复列表的输入链路
 
 上传一个外部备份 ZIP 文件，使其出现在备份列表中可供恢复，完整链路如下：
 
-### 9.1 前端上传触发
+### 10.1 前端上传触发
 
 **入口组件**：`frontend/app/pages/admin/backups.vue#L89-L95`
 
@@ -603,7 +795,7 @@ class BackupSchemaMismatch(Exception): ...
 - 限制文件类型为 `.zip`
 - 上传成功后回调 `refreshBackups()` 刷新列表
 
-### 9.2 AppButtonUpload 上传逻辑
+### 10.2 AppButtonUpload 上传逻辑
 
 **组件代码**：`frontend/app/components/global/AppButtonUpload.vue#L96-L130`
 
@@ -613,7 +805,7 @@ class BackupSchemaMismatch(Exception): ...
 3. 通过 `api.upload.file(url, formData)` 发起 POST 请求到 `/api/admin/backups/upload`
 4. 上传成功后 `emit("uploaded", response)` 通知父组件刷新
 
-### 9.3 后端接收上传
+### 10.3 后端接收上传
 
 **路由处理**：`mealie/routes/admin/admin_backups.py#L79-L101`（`upload_one`）
 
@@ -645,7 +837,7 @@ def upload_one(self, archive: UploadFile = File(...)):
 - 校验目标路径必须位于 `BACKUP_DIR` 下（防止路径遍历）
 - 校验文件确实被写入
 
-### 9.4 进入备份列表
+### 10.4 进入备份列表
 
 **刷新列表接口**：`mealie/routes/admin/admin_backups.py#L29-L42`（`get_all`）
 
@@ -667,7 +859,7 @@ def get_all(self):
 - 按修改时间倒序排列
 - 上传文件落盘后自然出现在列表中，可供后续点击"恢复"按钮使用
 
-### 9.5 上传链路全景图
+### 10.5 上传链路全景图
 
 ```
 用户点击上传按钮
@@ -700,11 +892,11 @@ AppButtonUpload 组件
 
 ---
 
-## 十、上传成功与实际可恢复成功的校验时机差异
+## 十一、上传成功与实际可恢复成功的校验时机差异
 
 备份 ZIP 的有效性校验分布在三个不同的时间点，"上传成功"不等于"可成功恢复"。以下是三级校验的时机、内容和失败表现对比：
 
-### 10.1 三级校验时机对比表
+### 11.1 三级校验时机对比表
 
 | 校验阶段 | 触发时机 | 执行位置 | 校验内容 | 失败表现 | 用户是否可见 |
 |----------|---------|---------|---------|---------|------------|
@@ -712,7 +904,7 @@ AppButtonUpload 组件
 | **第二级：列表加载校验** | 页面加载 / 刷新备份列表时 | `mealie/routes/admin/admin_backups.py#L29-L42` `get_all()` | **无内容校验**，仅扫描 `*.zip` 文件名、取 stat 的 mtime 和 size | 无（任何 .zip 都会出现在列表中） | ✅ 文件出现在列表中，看似正常 |
 | **第三级：恢复校验** | 用户点击"恢复"按钮并确认后 | `mealie/services/backups_v2/backup_v2.py#L95-L133` `BackupV2.restore()` + `mealie/services/backups_v2/backup_file.py` + `mealie/services/backups_v2/alchemy_exporter.py` | 详见 10.2 节 | 返回 500 HTTP 错误 | ✅ 恢复失败提示，但此时数据库可能已被清空 |
 
-### 10.2 恢复阶段的多层深度校验
+### 11.2 恢复阶段的多层深度校验
 
 恢复操作中包含了大量上传阶段完全没有的校验，按执行顺序：
 
@@ -753,7 +945,7 @@ AppButtonUpload 组件
 - 批量 `INSERT` 时数据库约束（NOT NULL、唯一索引、CHECK 等）可能触发 IntegrityError
 - 发生在 `mealie/services/backups_v2/alchemy_exporter.py#L225-L229`
 
-### 10.3 风险：校验滞后带来的破坏性问题
+### 11.3 风险：校验滞后带来的破坏性问题
 
 **关键风险**：第三级恢复校验是在**数据库已被清空之后**才执行的。
 
@@ -773,7 +965,7 @@ with backup as contents:
 
 然而若 ZIP 合法且结构完整，但 `database.json` 中存在不兼容数据（比如 Alembic 版本不存在，或 UUID 格式错误），则异常会在 `drop_all()` **之后**、`restore()` 内部抛出，此时**数据库已被清空但恢复中断**，只能依赖 SQLite 的预备份文件（`mealie_YYYY.MM.DD.bak.db`）或其他备份回滚。PostgreSQL 用户因 `_postgres()` 是空实现，**没有预备份保护**。
 
-### 10.4 小结：设计上的不足
+### 11.4 小结：设计上的不足
 
 1. **上传阶段仅校验扩展名**：不做 ZIP 魔数校验、不做解压测试、不校验内部结构
 2. **列表阶段完全无校验**：任何能通过上传的 `.zip`（哪怕是空文件、txt 改后缀）都会出现在恢复列表中
@@ -782,9 +974,9 @@ with backup as contents:
 
 ---
 
-## 十一、前端页面到后端路由的调用顺序
+## 十二、前端页面到后端路由的调用顺序
 
-### 11.1 涉及的前端文件
+### 12.1 涉及的前端文件
 
 | 文件 | 角色 |
 |------|------|
@@ -795,7 +987,7 @@ with backup as contents:
 | `frontend/app/lib/api/client-admin.ts` | Admin API 聚合类 |
 | `frontend/app/components/global/AppButtonUpload.vue` | 通用文件上传组件 |
 
-### 11.2 Admin Backups 页面完整调用链
+### 12.2 Admin Backups 页面完整调用链
 
 页面初始化与操作的完整前后端调用顺序：
 
@@ -881,7 +1073,7 @@ backups.vue#L124-L130: <BaseButton download :download-url="backupsFileNameDownlo
                       └─ 前端再打开 /api/utils/download?token=... 下载实际文件
 ```
 
-### 11.3 两套 API 客户端对比
+### 12.3 两套 API 客户端对比
 
 项目中存在两套备份 API 客户端，是代码演进遗留：
 
@@ -894,11 +1086,11 @@ backups.vue#L124-L130: <BaseButton download :download-url="backupsFileNameDownlo
 
 ---
 
-## 十二、文件下载的安全链路：fileToken → /api/utils/download
+## 十三、文件下载的安全链路：fileToken → /api/utils/download
 
 备份文件下载不直接暴露文件系统路径，而是通过"短期访问令牌 + 路径白名单"的安全机制完成。完整链路包含两次 HTTP 请求。
 
-### 12.1 前端触发下载
+### 13.1 前端触发下载
 
 **入口组件**：`frontend/app/pages/admin/backups.vue#L124-L130`
 
@@ -914,7 +1106,7 @@ backups.vue#L124-L130: <BaseButton download :download-url="backupsFileNameDownlo
 
 `backupsFileNameDownload()` 返回路径 `api/admin/backups/${fileName}`（`backups.vue#L246`），注意这只是**获取令牌的 URL**，不是直接下载 URL。
 
-### 12.2 BaseButton 封装下载逻辑
+### 13.2 BaseButton 封装下载逻辑
 
 **组件代码**：`frontend/app/components/global/BaseButton.vue#L195-L198`
 
@@ -927,7 +1119,7 @@ function downloadFile() {
 
 当 `download` 为 `true` 时，点击按钮不走默认 click，而是调用 `downloadFile()` → `UtilsAPI.download()`。
 
-### 12.3 UtilsAPI 获取 fileToken
+### 13.3 UtilsAPI 获取 fileToken
 
 **客户端代码**：`frontend/app/lib/api/user/utils.ts#L6-L19`
 
@@ -950,7 +1142,7 @@ export class UtilsAPI extends BaseAPI {
 3. 拼接成 `/api/utils/download?token=xxx`
 4. 用 `window.open()` 在新标签页打开此 URL 触发浏览器下载
 
-### 12.4 后端签发 fileToken
+### 13.4 后端签发 fileToken
 
 **签发路由**：`mealie/routes/admin/admin_backups.py#L55-L64` `get_one()`
 
@@ -978,7 +1170,7 @@ def create_file_token(file_path: Path) -> str:
 - payload 中嵌入文件的绝对路径
 - **有效期仅 30 分钟**
 
-### 12.5 /api/utils/download 校验与下载
+### 13.5 /api/utils/download 校验与下载
 
 **下载路由**：`mealie/routes/utility_routes.py#L12-L31`
 
@@ -1017,7 +1209,7 @@ def validate_file_token(token: str | None = None) -> Path:
 
 路由中额外做了**白名单目录校验**：文件必须位于 `BACKUP_DIR` 或 `GROUPS_DIR` 之下，防止令牌被用来下载任意系统文件。
 
-### 12.6 下载安全链路全景图
+### 13.6 下载安全链路全景图
 
 ```
 用户点击下载图标
@@ -1052,7 +1244,7 @@ UtilsAPI.download()              frontend/app/lib/api/user/utils.ts#L7-L18
 浏览器触发文件保存对话框
 ```
 
-### 12.7 安全设计要点
+### 13.7 安全设计要点
 
 | 防护层 | 机制 | 位置 |
 |--------|------|------|
@@ -1066,11 +1258,11 @@ UtilsAPI.download()              frontend/app/lib/api/user/utils.ts#L7-L18
 
 ---
 
-## 十三、BackupOptions / CreateBackup / ImportJob 实际参与度分析
+## 十四、BackupOptions / CreateBackup / ImportJob 实际参与度分析
 
 三个 Schema 均定义于 `mealie/schema/admin/backup.py`，但在当前代码中的实际参与度差异很大。
 
-### 13.1 Schema 定义回顾
+### 14.1 Schema 定义回顾
 
 ```python
 # mealie/schema/admin/backup.py#L6-L24
@@ -1094,7 +1286,7 @@ class CreateBackup(BaseModel):
     templates: list[str] | None = None
 ```
 
-### 13.2 后端路由使用情况
+### 14.2 后端路由使用情况
 
 **结论：后端路由完全不使用这三个 Schema 做参数解析。**
 
@@ -1110,7 +1302,7 @@ class CreateBackup(BaseModel):
 
 这三个 Schema 仅在 `mealie/schema/admin/__init__.py` 中被导出，没有任何路由函数将其作为 Pydantic 请求体模型。
 
-### 13.3 前端使用情况
+### 14.3 前端使用情况
 
 **`AdminBackupsApi`（实际使用的客户端）**：`frontend/app/lib/api/admin/admin-backups.ts`
 
@@ -1140,7 +1332,7 @@ async restoreDatabase(fileName: string, payload: BackupOptions) { ... }  // 类�
 - 调用 `api.backups.createOne(backupOptions)` 和 `api.backups.restoreDatabase(...)`
 - 但管理员页面 `backups.vue` **未引入此 composable**，使用的是简化逻辑
 
-### 13.4 旧版 API 的边界情况：已定义引用但后端无对应端点
+### 14.4 旧版 API 的边界情况：已定义引用但后端无对应端点
 
 旧版 `BackupAPI`（`frontend/app/lib/api/user/backups.ts`）定义了 6 个路由常量，但后端**不存在对应的 `/api/backups/*` 端点**。
 
@@ -1190,7 +1382,7 @@ async restoreDatabase(fileName: string, payload: BackupOptions) { ... }  // 类�
 - 当前 `BackupV2.restore()` 的行为相当于 `force=True`（无条件清空所有表后重新插入）和 `rebase=True`（全量替换数据目录）
 - **边界风险**：如果未来要实现这两个开关，需要重构恢复流程以支持"非强制模式"（仅插入缺失数据）和"不 rebase 模式"（保留部分现有数据）
 
-### 13.5 结论：当前 admin 链路未落地，旧线仍保留引用
+### 14.5 结论：当前 admin 链路未落地，旧线仍保留引用
 
 | Schema | 后端路由使用 | 前端 Admin 页面使用 | 状态 |
 |--------|------------|-------------------|------|
@@ -1206,7 +1398,7 @@ async restoreDatabase(fileName: string, payload: BackupOptions) { ... }  // 类�
 
 ---
 
-## 十四、关键设计要点
+## 十五、关键设计要点
 
 1. **备份非自动调度**：备份任务未注册到 SchedulerRegistry，需手动通过 API 触发
 2. **SQLite 自动预备份**：恢复前自动创建数据库文件副本（PostgreSQL 暂未实现）
@@ -1222,3 +1414,5 @@ async restoreDatabase(fileName: string, payload: BackupOptions) { ... }  // 类�
 12. **三级校验滞后风险**：上传仅校验扩展名，列表完全不校验，核心校验全部在恢复阶段且数据库清空早于多项数据校验
 13. **下载五层安全防护**：路径越界校验 → JWT 签名防篡改 → 30 分钟过期 → 文件存在校验 → BACKUP_DIR/GROUPS_DIR 白名单限制
 14. **旧版 API 端点完全缺失**：`BackupAPI` 引用的 6 个 `/api/backups/*` 端点在后端均不存在，存在 404 和选项静默丢弃的边界风险
+15. **管理员双重鉴权**：所有备份 API 由 `AdminAPIRouter` + `BaseAdminController` 注入两级 `Depends(get_admin_user)`，强制校验 403
+16. **后端鉴权为唯一可信边界**：前端 admin layout、sidebar 过滤、middleware 仅为 UI 可见性控制，真正权限保障完全依赖后端
