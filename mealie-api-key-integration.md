@@ -567,23 +567,47 @@ def set_member_permissions(self, permissions: SetPermissions):
     ...
 ```
 
-#### 场景 4：邀请功能（can_invite + 特殊范围限制）
-[controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L33-L55)：
+#### 场景 4：邀请功能（can_invite + 查询/创建范围不对称）
 
+**Repository 类型**：`HouseholdRepositoryGeneric`（group_id + household_id 双重过滤，[repository_factory.py:L273-L281](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py#L273-L281)）
+
+邀请令牌是理解"Repository 范围过滤 ≠ OperationChecks"的最佳案例，因为它的**查询和创建走了两条完全不同的范围路径**：
+
+**① 查询路径（`get_invite_tokens`）— Repository 层强制过滤**：
 ```python
+# [controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L23-L31)
+@router.get("", response_model=list[ReadInviteToken])
+def get_invite_tokens(self):
+    if not self.user.admin:                      # OperationChecks 层：只有 admin 能列出
+        raise HTTPException(status.HTTP_403_FORBIDDEN, ...)
+    # Repository 层：_filter_builder 自动注入 group_id+household_id
+    # → 即使 admin 也只能看到当前 Household 的邀请令牌
+    return self.repos.group_invite_tokens.page_all(PaginationQuery(page=1, per_page=-1)).items
+```
+
+**② 创建路径（`create_invite_token`）— 控制器层手工控制范围**：
+```python
+# [controller_invitations.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/routes/households/controller_invitations.py#L33-L60)
 @router.post("", response_model=ReadInviteToken, status_code=status.HTTP_201_CREATED)
 def create_invite_token(self, body: CreateInviteToken):
-    if not self.user.can_invite:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="User is not allowed to create invite tokens")
+    if not self.user.can_invite:                  # OperationChecks 层：需 can_invite 权限
+        raise HTTPException(status.HTTP_403_FORBIDDEN, ...)
 
-    body.group_id = body.group_id or self.group_id
-    body.household_id = body.household_id or self.household_id
+    body.group_id = body.group_id or self.group_id          # 默认当前用户 Group
+    body.household_id = body.household_id or self.household_id  # 默认当前用户 Household
 
-    # 非管理员只能为自己的 Group/Household 创建邀请
+    # 额外范围检查：非 admin 只能为自己的 Group/Household 创建
     if not self.user.admin and (body.group_id != self.group_id or body.household_id != self.household_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only admins can create invite tokens for other groups or households")
-    ...
+
+    token = SaveInviteToken(
+        uses_left=body.uses, group_id=body.group_id, household_id=body.household_id, token=url_safe_token()
+    )
+    # ⚠️ Repository.create() 不经过 _filter_builder，直接用上面的 group_id/household_id 写入
+    return self.repos.group_invite_tokens.create(token)
 ```
+
+**关键不对称**：`create()` 方法（[repository_generic.py:L181-L193](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py#L181-L193)）不调用 `_filter_builder`，直接将传入数据写入数据库；而所有查询方法（`get_one` / `page_all` / `multi_query`）都会自动拼接范围过滤条件。邀请令牌的跨范围能力完全依赖控制器层的手工检查。
 
 ---
 
@@ -643,7 +667,9 @@ class HouseholdRepositoryGeneric[Schema, Model](RepositoryGeneric[Schema, Model]
 
 ### 8.3 自动范围注入的核心逻辑
 
-所有查询方法（`get_one`、`multi_query`、`page_all` 等）都通过 `_filter_builder` 自动拼接过滤条件：
+#### 8.3.1 查询类方法：自动经过 `_filter_builder`
+
+`get_one`、`multi_query`、`page_all`、`_query_one` 等所有查询类方法都通过 `_filter_builder` 自动拼接范围过滤条件：
 
 ```python
 # [repository_generic.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py#L94-L102)
@@ -664,6 +690,24 @@ def _query_one(self, match_value, match_key=None):
 ```
 
 这意味着即使用户通过 API Key 直接传入一个其他 Group 的资源 ID，查询也会因 `filter_by(group_id=...)` 条件不匹配而返回空。
+
+#### 8.3.2 写入类方法：`create()` **不**经过 `_filter_builder`
+
+范围过滤并非对所有 Repository 方法生效。`create()` 和 `create_many()` 的实现（[repository_generic.py:L181-L208](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_generic.py#L181-L208)）直接将传入数据构造为 ORM 模型并写入数据库，**全程不调用 `_filter_builder`**：
+
+```python
+def create(self, data: Schema | BaseModel | dict) -> Schema:
+    data = data if isinstance(data, dict) else data.model_dump()
+    new_document = self.model(session=self.session, **data)  # ← 直接用传入的 data 构造
+    self.session.add(new_document)                            # ← 不追加 group_id/household_id 过滤
+    self.session.commit()
+    ...
+```
+
+**对 API Key 集成的关键影响**：
+- Repository 层不能保证写入数据的范围合法性
+- 如果控制器层将请求体中的 `group_id` / `household_id` 直接透传给 `create()`，外部应用可能越权写入其他范围的数据
+- 实际项目中，控制器通常通过 `mapper.cast(data, SaveModel, group_id=self.group_id, household_id=self.household_id)` 显式强制注入当前用户的范围（如通知器、Webhook 的 create_one），或在控制器代码中做额外的 `if` 检查（如邀请令牌对 admin 做跨范围放行）
 
 ### 8.4 完整 Repository 范围分类（依据 [repository_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/121-mealie/mealie/repos/repository_factory.py) 逐行核对）
 
@@ -1125,12 +1169,15 @@ Mealie 的权限控制由**两层独立机制**叠加构成，两者互不替代
 
 | | 无 OperationChecks（纯范围隔离） | 有 OperationChecks（范围 + 功能双重控制） |
 |---|---|---|
-| **GroupRepositoryGeneric**<br>（同组跨家庭可见） | 无（所有 Group 级写操作均需 `can_organize` / `can_invite`） | 标签、分类（`can_organize`）<br>邀请令牌（`can_invite`）<br>API Key 删除（本人校验） |
-| **HouseholdRepositoryGeneric**<br>（仅本家庭可见） | **通知器、Webhook、Cookbook、购物清单**<br>（所有 Household 成员均可 CRUD） | 家庭偏好（`can_manage_household`）<br>用户权限（`can_manage` + 额外范围）<br>邀请令牌创建（`can_invite`） |
+| **GroupRepositoryGeneric**<br>（同组跨家庭可见） | 无（所有 Group 级写操作均有功能检查） | 标签、分类（`can_organize`）<br>API Key 删除（本人校验，检查 `token.user.email == self.user.email`） |
+| **HouseholdRepositoryGeneric**<br>（仅本家庭可见） | **通知器、Webhook、Cookbook、购物清单**<br>（所有 Household 成员均可 CRUD） | 家庭偏好（`can_manage_household`）<br>用户权限（`can_manage` + 额外范围）<br>**邀请令牌**（查询：admin-only；创建：`can_invite` + 跨范围检查） |
+
+> **关于邀请令牌的特别说明**：邀请令牌虽属于 `HouseholdRepositoryGeneric`（数据库存储和查询都按 group_id+household_id 过滤），但其创建时 `create()` 方法不经过 `_filter_builder`，因此 admin 可以通过传入目标 group_id/household_id 实现跨范围创建——这个跨范围能力完全由控制器层的手工 `if` 检查控制，而非 Repository 层自动限制（详见第 7.3 节场景 4）。
 
 **对 API Key 集成的启示**：
 - 如果外部应用需要"只读 + 不触达敏感配置"，给 Household 普通成员的 API Key 已经足够访问通知器、Webhook、Cookbook、购物清单
-- 如果需要操作 Group 级资源（标签、分类、邀请），则必须给 API Key 对应用户授予 `can_organize` / `can_invite` 权限
+- 如果需要操作 **Group 级资源**（标签、分类），则必须给 API Key 对应用户授予 `can_organize` 权限
+- 如果需要创建/发送**邀请令牌**（Household 级资源，但有功能检查），则必须授予 `can_invite` 权限（若需跨 Group/Household 创建则还需 admin）
 - 如果需要修改家庭偏好或调整用户权限，则必须授予 `can_manage_household` / `can_manage`（仅管理员可授予）
 
 ### 12.7 API Key 持有者对通知器/Webhook 的实际可达能力
